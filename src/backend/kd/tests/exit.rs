@@ -60,6 +60,7 @@ fn exit_resume_consumes_pump_stop_before_final_continue() {
                 None,
                 DebugLog::new(DEBUG_LOG_CAPACITY),
                 None,
+                PumpBugcheck::default(),
             )
         })
     };

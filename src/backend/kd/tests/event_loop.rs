@@ -10,6 +10,7 @@ use std::thread::spawn;
 use std::time::Instant;
 
 use crate::backend::dbg_backend::ModuleEvent;
+use crate::backend::kd::event_loop::PumpBugcheck;
 use crate::backend::kd::framing::{
     BREAKIN_BYTE, HEADER_SIZE, INITIAL_PACKET_ID, PACKET_TYPE_KD_ACKNOWLEDGE,
     PACKET_TYPE_KD_DEBUG_IO, PACKET_TYPE_KD_RESET, PACKET_TYPE_KD_STATE_CHANGE64,
@@ -320,6 +321,7 @@ fn pump_services_state_change_and_returns_framing() {
                 None,
                 DebugLog::new(DEBUG_LOG_CAPACITY),
                 None,
+                PumpBugcheck::default(),
             )
         })
     };
@@ -377,6 +379,7 @@ fn pump_absorbs_rebreak_after_continue_and_reports_real_stop() {
                 None,
                 DebugLog::new(DEBUG_LOG_CAPACITY),
                 Some(drain),
+                PumpBugcheck::default(),
             )
         })
     };
@@ -479,6 +482,7 @@ fn pump_sends_breakin_after_peer_reset_while_waiting_for_reconnect() {
                 None,
                 DebugLog::new(DEBUG_LOG_CAPACITY),
                 None,
+                PumpBugcheck::default(),
             )
         })
     };
@@ -534,6 +538,7 @@ fn pump_tags_stop_after_assisted_reconnect_breakin() {
                 None,
                 DebugLog::new(DEBUG_LOG_CAPACITY),
                 None,
+                PumpBugcheck::default(),
             )
         })
     };
@@ -600,6 +605,7 @@ fn pump_surfaces_reloaded_transparent_state_change() {
                 None,
                 DebugLog::new(DEBUG_LOG_CAPACITY),
                 None,
+                PumpBugcheck::default(),
             )
         })
     };
@@ -649,6 +655,7 @@ fn pump_surfaces_load_symbols_as_a_module_change_stop() {
                 None,
                 DebugLog::new(DEBUG_LOG_CAPACITY),
                 None,
+                PumpBugcheck::default(),
             )
         })
     };
@@ -698,6 +705,7 @@ fn pump_sends_breakin_when_started_in_reconnect_assist_mode() {
                 Some(Duration::ZERO),
                 DebugLog::new(DEBUG_LOG_CAPACITY),
                 None,
+                PumpBugcheck::default(),
             )
         })
     };
@@ -751,6 +759,7 @@ fn pump_does_not_send_delayed_reconnect_assist_before_delay() {
                 Some(Duration::from_secs(60)),
                 DebugLog::new(DEBUG_LOG_CAPACITY),
                 None,
+                PumpBugcheck::default(),
             )
         })
     };
@@ -977,6 +986,7 @@ fn pump_exits_on_shutdown_when_idle() {
                 None,
                 DebugLog::new(DEBUG_LOG_CAPACITY),
                 None,
+                PumpBugcheck::default(),
             )
         })
     };

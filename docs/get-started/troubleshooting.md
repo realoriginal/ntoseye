@@ -43,6 +43,16 @@ See [UTM](../setup/utm.md#gdb-stub).
 
 **The guest's own hypervisor does not boot under nested virtualization** (VBS, Hyper-V, WSL2). On the tested host, the `host-passthrough` CPU model failed and a custom CPU model with `vmx` worked. See [KVM/QEMU](../setup/kvm-qemu.md#virtualization-based-security-vbs).
 
+## Serial connection lost after suspend/resume
+
+VMware can remove its Unix serial socket when suspended and recreate it on resume. After an EOF, connection reset, or broken pipe, an active KD wait retries the socket for up to 30 seconds. A missing socket or one not yet accepting connections is retried within that budget. Shorter client deadlines still return control, and cancellation is checked between polls.
+
+Reconnecting keeps the existing session, packet IDs, and tracked breakpoint handles. It does not send RESET, replay requests, interrupt a running guest, or continue past a stop. The outstanding wait keeps waiting for a stop; an explicit {command}`break` reconnects and requests a halt. A real breakpoint, exception, or reboot notification follows normal stop handling.
+
+If the socket remains unavailable for 30 seconds, recovery reports a timeout and retains the session. Resume the VM, then wait again or use {command}`break` to retry. If a break-in cannot be confirmed, its error does not mean the guest is halted. Exit cleanup does not reopen the socket and cannot confirm breakpoint restoration over a disconnected connection.
+
+For suspend/resume diagnosis, use `--memory-source kd` so reads use the recovered KD connection. Host-memory access keeps the process and mappings selected at attach; serial recovery does not rediscover those if VMware replaces them.
+
 ## Symbols
 
 **{command}`lm` shows a module's symbols as `failed`,** or its frames stay `module+offset`. Microsoft did not publish a PDB for that build, or the download failed. To fix it, do one of the following:

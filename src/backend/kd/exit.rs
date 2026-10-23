@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::mem::take;
 use std::time::Duration;
 
-use crate::backend::dbg_backend::{DebugBackend, StopEvent, clear_trap_flag};
+use crate::backend::dbg_backend::{StopEvent, clear_trap_flag};
 use crate::base::error::{Error, Result};
 
 use super::{
@@ -92,6 +92,9 @@ impl KdBackend {
     }
 
     pub(super) fn finish_for_exit(&mut self, leave_running: bool) -> Result<()> {
+        if self.serial_recovery.is_some() {
+            return Err(Error::Kd("serial connection is unavailable during exit; target state and breakpoint restoration are unconfirmed".into()));
+        }
         if let Some(stop) = self.shutdown_pump_with_stop()? {
             self.record_stop(&stop);
         }
@@ -108,7 +111,7 @@ impl KdBackend {
             if !self.link.is_running() {
                 self.continue_stopped_for_exit()?;
             }
-            let Some(stop) = self.try_wait_for_stop(KD_EXIT_STOP_POLL)? else {
+            let Some(stop) = self.poll_stop(KD_EXIT_STOP_POLL, false)? else {
                 return Ok(());
             };
             if stop.modules_changed {

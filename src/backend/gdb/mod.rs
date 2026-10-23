@@ -1553,6 +1553,14 @@ impl DebugBackend for GdbClient {
         if !self.halts.is_running() {
             return false;
         }
+        // A timed wait may have consumed the packet prefix already. Until
+        // its kind arrives, keep polling rather than losing a possible stop.
+        match &self.rx_state {
+            PacketReadState::ReadingData(data) | PacketReadState::ReadingChecksum { data, .. } => {
+                return data.first().is_none_or(|kind| b"STWXN".contains(kind));
+            }
+            PacketReadState::SeekingStart => {}
+        }
         let buffered = self.stream.buffer();
         if !buffered.is_empty() {
             return holds_stop_reply(buffered);
@@ -1943,6 +1951,82 @@ mod tests {
         assert!(client.has_pending_stop());
         client.halts.set_running(false);
         assert!(!client.has_pending_stop());
+    }
+
+    #[test]
+    fn a_partially_consumed_stop_body_stays_pending_after_a_timed_wait() {
+        for prefix in ["$S05", "$T05thread:", "$W00", "$X09", "$N"] {
+            let (mut client, _) = running_client_over_recording_stub();
+            for byte in prefix.bytes() {
+                assert!(client.consume_packet_byte(byte).unwrap().is_none());
+            }
+
+            let polled = DebugBackend::try_wait_for_stop(&mut client, Duration::ZERO);
+
+            assert!(matches!(polled, Ok(None)), "{polled:?}");
+            assert!(
+                matches!(&client.rx_state, PacketReadState::ReadingData(data) if !data.is_empty())
+            );
+            assert!(client.has_pending_stop(), "consumed prefix {prefix:?}");
+            client.halts.set_running(false);
+            assert!(
+                !client.has_pending_stop(),
+                "a halted target has no pending stop"
+            );
+        }
+    }
+
+    #[test]
+    fn a_consumed_packet_start_stays_pending_until_its_kind_is_known() {
+        let (mut client, _) = running_client_over_recording_stub();
+        assert!(client.consume_packet_byte(b'$').unwrap().is_none());
+
+        let polled = DebugBackend::try_wait_for_stop(&mut client, Duration::ZERO);
+
+        assert!(matches!(polled, Ok(None)), "{polled:?}");
+        assert!(matches!(&client.rx_state, PacketReadState::ReadingData(data) if data.is_empty()));
+        assert!(
+            client.has_pending_stop(),
+            "the packet kind has not arrived yet"
+        );
+    }
+
+    #[test]
+    fn a_partially_consumed_stop_checksum_stays_pending_after_a_timed_wait() {
+        for body in ["S05", "T05thread:p01.02;", "W00", "X09", "N"] {
+            for checksum in ["", "0"] {
+                let (mut client, _) = running_client_over_recording_stub();
+                for byte in format!("${body}#{checksum}").bytes() {
+                    assert!(client.consume_packet_byte(byte).unwrap().is_none());
+                }
+
+                let polled = DebugBackend::try_wait_for_stop(&mut client, Duration::ZERO);
+
+                assert!(matches!(polled, Ok(None)), "{polled:?}");
+                assert!(
+                    matches!(&client.rx_state, PacketReadState::ReadingChecksum { len, .. } if *len == checksum.len())
+                );
+                assert!(
+                    client.has_pending_stop(),
+                    "body {body:?}, checksum {checksum:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_partially_consumed_console_packet_is_not_a_pending_stop() {
+        for prefix in ["$O", "$O6869", "$O6869#", "$O6869#9"] {
+            let (mut client, _) = running_client_over_recording_stub();
+            for byte in prefix.bytes() {
+                assert!(client.consume_packet_byte(byte).unwrap().is_none());
+            }
+
+            let polled = DebugBackend::try_wait_for_stop(&mut client, Duration::ZERO);
+
+            assert!(matches!(polled, Ok(None)), "{polled:?}");
+            assert!(!client.has_pending_stop(), "console prefix {prefix:?}");
+        }
     }
 
     #[test]

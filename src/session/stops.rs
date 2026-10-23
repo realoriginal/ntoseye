@@ -155,7 +155,9 @@ impl Session {
         if !self.backend.has_pending_stop() {
             return Ok(());
         }
-        let event = self.backend.wait_for_stop()?;
+        let Some(event) = self.backend.try_wait_for_stop(Duration::ZERO)? else {
+            return Ok(());
+        };
         match self.classify_stop_event(event)? {
             StopResolution::Resumed | StopResolution::ModulesChanged => {}
             // Settling is intentionally non-surfacing. Preserve the single

@@ -321,6 +321,11 @@ pub struct KdBackend {
     /// [`DebugBackend::sites_dropped_by_stop`].
     switch_report_pcs: Vec<u64>,
     reconnect_assist_after_continue: Option<Duration>,
+    serial_recovery: Option<pump::SerialRecovery>,
+    pump_bugcheck: PumpBugcheck,
+    /// A replacement socket has not yet reported a stop. Old break-in PCs
+    /// cannot establish why this connection's first stop occurred.
+    serial_reconnected: bool,
     bp_handles: HashMap<u64, u32>,
     managed_bp_addresses: HashSet<u64>,
     breakin_addresses: HashSet<u64>,
@@ -802,7 +807,7 @@ impl DebugBackend for KdBackend {
     }
 
     fn try_wait_for_stop(&mut self, timeout: Duration) -> Result<Option<StopEvent>> {
-        self.poll_stop(timeout)
+        self.poll_stop(timeout, true)
     }
 
     fn thread_list(&mut self) -> Result<Vec<String>> {

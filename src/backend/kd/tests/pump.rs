@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::thread::spawn;
 use std::time::Instant;
 
+use crate::backend::kd::event_loop::{PumpBugcheck, PumpResult};
 use crate::backend::kd::framing::{
     BREAKIN_BYTE, INITIAL_PACKET_ID, PACKET_TYPE_KD_STATE_CHANGE64, data_packet,
 };
@@ -37,9 +38,14 @@ fn pump_shutdown_reclaims_framing_after_reported_error() {
     let breakin_clone = host.try_clone().unwrap();
     let (stop_tx, stop_rx) = mpsc::channel();
     // Queue the failure before shutdown so the early receive must see it.
-    stop_tx.send(Err("injected pump failure".into())).unwrap();
+    stop_tx
+        .send(Err(Error::Kd("injected pump failure".into())))
+        .unwrap();
     let pump = PumpHandle {
-        join: spawn(move || KdFraming::new(host.into())),
+        join: spawn(move || PumpResult {
+            framing: KdFraming::new(host.into()),
+            bugcheck: PumpBugcheck::default(),
+        }),
         stop_rx,
         shutdown: Arc::new(AtomicBool::new(false)),
         reported_stop: Arc::new(AtomicBool::new(true)),
@@ -88,6 +94,7 @@ fn has_pending_stop_flags_undrained_pump_stop_until_consumed() {
                 None,
                 DebugLog::new(DEBUG_LOG_CAPACITY),
                 None,
+                PumpBugcheck::default(),
             )
         })
     };

@@ -1705,6 +1705,7 @@ dependencies = [
  "sha2",
  "single-instance",
  "smallvec",
+ "socket2",
  "spin",
  "subtle",
  "syn 2.0.118",

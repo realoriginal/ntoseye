@@ -17,10 +17,9 @@ use super::breakpoints::{
 use super::registers::KSPECIAL_REGISTERS_DR7_OFFSET;
 use super::{
     AwaitStateOptions, ContinueDrain, ControlReport, DBG_KD_EXCEPTION_STATE_CHANGE,
-    DBG_KD_LOAD_SYMBOLS_STATE_CHANGE, KD_REQUEST_TIMEOUT, KdBackend, Link, STATUS_BREAKPOINT,
-    StateChange, StateChangeFilter, advance_pc_past_breakpoint, api, await_state_change,
-    blocking_read_timeout, breakin_and_wait, read_program_counter, thread_id_for,
-    with_framing_read_timeout,
+    DBG_KD_LOAD_SYMBOLS_STATE_CHANGE, KD_REQUEST_TIMEOUT, KdBackend, Link, PUMP_POLL,
+    STATUS_BREAKPOINT, StateChange, StateChangeFilter, advance_pc_past_breakpoint, api,
+    await_state_change, read_program_counter, thread_id_for, with_framing_read_timeout,
 };
 
 const POST_BUGCHECK_RECONNECT_ASSIST_DELAY: Duration = Duration::from_secs(20);
@@ -71,13 +70,17 @@ impl KdBackend {
     }
 
     pub(super) fn mark_known_breakin_stop(&self, mut stop: StateChange) -> StateChange {
-        if self.known_breakin_stop(&stop) {
+        if self.serial_reconnected {
+            stop.assisted_breakin = false;
+        } else if self.known_breakin_stop(&stop) {
             stop.assisted_breakin = true;
         }
         stop
     }
 
     pub(super) fn record_stop(&mut self, stop: &StateChange) {
+        self.serial_reconnected = false;
+        self.pump_bugcheck = super::PumpBugcheck::default();
         if self.unmanaged_breakpoint_stop(stop) {
             self.late_breakin = false;
         }
@@ -488,80 +491,123 @@ impl KdBackend {
     }
 
     pub(super) fn break_in(&mut self) -> Result<StopEvent> {
-        let stop = if let Link::RunningPumped(pump) = &self.link {
-            // Pump owns the socket; poke the kernel with a break-in over the
-            // cloned fd, then collect the state-change the pump reports back.
-            // Flag it first: the stop lands at the KD break-in instruction,
-            // where the pump would otherwise absorb it as post-continue noise.
-            pump.breakin_requested.store(true, Ordering::SeqCst);
-            self.send_raw_breakin()?;
-            match self.take_pump_stop(Some(Duration::from_secs(10)))? {
-                Some(stop) => stop,
-                None => {
-                    self.shutdown_pump();
-                    return Err(Error::Kd("no break-in response within 10s".into()));
-                }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut sent = false;
+        loop {
+            // A stop already reported wins, even when the cloned writer is dead.
+            if !sent && let Some(stop) = self.poll_state_change(Duration::ZERO, true)? {
+                return Ok(self.interrupted_stop(stop, sent));
             }
-        } else {
-            // Stopped, or running via a bare step: drive the break-in inline
-            let arch = self.arch;
-            breakin_and_wait(self.framing()?, arch, Duration::from_secs(10))?
-        };
-        self.late_breakin = !self.unmanaged_breakpoint_stop(&stop);
+            if Instant::now() >= deadline {
+                // Keep servicing: the target can still answer the interrupt
+                // later. Joining here could outlive the caller's break budget.
+                return Err(Error::Kd(
+                    "no break-in response within 10s; target state is unconfirmed".into(),
+                ));
+            }
+            if self.serial_recovery.is_some() {
+                sent = false;
+            } else if !sent {
+                if let Link::RunningPumped(pump) = &self.link {
+                    pump.breakin_requested.store(true, Ordering::SeqCst);
+                }
+                if let Err(error) = self.send_raw_breakin() {
+                    let error = match self.shutdown_pump_with_stop() {
+                        Ok(Some(stop)) => {
+                            return Ok(self.interrupted_stop(stop, sent));
+                        }
+                        Ok(None) => error,
+                        Err(error) => error,
+                    };
+                    if !self.begin_serial_recovery(&error)? {
+                        return Err(error);
+                    }
+                    continue;
+                }
+                sent = true;
+            }
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .min(PUMP_POLL);
+            let result = if sent {
+                self.poll_state_change_connected(wait)
+            } else {
+                self.poll_state_change(wait, true)
+            };
+            match result {
+                Ok(Some(stop)) => return Ok(self.interrupted_stop(stop, sent)),
+                Ok(None) => {}
+                Err(error) if self.begin_serial_recovery(&error)? => sent = false,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn interrupted_stop(&mut self, mut stop: StateChange, sent: bool) -> StopEvent {
+        stop.assisted_breakin = false;
         self.record_stop(&stop);
-        Ok(stop_event(stop))
+        if sent {
+            self.late_breakin = !self.unmanaged_breakpoint_stop(&stop);
+        }
+        stop_event(stop)
     }
 
     pub(super) fn await_stop(&mut self) -> Result<StopEvent> {
-        if matches!(self.link, Link::RunningPumped(_)) {
-            let stop = self
-                .take_pump_stop(None)?
-                .ok_or_else(|| Error::Kd("KD pump returned no stop".into()))?;
-            let stop = self.mark_known_breakin_stop(stop);
-            self.record_stop(&stop);
-            return Ok(stop_event(stop));
+        loop {
+            if let Some(stop) = self.poll_stop(PUMP_POLL, true)? {
+                return Ok(stop);
+            }
         }
-        let debug_log = self.debug_log.clone();
-        let arch = self.arch;
-        // Request paths leave shorter timeouts in place; a blocking wait needs a long one.
-        let _ = self
-            .framing()?
-            .transport_mut()
-            .set_read_timeout(Some(blocking_read_timeout()));
-        let stop = await_state_change(
-            self.framing()?,
-            AwaitStateOptions {
-                arch,
-                saw_kd_refresh: None,
-                filter: StateChangeFilter::Runtime,
-                bugcheck: None,
-                bugcheck_capture: None,
-                deadline: None,
-                debug_log: Some(&debug_log),
-            },
-        )?;
-        let stop = self.mark_known_breakin_stop(stop);
-        self.record_stop(&stop);
-        Ok(stop_event(stop))
     }
 
-    pub(super) fn poll_stop(&mut self, timeout: Duration) -> Result<Option<StopEvent>> {
+    pub(super) fn poll_stop(
+        &mut self,
+        timeout: Duration,
+        reconnect: bool,
+    ) -> Result<Option<StopEvent>> {
+        Ok(self.poll_state_change(timeout, reconnect)?.map(|stop| {
+            let stop = self.mark_known_breakin_stop(stop);
+            self.record_stop(&stop);
+            stop_event(stop)
+        }))
+    }
+
+    fn poll_state_change(
+        &mut self,
+        timeout: Duration,
+        reconnect: bool,
+    ) -> Result<Option<StateChange>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.serial_recovery.is_some() {
+                if !reconnect {
+                    return Err(Error::Kd(
+                        "serial connection is unavailable during exit".into(),
+                    ));
+                }
+                self.recover_serial(deadline.saturating_duration_since(Instant::now()))?;
+                if self.serial_recovery.is_some() {
+                    return Ok(None);
+                }
+            }
+            match self
+                .poll_state_change_connected(deadline.saturating_duration_since(Instant::now()))
+            {
+                Err(error) if reconnect && self.begin_serial_recovery(&error)? => {
+                    if Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn poll_state_change_connected(&mut self, timeout: Duration) -> Result<Option<StateChange>> {
         // Pump path: the background thread already services the socket and
         // detects stops, so just poll it. This is the common case while running
         if matches!(self.link, Link::RunningPumped(_)) {
-            return match self.take_pump_stop(Some(timeout))? {
-                Some(stop) => {
-                    let stop = self.mark_known_breakin_stop(stop);
-                    kd_trace!(
-                        "kd: try_wait: pump reported stop rip={:#x} exc={:#x}",
-                        stop.program_counter,
-                        stop.exception_code
-                    );
-                    self.record_stop(&stop);
-                    Ok(Some(stop_event(stop)))
-                }
-                None => Ok(None),
-            };
+            return self.take_pump_stop(Some(timeout));
         }
         // Synchronous fallback (no pump, e.g. polling after a bare step)
         self.framing()?
@@ -596,15 +642,6 @@ impl KdBackend {
             Err(e) => return Err(e),
         };
 
-        let stop = self.mark_known_breakin_stop(stop);
-        kd_trace!(
-            "kd: try_wait: stop rip={:#x} exc={:#x} in_managed={}",
-            stop.program_counter,
-            stop.exception_code,
-            self.managed_bp_addresses.contains(&stop.program_counter)
-        );
-
-        self.record_stop(&stop);
-        Ok(Some(stop_event(stop)))
+        Ok(Some(stop))
     }
 }

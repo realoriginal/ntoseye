@@ -90,6 +90,7 @@ nix = { version = "0.31.3", features = [ "process", "uio" ] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+socket2 = "0.6"
 
 [features]
 default = ["cli", "mcp", "dap", "gdbserver", "python-embed"]

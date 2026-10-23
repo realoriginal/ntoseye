@@ -805,10 +805,22 @@ impl ContinueDrain {
     }
 }
 
+/// Crash evidence belongs to the outstanding wait, even across socket replacement.
+#[derive(Default)]
+pub struct PumpBugcheck {
+    pending: bool,
+    capture: BugcheckCapture,
+}
+
+pub struct PumpResult {
+    pub framing: KdFraming<KdTransport>,
+    pub bugcheck: PumpBugcheck,
+}
+
 /// Handle to the background servicing pump (see [`run_pump`])
 pub struct PumpHandle {
-    pub join: JoinHandle<KdFraming<KdTransport>>,
-    pub stop_rx: Receiver<std::result::Result<StateChange, String>>,
+    pub join: JoinHandle<PumpResult>,
+    pub stop_rx: Receiver<Result<StateChange>>,
     pub shutdown: Arc<AtomicBool>,
     /// Set by the pump the instant it places a result in `stop_rx` and exits.
     /// Lets the foreground tell "running" from "stopped but not yet drained"
@@ -822,7 +834,7 @@ pub struct PumpHandle {
 /// The pump's side of its link to the foreground: where it reports the stop
 /// and how it learns to shut down.
 pub struct PumpLink {
-    pub stop_tx: mpsc::Sender<std::result::Result<StateChange, String>>,
+    pub stop_tx: mpsc::Sender<Result<StateChange>>,
     pub shutdown: Arc<AtomicBool>,
     /// See [`PumpHandle::reported_stop`].
     pub reported_stop: Arc<AtomicBool>,
@@ -843,19 +855,15 @@ pub fn run_pump(
     reconnect_assist_delay: Option<Duration>,
     debug_log: DebugLog,
     mut drain: Option<ContinueDrain>,
-) -> KdFraming<KdTransport> {
-    // Flag the result the moment it lands in the channel, before we exit, so a
-    // concurrent foreground `is_running()`/status read sees "stopped, undrained"
-    // rather than the stale running value.
+    mut bugcheck: PumpBugcheck,
+) -> PumpResult {
+    // Publish before flagging: a foreground zero-time poll must be able to
+    // receive the result as soon as has_pending_stop reports it.
     let report = |result| {
-        link.reported_stop.store(true, Ordering::SeqCst);
         let _ = link.stop_tx.send(result);
+        link.reported_stop.store(true, Ordering::SeqCst);
     };
-    // Persists across poll iterations: once the fatal-error print is seen, the
-    // next state-change is surfaced even if a timeout intervened first
-    let mut bugcheck = false;
     let reconnect_assist_at = reconnect_assist_delay.map(|delay| Instant::now() + delay);
-    let mut bugcheck_capture = BugcheckCapture::default();
     let mut next_assist_breakin = Instant::now();
     let mut assist_breakin_count = 0u32;
     let mut assisted_breakin_pending = false;
@@ -872,8 +880,8 @@ pub fn run_pump(
                 arch,
                 saw_kd_refresh: None,
                 filter: StateChangeFilter::Runtime,
-                bugcheck: Some(&mut bugcheck),
-                bugcheck_capture: Some(&mut bugcheck_capture),
+                bugcheck: Some(&mut bugcheck.pending),
+                bugcheck_capture: Some(&mut bugcheck.capture),
                 deadline: Some(Instant::now() + PUMP_POLL),
                 debug_log: Some(&debug_log),
             },
@@ -884,7 +892,7 @@ pub fn run_pump(
                     && drain.is_spurious(&stop)
                 {
                     if let Err(e) = drain.absorb(&mut framing, arch, &stop) {
-                        report(Err(e.to_string()));
+                        report(Err(e));
                         break;
                     }
                     continue;
@@ -910,7 +918,7 @@ pub fn run_pump(
                         &mut next_assist_breakin,
                         &mut assist_breakin_count,
                     ) {
-                        report(Err(e.to_string()));
+                        report(Err(e));
                         break;
                     }
                     assisted_breakin_pending = true;
@@ -920,12 +928,12 @@ pub fn run_pump(
                 }
             }
             Err(e) => {
-                report(Err(e.to_string()));
+                report(Err(e));
                 break;
             }
         }
     }
-    framing
+    PumpResult { framing, bugcheck }
 }
 
 #[cfg(test)]

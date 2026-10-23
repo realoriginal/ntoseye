@@ -23,6 +23,7 @@ Keeping this file:
 
 ### Fixed
 
+- A serial KD wait retries a disconnected VM socket for up to 30 seconds, including while VMware recreates it after suspend/resume. Reconnecting preserves the session and its tracked breakpoints without requiring repeated `g` commands or interrupting a running guest. An explicit `break` reconnects before requesting a halt.
 - Modules are named after their image file, as WinDbg's `lm` names them, not the loader's alias for it: `kd.dll` rather than `kdcom.dll`, `mcupdate_GenuineIntel.dll` rather than `mcupdate.dll`, in a WOW64 process's 32-bit module list too. Their `module!` prefixes follow (`kd!`, `mcupdate_genuineintel!`).
 
 ## v0.51.0 (2026-10-19)

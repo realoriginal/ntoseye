@@ -1,17 +1,29 @@
 //! Handing the transport to the background pump while the target runs, and
 //! taking it back when the target stops or the foreground needs the socket.
 
-use std::io::Write;
+use std::io::{ErrorKind, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, mpsc};
 use std::thread::spawn;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::backend::kd::framing::BREAKIN_BYTE;
 use crate::base::error::{Error, Result};
 
-use super::{ContinueDrain, KdBackend, Link, PumpHandle, PumpLink, StateChange, run_pump};
+use super::transport::KdTransport;
+use super::{
+    ContinueDrain, KdBackend, Link, PUMP_POLL, PumpHandle, PumpLink, StateChange, run_pump,
+};
+
+const SERIAL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(super) struct SerialRecovery {
+    path: PathBuf,
+    pub(super) deadline: Instant,
+    next_attempt: Instant,
+}
 
 impl KdBackend {
     /// Hand the framing to a freshly spawned background pump. The target has
@@ -37,6 +49,7 @@ impl KdBackend {
         let pump_reported_stop = Arc::clone(&reported_stop);
         let pump_debug_log = self.debug_log.clone();
         let arch = self.arch;
+        let bugcheck = std::mem::take(&mut self.pump_bugcheck);
         let breakin_requested = drain
             .as_ref()
             .map(ContinueDrain::interrupt_flag)
@@ -53,6 +66,7 @@ impl KdBackend {
                 reconnect_assist_delay,
                 pump_debug_log,
                 drain,
+                bugcheck,
             )
         });
         kd_trace!("kd: pump: spawned background servicing thread");
@@ -76,7 +90,10 @@ impl KdBackend {
                 // Whoever asked for the framing back also consumes the stop,
                 // if there was one, and records it; until then the target is
                 // still running.
-                Ok(framing) => self.link = Link::RunningInline(framing),
+                Ok(result) => {
+                    self.link = Link::RunningInline(result.framing);
+                    self.pump_bugcheck = result.bugcheck;
+                }
                 Err(_) => {
                     // The pump panicked; the framing (and socket) is lost. The
                     // next foreground op surfaces this as a transport error
@@ -84,6 +101,88 @@ impl KdBackend {
                 }
             }
         }
+    }
+
+    /// Start recovery only after a disconnected, named serial stream. The old
+    /// framing stays intact: reopening is not a new KD session or a replay.
+    pub(super) fn begin_serial_recovery(&mut self, error: &Error) -> Result<bool> {
+        if !matches!(error, Error::Io(error) if matches!(error.kind(),
+            ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
+        )) {
+            return Ok(false);
+        }
+        let Some(path) = self.framing()?.transport_mut().serial_path()? else {
+            return Ok(false);
+        };
+        if self.serial_recovery.is_none() {
+            let now = Instant::now();
+            self.serial_recovery = Some(SerialRecovery {
+                path,
+                deadline: now + SERIAL_RECOVERY_TIMEOUT,
+                next_attempt: now,
+            });
+            self.record_running();
+            self.efer_cache.clear();
+            kd_trace!("kd: serial disconnected; retrying the existing session for up to 30s");
+        }
+        Ok(true)
+    }
+
+    /// Retry within one caller's poll budget, leaving longer waits and their
+    /// cancellation to the existing run driver.
+    pub(super) fn recover_serial(&mut self, budget: Duration) -> Result<()> {
+        let poll_deadline = Instant::now() + budget;
+        while let Some(recovery) = &mut self.serial_recovery {
+            let now = Instant::now();
+            if now >= recovery.deadline {
+                let message = format!(
+                    "serial connection recovery timed out after 30s waiting for {}; the session is retained",
+                    recovery.path.display()
+                );
+                self.serial_recovery = None;
+                return Err(Error::Kd(message));
+            }
+            if now < recovery.next_attempt {
+                let wait_until = recovery
+                    .next_attempt
+                    .min(poll_deadline)
+                    .min(recovery.deadline);
+                std::thread::sleep(wait_until.saturating_duration_since(now));
+                if Instant::now() >= poll_deadline {
+                    return Ok(());
+                }
+                continue;
+            }
+            recovery.next_attempt = now + PUMP_POLL;
+            match KdTransport::reopen_serial(&recovery.path) {
+                Ok(transport) => {
+                    let breakin_clone = transport.try_clone()?;
+                    *self.framing()?.transport_mut() = transport;
+                    self.breakin_clone = breakin_clone;
+                    self.serial_recovery = None;
+                    self.serial_reconnected = true;
+                    kd_trace!("kd: serial connection restored; continuing the existing wait");
+                    // A running guest needs no break-in. A stopped one retransmits
+                    // its state change; neither case warrants RESET or continue.
+                    self.start_pump(None, None)?;
+                    return Ok(());
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::NotFound
+                            | ErrorKind::ConnectionRefused
+                            | ErrorKind::WouldBlock
+                            | ErrorKind::TimedOut
+                            | ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+            if Instant::now() >= poll_deadline {
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     /// Wait for the pump to report a stop. `wait` bounds a non-blocking poll;
@@ -103,7 +202,7 @@ impl KdBackend {
         match received {
             Ok(result) => {
                 self.reclaim_framing();
-                result.map(Some).map_err(Error::Kd)
+                result.map(Some)
             }
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => {
@@ -113,18 +212,12 @@ impl KdBackend {
         }
     }
 
-    /// Stop the pump (if running) without waiting for a stop event, reclaiming
-    /// the framing. Used on teardown and when abandoning an interrupt
-    pub(super) fn shutdown_pump(&mut self) {
-        let _ = self.shutdown_pump_with_stop();
-    }
-
     fn try_recv_pump_stop(
-        stop_rx: &mpsc::Receiver<std::result::Result<StateChange, String>>,
+        stop_rx: &mpsc::Receiver<Result<StateChange>>,
     ) -> Result<Option<StateChange>> {
         match stop_rx.try_recv() {
             Ok(Ok(stop)) => Ok(Some(stop)),
-            Ok(Err(message)) => Err(Error::Kd(message)),
+            Ok(Err(error)) => Err(error),
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => Ok(None),
         }
     }
@@ -146,7 +239,10 @@ impl KdBackend {
         // before propagating that error, just as we do for a successful stop.
         let stop = Self::try_recv_pump_stop(&stop_rx);
         match join.join() {
-            Ok(framing) => self.link = Link::RunningInline(framing),
+            Ok(result) => {
+                self.link = Link::RunningInline(result.framing);
+                self.pump_bugcheck = result.bugcheck;
+            }
             Err(_) => {
                 kd_trace!("kd: pump: thread panicked during shutdown, framing lost");
                 if matches!(stop, Ok(None)) {

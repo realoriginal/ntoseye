@@ -12,6 +12,20 @@ pub enum KdTransport {
 }
 
 impl KdTransport {
+    pub(super) fn serial_path(&self) -> io::Result<Option<std::path::PathBuf>> {
+        match self {
+            Self::Serial(stream) => Ok(stream.peer_addr()?.as_pathname().map(ToOwned::to_owned)),
+            Self::Network(_) => Ok(None),
+        }
+    }
+
+    pub(super) fn reopen_serial(path: &std::path::Path) -> io::Result<Self> {
+        let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+        socket.connect_timeout(&socket2::SockAddr::unix(path)?, Duration::from_millis(1))?;
+        socket.set_write_timeout(Some(super::PUMP_POLL))?;
+        Ok(Self::Serial(socket.into()))
+    }
+
     pub fn try_clone(&self) -> io::Result<Self> {
         match self {
             Self::Serial(stream) => stream.try_clone().map(Self::Serial),

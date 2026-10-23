@@ -23,6 +23,7 @@ mod exit;
 mod file_io;
 mod memory;
 mod pump;
+mod recovery;
 mod registers;
 mod run;
 
@@ -172,6 +173,9 @@ fn exception_state_change_payload(pc: u64) -> Vec<u8> {
 fn kd_backend_with_pump(pump: PumpHandle, breakin_clone: UnixStream) -> KdBackend {
     KdBackend {
         link: Link::RunningPumped(pump),
+        serial_recovery: None,
+        pump_bugcheck: PumpBugcheck::default(),
+        serial_reconnected: false,
         breakin_clone: breakin_clone.into(),
         backend_name: "kd",
         register_map: amd64::build_register_map(),
@@ -222,6 +226,9 @@ fn kd_backend_with_framing(host: UnixStream) -> KdBackend {
     let breakin_clone = host.try_clone().unwrap();
     KdBackend {
         link: Link::RunningInline(KdFraming::new(host.into())),
+        serial_recovery: None,
+        pump_bugcheck: PumpBugcheck::default(),
+        serial_reconnected: false,
         breakin_clone: breakin_clone.into(),
         backend_name: "kd",
         register_map: amd64::build_register_map(),

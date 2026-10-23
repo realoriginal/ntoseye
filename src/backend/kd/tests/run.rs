@@ -145,7 +145,10 @@ fn known_breakin_stop_is_marked_assisted_unless_managed() {
     let breakin_clone = host.try_clone().unwrap();
     let pump_host = host.try_clone().unwrap();
     let pump = PumpHandle {
-        join: spawn(move || KdFraming::new(pump_host.into())),
+        join: spawn(move || PumpResult {
+            framing: KdFraming::new(pump_host.into()),
+            bugcheck: PumpBugcheck::default(),
+        }),
         stop_rx: mpsc::channel().1,
         shutdown: Arc::new(AtomicBool::new(false)),
         reported_stop: Arc::new(AtomicBool::new(false)),
@@ -187,7 +190,10 @@ fn a_breakin_answered_by_another_stop_is_absorbed_when_it_arrives_late() {
     let breakin_clone = host.try_clone().unwrap();
     let pump_host = host.try_clone().unwrap();
     let pump = PumpHandle {
-        join: spawn(move || KdFraming::new(pump_host.into())),
+        join: spawn(move || PumpResult {
+            framing: KdFraming::new(pump_host.into()),
+            bugcheck: PumpBugcheck::default(),
+        }),
         stop_rx: mpsc::channel().1,
         shutdown: Arc::new(AtomicBool::new(false)),
         reported_stop: Arc::new(AtomicBool::new(false)),
