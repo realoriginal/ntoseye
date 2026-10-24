@@ -13,7 +13,6 @@ use crate::backend::dbg_backend::{
 };
 use crate::backend::debugger_data::DebuggerDataCandidate;
 use crate::backend::kd::framing::KdFraming;
-use crate::base::bytes;
 use crate::base::error::{Error, Result};
 use crate::base::memory::TranslationCache;
 use crate::base::notice::Notice;
@@ -52,7 +51,9 @@ pub fn trace_bytes_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("NTOSEYE_KD_TRACE_BYTES").is_some())
 }
 
+mod amd64;
 pub mod api;
+mod arm64;
 mod breakpoints;
 mod connect;
 mod exit;
@@ -61,6 +62,7 @@ mod halt;
 mod handles;
 mod hw_breakpoints;
 mod kdnet;
+mod machine;
 mod memory;
 mod pump;
 mod registers;
@@ -68,6 +70,7 @@ mod run;
 mod transport;
 use breakpoints::PendingWriteBreakpoint;
 use halt::HaltRegisters;
+use machine::machine;
 use memory::LineCache;
 use transport::KdTransport;
 
@@ -117,33 +120,6 @@ struct ControlReport(Vec<u8>);
 /// `DBGKD_ANY_WAIT_STATE_CHANGE` header (32) plus its exception union
 /// (`EXCEPTION_RECORD64` 0x98 + `FirstChance` ULONG, padded to 0xa0).
 const CONTROL_REPORT_OFFSET: usize = 192;
-/// `AMD64_DBGKD_CONTROL_REPORT`: Dr6, Dr7, EFlags, InstructionCount,
-/// ReportFlags, InstructionStream[16], SegCs, SegDs, SegEs, SegFs.
-const AMD64_CONTROL_REPORT_SIZE: usize = 48;
-const AMD64_CONTROL_DR6_OFFSET: usize = 0;
-const AMD64_CONTROL_DR7_OFFSET: usize = 8;
-const AMD64_CONTROL_EFLAGS_OFFSET: usize = 16;
-
-impl ControlReport {
-    fn amd64(&self) -> Option<&[u8]> {
-        self.0.get(..AMD64_CONTROL_REPORT_SIZE)
-    }
-
-    /// AMD64 DR6 and RFLAGS as the target reported them at the stop.
-    fn amd64_trap_state(&self) -> Option<TrapState> {
-        let report = self.amd64()?;
-        Some(TrapState {
-            eflags: u64::from(bytes::read_u32(report, AMD64_CONTROL_EFLAGS_OFFSET)),
-            dr6: bytes::read_u64(report, AMD64_CONTROL_DR6_OFFSET),
-        })
-    }
-
-    /// AMD64 DR7, which a continue must preserve.
-    fn amd64_dr7(&self) -> Option<u64> {
-        Some(bytes::read_u64(self.amd64()?, AMD64_CONTROL_DR7_OFFSET))
-    }
-}
-
 /// Retained guest debug-output lines (DbgPrint ring). Bounded so a chatty guest
 /// can't grow memory without limit; older lines are evicted and a reader that
 /// falls behind sees `dropped`.
@@ -475,17 +451,8 @@ impl DebugBackend for KdBackend {
         self.read_register_context()
     }
 
-    /// KD reports TF and DR6 in every AMD64 state change, so an absorbed
-    /// breakpoint hit can decide it has no single-step residue to clear
-    /// without fetching a `CONTEXT` it would read two fields from.
     fn stop_trap_state(&mut self) -> Option<TrapState> {
-        match self.arch {
-            Arch::Amd64 => {}
-            Arch::Arm64 => return None,
-        }
-        self.registers
-            .report(self.current_processor)?
-            .amd64_trap_state()
+        machine(self.arch).stop_trap_state(self)
     }
 
     fn surface_next_break_at(&mut self, address: Option<u64>) {
@@ -504,12 +471,10 @@ impl DebugBackend for KdBackend {
         self.uninstall_breakpoint(addr)
     }
 
+    // Every architecture exposes per-processor debug state through KD's
+    // KSPECIAL_REGISTERS (DR0-DR7 on AMD64; BVR/BCR and WVR/WCR on ARM64).
     fn supports_watchpoints(&self) -> bool {
-        // Both architectures expose per-processor debug state through KD
-        // KSPECIAL_REGISTERS (DR0-DR7 on AMD64; BVR/BCR and WVR/WCR on ARM64).
-        match self.arch {
-            Arch::Amd64 | Arch::Arm64 => true,
-        }
+        true
     }
 
     fn hardware_breakpoint_slots(&self) -> usize {
@@ -534,11 +499,9 @@ impl DebugBackend for KdBackend {
         self.clear_hardware_slot(slot)
     }
 
+    // GuestMemoryPatch writes the architecture's breakpoint instruction.
     fn supports_user_mode_breakpoints(&self) -> bool {
-        // GuestMemoryPatch emits `int3` on AMD64 and `brk #0xF000` on ARM64.
-        match self.arch {
-            Arch::Amd64 | Arch::Arm64 => true,
-        }
+        true
     }
 
     fn supports_msr(&self) -> bool {

@@ -25,7 +25,7 @@ Stops and `u` now show where the code goes: the instructions around the stop in 
 - The prompt suggests as you type: the rest of the most recent earlier line that starts with what you've typed appears dimmed after the cursor (`b` suggests `bp nt!NtClose`), as fish does. **→**, **End** or **Ctrl+E** accepts it, **Ctrl+→** a word at a time; **Enter** runs only what you typed. Tern's prompt already did this. With `NO_COLOR` set, nothing is suggested, since only its dimming sets a suggestion apart from what you typed.
 - The prompt marks where each command and its output start and end (OSC 133), as a shell does for its terminal, so a terminal that reads the marks can jump between commands, select one's output, or flag one that reported an error.
 - When the target ran for 10 seconds or more before it stopped, the terminal shows a desktop notification of the stop (`ntoseye: breakpoint #0 hit at nt!NtClose on processor 2`): kitty only while its window is out of view, terminals that read OSC 9 (Ghostty, iTerm2) each time. A stop you cause with Ctrl+C or `break` sends none.
-- The window title names the prompt's processor and backend, and where the target stopped or that it runs (`ntoseye — 3: kd — nt!NtClose+0x5`), and is given back on exit. While the target runs, and while symbols download or a dump is written, terminals that show progress (OSC 9;4: kitty, Ghostty, iTerm2, Windows Terminal) show it on the window or tab.
+- The window title names the prompt's processor and backend, and where the target stopped or that it runs (`ntoseye - 3: kd - nt!NtClose+0x5`), and is given back on exit.
 
 ### Changed
 
@@ -41,6 +41,8 @@ Stops and `u` now show where the code goes: the instructions around the stop in 
 - `dqs`, `dps`, `dds` and `kd` name the registers that point into each slot (`rsp ▶`), and mark a value that is a return address, one the code before ends in a call, `↩` before its symbol.
 - `db` splits each row's two halves with `-`, as WinDbg does, and the memory displays show zero values and unreadable items dimmer than data.
 - `~` marks the selected vCPU with `.`.
+- On an ARM64 target, the register grid names the flags `cpsr` has set after its value (`cpsr 0000000060000000 [Z C]`), as it names `rfl`'s on AMD64. They were spelled under its digits, on a line of their own.
+- `r rfl` reads AMD64's flags register by the name the grid shows, and a selected frame's or context's registers answer to their other names too (`rfl` for `eflags`, `fp` for `x29`). `r eax` in a frame that did not save `rax` says it was not recovered rather than that no such register exists.
 - One blank line sets a command's output apart from the next prompt, whatever the command ended with: some commands left none, others one or two. The output starts right under the command line, and the blank lines between its sections stay. A `.logopen` transcript reads the same; MCP results, gdbserver's `monitor` output and DAP's debug console end at the output's last line.
 - Every command's output follows one style, closer to WinDbg's. One object's fields are aligned under a heading that names it (`THREAD`, `PROCESS`, `TEB`, `TOKEN`, as WinDbg names them); a value that is missing or could not be read is `-`, with the reason in one note under the block; booleans read `yes`/`no`, enumerations `Waiting (0x5)`, flag sets `0x8004 (SE_DACL_PRESENT | SE_SELF_RELATIVE)`, times `2026-10-15T23:23:28Z`, and processes `smss.exe (PID 540)`. Messages start in lowercase, an empty result says what there is none of, and a command that changed nothing says so (`.logclose` with no log open, `.cxr` with no context selected). `!thread` and `!process` list their fields one per line, not packed into `key=value` runs, and many extension commands (`!vm`, `!locks`, `!lookaside`, `!stacks`, `!idt`, `!gdt`) lay out their records as tables. Disassembly prints hex in lowercase.
 - Stacks are numbered as `k` numbers them (`00`, `01`) everywhere, the stop's and `!thread`'s too, and every stack in `k`'s layout has its header row (` # Child-SP  IP  Call Site`). A frame without a symbol shows its address in the call site, and a stop names its thread as `!thread` does (`thread ffffb10918a7f080  TID 10236  PID 6532  process svchost.exe`).
@@ -69,6 +71,7 @@ Stops and `u` now show where the code goes: the instructions around the stop in 
 - `s` counts the bytes it could not read correctly, and says so when it could read none of the range rather than reporting no matches. `dS` no longer reads past a string's `MaximumLength`.
 - `!hvcall` on a target without direct host RAM, such as a kernel dump, says that the hypervisor's memory needs it, as the other hypervisor commands do. It said the processor was not halted in the hypervisor.
 - `!address -summary` on a user-mode dump without a memory-info list prints the summary only, not every captured range.
+- `ntoseye mcp --http <address> --unsafe-http` answers requests addressed to the host's network address or name. Since v0.49.1 it refused every request whose `Host` was not a loopback name with `403 Forbidden`, so no other machine could use it.
 
 ### Removed
 

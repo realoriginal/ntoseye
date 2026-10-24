@@ -10,6 +10,7 @@ use std::thread::spawn;
 use std::time::Instant;
 
 use crate::backend::dbg_backend::ModuleEvent;
+use crate::backend::kd::amd64::{reported_dr7, trap_state};
 use crate::backend::kd::event_loop::PumpBugcheck;
 use crate::backend::kd::framing::{
     BREAKIN_BYTE, HEADER_SIZE, INITIAL_PACKET_ID, PACKET_TYPE_KD_ACKNOWLEDGE,
@@ -180,10 +181,10 @@ fn state_change_carries_the_amd64_control_report() {
     assert_eq!(stop.exception_code, STATUS_BREAKPOINT);
 
     let report = stop.control_report.expect("240 bytes carry a report");
-    let trap = report.amd64_trap_state().expect("AMD64 report");
+    let trap = trap_state(&report).expect("AMD64 report");
     assert_eq!(trap.eflags, 0x246, "RFLAGS: IF | PF | reserved");
     assert_eq!(trap.dr6, 0xffff_0ff0, "DR6 with no breakpoint status set");
-    assert_eq!(report.amd64_dr7(), Some(0x400));
+    assert_eq!(reported_dr7(&report), Some(0x400));
     assert!(
         trap.is_clean(),
         "an int3 stop has neither a trap flag nor DR6 status to clear"
@@ -801,7 +802,7 @@ fn await_refresh_sets_flag_without_breakin() {
         let stop = await_state_change(
             &mut framing,
             AwaitStateOptions {
-                arch: Arch::Amd64,
+                arch: Some(Arch::Amd64),
                 saw_kd_refresh: Some(&mut saw_refresh),
                 filter: StateChangeFilter::Runtime,
                 bugcheck: None,
@@ -891,7 +892,7 @@ fn await_bugcheck_aware(prints: &[&[u8]], pc: u64) -> StateChange {
         await_state_change(
             &mut framing,
             AwaitStateOptions {
-                arch: Arch::Amd64,
+                arch: Some(Arch::Amd64),
                 saw_kd_refresh: None,
                 filter: StateChangeFilter::Runtime,
                 bugcheck: Some(&mut bugcheck),
