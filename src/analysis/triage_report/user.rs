@@ -11,10 +11,11 @@ use ntoseye_macros::record;
 use super::culprit::{is_user_system_module, user_culprit_attribution};
 use super::signature::user_failure_signature;
 use super::{TRIAGE_BACKTRACE_LIMIT, TriageReport};
+use crate::arch::Arch;
 use crate::base::memory::MemoryOps;
 use crate::base::ntstatus::ntstatus_name;
 use crate::base::time::unix_time_to_iso;
-use crate::base::types::{Arch, VirtAddr};
+use crate::base::types::VirtAddr;
 use crate::nt::dmp::{DmpException, UnloadedDriver};
 use crate::nt::guest::ModuleInfo;
 use crate::nt::target::mm::{memory_state_name, memory_type_name, page_protection_name};
@@ -347,13 +348,6 @@ const FAST_FAIL_CODES: &[(u64, &str)] = &[
     (69, "FAST_FAIL_NTDLL_PATCH_FAILED"),
     (70, "FAST_FAIL_INVALID_FLS_DATA"),
 ];
-
-/// The general-purpose registers `-v` shows from the exception's context.
-const AMD64_REGISTERS: [&str; 18] = [
-    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rsp", "rbp", "rip", "r8", "r9", "r10", "r11", "r12",
-    "r13", "r14", "r15", "eflags",
-];
-const ARM64_EXTRA_REGISTERS: [&str; 5] = ["fp", "lr", "sp", "pc", "cpsr"];
 
 /// The kind of an exception code and its name, or what it is when it has
 /// no name.
@@ -720,19 +714,17 @@ fn frame_where(
         })
 }
 
+/// The general-purpose registers `-v` shows from the exception's context,
+/// in the register grid's order.
 fn general_registers(arch: Arch, values: &HashMap<String, u64>) -> Vec<RegisterValue> {
-    let names: Vec<String> = match arch {
-        Arch::Amd64 => AMD64_REGISTERS.map(String::from).to_vec(),
-        Arch::Arm64 => (0..=28)
-            .map(|index| format!("x{index}"))
-            .chain(ARM64_EXTRA_REGISTERS.map(String::from))
-            .collect(),
-    };
-    names
-        .into_iter()
+    arch.general_registers()
+        .iter()
         .filter_map(|name| {
-            let value = *values.get(&name)?;
-            Some(RegisterValue { name, value })
+            let value = *values.get(*name)?;
+            Some(RegisterValue {
+                name: name.to_string(),
+                value,
+            })
         })
         .collect()
 }
@@ -799,10 +791,7 @@ pub fn build(session: &mut Session) -> Option<TriageReport> {
                     .and_then(|thread| thread.name.clone()),
                 source: UserStackSource::ExceptionContext,
             };
-            let trace = match session
-                .target
-                .user_exception_registers(&session.register_map)
-            {
+            let trace = match session.target.user_exception_registers() {
                 Ok(registers) => {
                     exception_registers = general_registers(info.arch, &registers);
                     Some(

@@ -8,13 +8,14 @@ use std::sync::Arc;
 use pelite::PeView;
 
 use super::{SelectedFrame, Target};
+use crate::arch::Arch;
 use crate::{
     backend::{dbg_backend::processor_index_from_backend_thread_id, phys::PhysMem},
     base::{
         disasm::{self, DisasmRow},
         error::{Error, Result},
         memory::{AddressSpace, MemoryOps, PAGE_SIZE},
-        types::{Arch, CodeMachine, Dtb, Keyed, PhysAddr, VirtAddr},
+        types::{CodeMachine, Dtb, Keyed, PhysAddr, VirtAddr},
     },
     nt::{
         cpu_state::kpcr_for_processor,
@@ -35,6 +36,10 @@ use crate::{
     },
 };
 use ntoseye_macros::record;
+
+/// Why the Windows hypervisor's memory can't be read: only direct host RAM
+/// reaches it.
+pub const HYPERVISOR_NEEDS_HOST_RAM: &str = "reading the hypervisor's memory needs direct host RAM: the memory or gdb backend, or kd/kdnet with --memory-source host";
 
 /// How far below an instruction pointer to look for the header of the image
 /// it lies in. The Windows hypervisor and secure kernel are a few MiB.
@@ -453,8 +458,9 @@ impl Target {
         rip: u64,
         processor: Option<u16>,
     ) -> Result<Vec<SavedVtlContext>> {
-        if self.arch() != Arch::Amd64 {
-            return Ok(Vec::new());
+        match self.arch() {
+            Arch::Amd64 => {}
+            Arch::Arm64 => return Ok(Vec::new()),
         }
         let mask = self.arch().dtb_page_mask();
         let pages = self
@@ -645,7 +651,7 @@ impl Target {
         else {
             return false;
         };
-        self.select_frame(SelectedFrame::from_registers(0, saved));
+        self.select_frame(SelectedFrame::from_registers(self.arch(), 0, saved));
         true
     }
 
@@ -1149,7 +1155,7 @@ impl Target {
         let guest = ept::EptMemory::new(&*self.phys, state.ept_pointer, state.mode_based_execute());
         if virtual_address {
             require_four_level_paging(state)?;
-            AddressSpace::new(&guest, state.cr3 & self.arch().dtb_page_mask())
+            AddressSpace::new_amd64(&guest, state.cr3 & self.arch().dtb_page_mask())
                 .read_bytes(VirtAddr(address), buf)
         } else {
             guest.read_bytes(address, buf)
@@ -1166,8 +1172,9 @@ impl Target {
     ) -> Result<Option<(u64, u64)>> {
         require_four_level_paging(state)?;
         let guest = ept::EptMemory::new(&*self.phys, state.ept_pointer, state.mode_based_execute());
-        let Some(translation) = AddressSpace::new(&guest, state.cr3 & self.arch().dtb_page_mask())
-            .virt_to_phys(VirtAddr(address))?
+        let Some(translation) =
+            AddressSpace::new_amd64(&guest, state.cr3 & self.arch().dtb_page_mask())
+                .virt_to_phys(VirtAddr(address))?
         else {
             return Ok(None);
         };
@@ -1254,10 +1261,13 @@ impl Target {
     /// (their host GS base) and from the selected vCPU when it is halted in
     /// the hypervisor, and its image through the first root that maps it.
     fn locate_hypervisor(&self) -> Result<HypervisorLocation<'_>> {
-        if self.arch() != Arch::Amd64 {
-            return Err(Error::Hypervisor(
-                "the Windows hypervisor needs an AMD64 target".to_string(),
-            ));
+        match self.arch() {
+            Arch::Amd64 => {}
+            Arch::Arm64 => {
+                return Err(Error::Hypervisor(
+                    "the Windows hypervisor needs an AMD64 target".to_string(),
+                ));
+            }
         }
         // A guest partition's memory holds no hypervisor: the target's runs
         // it, and is inspected from the target.
@@ -1293,10 +1303,7 @@ impl Target {
                 }
             }
             Err(_) if sources.is_empty() && self.phys.ram_runs().is_empty() => {
-                return Err(Error::Hypervisor(
-                    "reading the hypervisor's memory needs direct host RAM: the memory or gdb backend, or kd/kdnet with --memory-source host"
-                        .to_string(),
-                ));
+                return Err(Error::Hypervisor(HYPERVISOR_NEEDS_HOST_RAM.to_string()));
             }
             Err(error) if sources.is_empty() => return Err(error),
             Err(_) => {}

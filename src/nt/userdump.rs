@@ -7,7 +7,6 @@
 //! directly (see [`UserDump::read_virtual`]); the target built over it lists
 //! the dump's own modules and threads rather than discovering a kernel.
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::path::Path;
@@ -15,11 +14,9 @@ use std::path::Path;
 use memmap2::Mmap;
 use ntoseye_macros::record;
 
-use crate::backend::cpu_context::{amd64, arm64};
-use crate::backend::dbg_backend::RegisterMap;
-use crate::base::bytes::get_u32;
+use crate::arch::Arch;
 use crate::base::error::{Error, Result};
-use crate::base::types::{Arch, VirtAddr};
+use crate::base::types::VirtAddr;
 use crate::nt::guest::ModuleInfo;
 use crate::nt::pe::headers::CodeView;
 use crate::nt::target::mm::{memory_state_name, memory_type_name, page_protection_name};
@@ -388,11 +385,11 @@ impl UserDumpInfo {
         }
     }
 
-    /// `charmap.exe (pid 1234)`, as far as the dump records it.
+    /// `charmap.exe (PID 1234)`, as far as the dump records it.
     pub fn process_label(&self) -> String {
         let name = self.process_name().unwrap_or("process");
         match self.process_id {
-            Some(pid) => format!("{name} (pid {pid})"),
+            Some(pid) => format!("{name} (PID {pid})"),
             None => name.to_string(),
         }
     }
@@ -444,69 +441,24 @@ impl UserDumpInfo {
         }
     }
 
+    /// The thread id a backend id names (see [`Self::backend_thread_id`]),
+    /// when it names a thread of this dump's process.
+    pub fn tid_for_backend_id(&self, id: &str) -> Option<u32> {
+        let (pid, tid) = match id.split_once('.') {
+            Some((pid, tid)) => (Some(u32::from_str_radix(pid, 16).ok()?), tid),
+            None => (None, id),
+        };
+        if pid != self.process_id {
+            return None;
+        }
+        u32::from_str_radix(tid, 16).ok()
+    }
+
     /// The thread a backend id names (see [`Self::backend_thread_id`]).
     pub fn thread_for_backend_id(&self, id: &str) -> Option<&UserThreadInfo> {
-        self.threads
-            .iter()
-            .find(|thread| self.backend_thread_id(thread.tid).eq_ignore_ascii_case(id))
+        let tid = self.tid_for_backend_id(id)?;
+        self.threads.iter().find(|thread| thread.tid == tid)
     }
-}
-
-/// The register buffer the architecture's register map reads, holding a raw
-/// CONTEXT. The slots past the CONTEXT (control registers, page-table roots)
-/// stay zero: a user dump records none.
-pub fn register_buffer(arch: Arch, raw_context: &[u8]) -> Vec<u8> {
-    let (context_size, buffer_size) = match arch {
-        Arch::Amd64 => (amd64::CONTEXT_SIZE, amd64::REGISTER_BUFFER_SIZE),
-        Arch::Arm64 => (arm64::CONTEXT_SIZE, arm64::REGISTER_BUFFER_SIZE),
-    };
-    let mut buffer = vec![0u8; buffer_size];
-    let length = raw_context.len().min(context_size);
-    buffer[..length].copy_from_slice(&raw_context[..length]);
-    buffer
-}
-
-/// The registers a raw CONTEXT records, named as the architecture's
-/// register map names them: the CONTEXT's own fields only (none of the
-/// control-register or descriptor slots past it), and of those only the
-/// groups its `ContextFlags` mark present, so an unrecorded register is
-/// unknown rather than whatever the structure holds there.
-pub fn context_registers(
-    arch: Arch,
-    register_map: &RegisterMap,
-    raw_context: &[u8],
-) -> HashMap<String, u64> {
-    let (size, flags_offset) = match arch {
-        Arch::Amd64 => (amd64::CONTEXT_SIZE, amd64::OFFSET_CONTEXT_FLAGS),
-        Arch::Arm64 => (arm64::CONTEXT_SIZE, arm64::OFFSET_CONTEXT_FLAGS),
-    };
-    let raw_context = &raw_context[..raw_context.len().min(size)];
-    let flags = get_u32(raw_context, flags_offset).unwrap_or(0);
-    let has = |group: u32| flags & group == group;
-    let mut values = register_map.to_hashmap(raw_context);
-    values.retain(|name, _| {
-        let numbered = |prefix: &str| {
-            name.strip_prefix(prefix)
-                .and_then(|rest| rest.chars().next())
-                .is_some_and(|ch| ch.is_ascii_digit())
-        };
-        match arch {
-            Arch::Amd64 => {
-                (has(amd64::CONTEXT_SEGMENTS) || !["ds", "es", "fs", "gs"].contains(&name.as_str()))
-                    && (has(amd64::CONTEXT_DEBUG_REGISTERS) || !numbered("dr"))
-                    && (has(amd64::CONTEXT_FLOATING_POINT) || !(numbered("xmm") || name == "mxcsr"))
-            }
-            Arch::Arm64 => {
-                (has(arm64::CONTEXT_FLOATING_POINT)
-                    || !(numbered("v") || name == "fpcr" || name == "fpsr"))
-                    && (has(arm64::CONTEXT_DEBUG_REGISTERS)
-                        || !["bcr", "bvr", "wcr", "wvr"]
-                            .iter()
-                            .any(|prefix| numbered(prefix)))
-            }
-        }
-    });
-    values
 }
 
 /// A user-mode minidump: the parsed streams and the file holding the

@@ -4,13 +4,13 @@
 
 use tabled::builder::Builder;
 
-use owo_colors::OwoColorize;
-
 use ntoseye_macros::{command, grammar};
 
 use crate::base::error::{Error, Result};
 use crate::base::memory::PAGE_SIZE;
 use crate::base::types::VirtAddr;
+use crate::hosts::repl::args::{ArgCursor, ArgCx, ArgError};
+use crate::hosts::repl::*;
 use crate::hosts::ui;
 use crate::nt::expr::Expr;
 use crate::nt::guest::{ModuleInfo, ProcessInfo};
@@ -23,9 +23,6 @@ use crate::nt::target::usermode::address::{
     state_label, type_label,
 };
 use crate::nt::target::{MemoryKind, TargetKind};
-
-use crate::hosts::repl::args::{ArgCursor, ArgCx, ArgError};
-use crate::hosts::repl::*;
 use crate::session::Session;
 
 pub const PAGE_SHIFT: u32 = PAGE_SIZE.trailing_zeros();
@@ -170,25 +167,16 @@ fn print_regions(
         .filter(|region| is_vad || region_matches_filter(region, filter, filter_address))
         .collect();
     if shown.is_empty() {
-        outln!("{}\n", "no matching memory regions".bright_black());
+        outln!("{}", ui::muted("no matching memory regions"));
         return;
     }
-    let print_text = || {
-        outln!(
-            "{} {} ({})",
-            ui::label("process"),
-            process.name,
-            ui::Value(process.pid)
-        );
-        print_padded_table(region_table(&shown, is_vad));
-    };
-    #[cfg(feature = "cli")]
-    native::render(
-        || native::lists::regions(process, &shown, is_vad),
-        print_text,
+    outln!(
+        "{} {} (PID {})",
+        ui::label("process"),
+        process.name,
+        process.pid
     );
-    #[cfg(not(feature = "cli"))]
-    print_text();
+    print_padded_table(region_table(&shown, is_vad));
 }
 
 fn print_kernel_regions(
@@ -215,33 +203,27 @@ fn print_kernel_regions(
         .collect();
 
     if shown.is_empty() {
-        outln!("no matching kernel regions\n");
+        outln!("no matching kernel regions");
         return;
     }
-    let print_text = || {
-        let mut builder = Builder::default();
+    let mut builder = Builder::default();
+    builder.push_record(vec![
+        "Start".to_string(),
+        "End".to_string(),
+        "Size".to_string(),
+        "Module".to_string(),
+        "Image".to_string(),
+    ]);
+    for module in &shown {
         builder.push_record(vec![
-            "Start".to_string(),
-            "End".to_string(),
-            "Size".to_string(),
-            "Module".to_string(),
-            "Image".to_string(),
+            ui::addr(module.base_address.0).to_string(),
+            ui::addr(module.end_address().0).to_string(),
+            format_region_size(module.size as u64).to_string(),
+            module.short_name.to_string(),
+            module.name.clone(),
         ]);
-        for module in &shown {
-            builder.push_record(vec![
-                ui::addr(module.base_address.0).to_string(),
-                ui::addr(module.end_address().0).to_string(),
-                format_region_size(module.size as u64).to_string(),
-                module.short_name.to_string(),
-                module.name.clone(),
-            ]);
-        }
-        print_padded_table(builder);
-    };
-    #[cfg(feature = "cli")]
-    native::render(|| native::lists::kernel_regions(&shown), print_text);
-    #[cfg(not(feature = "cli"))]
-    print_text();
+    }
+    print_padded_table(builder);
 }
 
 /// `!address -summary` on a user-mode minidump: only the summary. The
@@ -396,7 +378,14 @@ impl Render<bool> for AddressReport {
 )]
 fn vprot(session: &Session, address: VirtAddr) -> Result<MemoryBasicInformation> {
     let target = &session.target;
-    if target.user_dump_info().is_some() {
+    if let Some(info) = target.user_dump_info() {
+        if info.regions.is_none() {
+            return Err(Error::DebugInfo(format!(
+                "the minidump records no memory-info list, so it has no region state or \
+                 protection; `!address {:#x}` shows the captured range that holds the address",
+                address.0
+            )));
+        }
         return target.user_virtual_query(address);
     }
     let process = target.current_process().ok_or_else(|| {
@@ -531,48 +520,50 @@ fn region_table(regions: &[&MemoryRegionInfo], is_vad: bool) -> Builder {
 
 fn print_address_description(d: &AddressDescription) {
     outln!("address {}", ui::addr(d.address.0));
-    outln!("  kind    : {}", d.kind);
+    region_field("Usage", d.kind);
     if let Some(m) = &d.module {
-        outln!(
-            "  module  : {}+{:#x}  (base {}, size {:#x})",
-            m.name,
-            m.offset,
-            ui::addr(m.base.0),
-            m.size
+        region_field("Module", format!("{}+{:#x}", m.name, m.offset));
+        region_field("BaseAddress", ui::addr(m.base.0));
+        region_field(
+            "EndAddress",
+            ui::addr(m.base.0.saturating_add(u64::from(m.size))),
         );
+        region_field("RegionSize", format!("{:016x}", m.size));
     }
     if let Some(s) = &d.section {
-        outln!("  section : {}", s);
+        region_field("Section", s);
     }
     if let Some(va) = &d.va_type {
-        outln!("  region  : {}", va);
+        region_field("VaType", va);
     }
     if let Some(r) = &d.region {
-        outln!(
-            "  region  : {} - {}",
-            ui::addr(r.start.0),
-            ui::addr(r.end.0)
-        );
+        region_field("BaseAddress", ui::addr(r.start.0));
+        region_field("EndAddress", ui::addr(r.end.0));
         if let Some(p) = r.protection {
-            outln!("    protection : {:#x}", p.raw());
+            region_field("VadProtection", format!("{:#x}", p.raw()));
         }
         if let Some(t) = r.vad_type {
-            outln!("    vad type   : {:#x}", t.raw());
+            region_field("VadType", format!("{:#x}", t.raw()));
         }
         if let Some(pm) = r.private_memory {
-            outln!("    private    : {}", pm);
+            region_field("PrivateMemory", if pm { "yes" } else { "no" });
         }
         if let Some(det) = &r.details {
-            outln!("    details    : {}", det);
+            region_field("Details", det);
         }
     }
     if d.module.is_none() && d.region.is_none() && d.va_type.is_none() {
         outln!(
             "  {}",
-            "not inside any loaded module, kernel region, or VAD".bright_black()
+            ui::muted("not inside any loaded module, kernel region, or VAD")
         );
     }
-    outln!();
+}
+
+/// One field of a single-address record, in WinDbg's `!address` and
+/// `!vprot` layout: `Name:` padded so the values share a column.
+fn region_field(name: &str, value: impl std::fmt::Display) {
+    outln!("  {:<19}{value}", format!("{name}:"));
 }
 
 /// `!address` on a user-mode minidump: its memory-info list, or the ranges
@@ -586,37 +577,42 @@ fn print_user_address_report(report: &UserAddressReport, summary_only: bool) {
         } => match region {
             Some(region) => print_user_region(*address, region, *address_captured),
             None => outln!(
-                "address {}: not in any region the minidump's memory-info list records\n",
+                "address {}: not in any region the minidump's memory-info list records",
                 ui::addr(address.0)
             ),
         },
         UserAddressReport::Map { regions, summary } => {
             if !summary_only {
                 print_padded_table(user_region_table(regions));
-                outln!();
             }
             print_address_summary(summary);
         }
         UserAddressReport::CapturedRange { address, range } => {
             print_no_memory_info_list();
             match range {
-                Some(range) => outln!(
-                    "address {}: in the captured range {} - {} ({}), {}\n",
-                    ui::addr(address.0),
-                    ui::addr(range.start),
-                    ui::addr(range.start.saturating_add(range.length)),
-                    human_size(range.length),
-                    captured_usage_cell(range)
-                ),
+                Some(range) => {
+                    outln!("address {}", ui::addr(address.0));
+                    region_field("Usage", captured_usage_cell(range));
+                    region_field("BaseAddress", ui::addr(range.start));
+                    region_field(
+                        "EndAddress",
+                        ui::addr(range.start.saturating_add(range.length)),
+                    );
+                    region_field(
+                        "RegionSize",
+                        format!("{:016x} ({})", range.length, human_size(range.length)),
+                    );
+                    region_field("Captured", "all of the range; this address is captured");
+                }
                 None => outln!(
-                    "address {}: not in the memory the minidump captured\n",
+                    "address {}: not in the memory the minidump captured",
                     ui::addr(address.0)
                 ),
             }
         }
         UserAddressReport::CapturedRanges { ranges } => {
             print_no_memory_info_list();
-            print_captured_ranges(ranges);
+            print_captured_ranges(ranges, summary_only);
         }
     }
 }
@@ -624,45 +620,50 @@ fn print_user_address_report(report: &UserAddressReport, summary_only: bool) {
 fn print_user_region(address: VirtAddr, entry: &UserRegion, captured: bool) {
     let region = &entry.region;
     outln!("address {}", ui::addr(address.0));
-    outln!("  Usage:             {}", usage_cell(entry));
-    outln!("  BaseAddress:       {}", ui::addr(region.base));
-    outln!("  EndAddress:        {}", ui::addr(entry.end()));
-    outln!(
-        "  RegionSize:        {:016x} ({})",
-        region.size,
-        human_size(region.size)
+    region_field("Usage", usage_cell(entry));
+    region_field("BaseAddress", ui::addr(region.base));
+    region_field("EndAddress", ui::addr(entry.end()));
+    region_field(
+        "RegionSize",
+        format!("{:016x} ({})", region.size, human_size(region.size)),
     );
-    outln!(
-        "  State:             {:08x}  {}",
-        region.state,
-        state_label(region.state)
+    region_field(
+        "State",
+        format!("{:08x}  {}", region.state, state_label(region.state)),
     );
-    outln!(
-        "  Protect:           {:08x}  {}",
-        region.protect,
-        page_protection_name(region.protect)
+    region_field(
+        "Protect",
+        format!(
+            "{:08x}  {}",
+            region.protect,
+            page_protection_name(region.protect)
+        ),
     );
-    outln!(
-        "  Type:              {:08x}  {}",
-        region.kind,
-        type_label(region.kind)
+    region_field(
+        "Type",
+        format!("{:08x}  {}", region.kind, type_label(region.kind)),
     );
-    outln!("  AllocationBase:    {}", ui::addr(region.allocation_base));
-    outln!(
-        "  AllocationProtect: {:08x}  {}",
-        region.allocation_protect,
-        page_protection_name(region.allocation_protect)
+    region_field("AllocationBase", ui::addr(region.allocation_base));
+    region_field(
+        "AllocationProtect",
+        format!(
+            "{:08x}  {}",
+            region.allocation_protect,
+            page_protection_name(region.allocation_protect)
+        ),
     );
-    outln!(
-        "  Captured:          {} of the region; this address {}",
-        captured_cell(entry),
-        if captured {
-            "is captured"
-        } else {
-            "is not captured"
-        }
+    region_field(
+        "Captured",
+        format!(
+            "{} of the region; this address {}",
+            captured_cell(entry),
+            if captured {
+                "is captured"
+            } else {
+                "is not captured"
+            }
+        ),
     );
-    outln!();
 }
 
 fn print_no_memory_info_list() {
@@ -675,13 +676,18 @@ fn print_no_memory_info_list() {
 }
 
 /// The ranges a dump without a memory-info list captured.
-fn print_captured_ranges(ranges: &[CapturedRange]) {
+/// `summary_only` (`!address -summary`) leaves out the list.
+fn print_captured_ranges(ranges: &[CapturedRange], summary_only: bool) {
     let total: u64 = ranges.iter().map(|range| range.length).sum();
     outln!(
-        "captured memory: {} ranges, {}",
+        "captured memory: {} range{}, {}",
         ranges.len(),
+        if ranges.len() == 1 { "" } else { "s" },
         human_size(total)
     );
+    if summary_only {
+        return;
+    }
     let mut builder = Builder::default();
     builder.push_record(["Start", "End", "Size", "Usage"]);
     for range in ranges {
@@ -743,13 +749,13 @@ fn user_region_table(regions: &[UserRegion]) -> Builder {
             state_label(region.state),
             page_protection_name(region.protect),
             if free {
-                String::new()
+                "-".to_string()
             } else {
                 ui::addr(region.allocation_base).to_string()
             },
             usage_cell(entry),
             if free {
-                String::new()
+                "-".to_string()
             } else {
                 captured_cell(entry)
             },
@@ -778,7 +784,7 @@ fn print_summary_section(title: &str, rows: &[SummaryRow], total: u64, busy: u64
             format!("{:#x}", row.size),
             human_size(row.size),
             if free {
-                String::new()
+                "-".to_string()
             } else {
                 percent(row.size, busy)
             },
@@ -800,7 +806,7 @@ fn print_address_summary(summary: &AddressSummary) {
         busy,
     );
     outln!(
-        "total {:#x} ({}), in use {:#x} ({})\n",
+        "total {:#x} ({}), in use {:#x} ({})",
         summary.total,
         human_size(summary.total),
         summary.busy,
@@ -809,46 +815,53 @@ fn print_address_summary(summary: &AddressSummary) {
 }
 
 fn print_vprot(detail: &MemoryBasicInformation) {
-    if let Some(process) = &detail.process {
-        outln!(
-            "{} {} ({})",
-            ui::label("process"),
+    match &detail.process {
+        Some(process) => outln!(
+            "address {}  process {} (PID {})",
+            ui::addr(detail.address.0),
             process.name,
-            ui::Value(process.pid)
-        );
+            process.pid
+        ),
+        None => outln!("address {}", ui::addr(detail.address.0)),
     }
-    outln!("BaseAddress:       {}", ui::addr(detail.base_address.0));
-    outln!("AllocationBase:    {}", ui::addr(detail.allocation_base.0));
-    outln!(
-        "AllocationProtect: {:08x}  {}",
-        detail.allocation_protect,
-        page_protection_name(detail.allocation_protect)
+    region_field("BaseAddress", ui::addr(detail.base_address.0));
+    region_field("AllocationBase", ui::addr(detail.allocation_base.0));
+    region_field(
+        "AllocationProtect",
+        format!(
+            "{:08x}  {}",
+            detail.allocation_protect,
+            page_protection_name(detail.allocation_protect)
+        ),
     );
-    outln!(
-        "RegionSize:        {:016x}{}",
-        detail.region_size,
-        if detail.truncated {
-            "  (scan bound reached; at least this much)"
-        } else {
-            ""
-        }
+    region_field(
+        "RegionSize",
+        format!(
+            "{:016x}{}",
+            detail.region_size,
+            if detail.truncated {
+                "  (scan bound reached; at least this much)"
+            } else {
+                ""
+            }
+        ),
     );
-    outln!(
-        "State:             {:08x}  {}",
-        detail.state,
-        memory_state_name(detail.state)
+    region_field(
+        "State",
+        format!("{:08x}  {}", detail.state, memory_state_name(detail.state)),
     );
-    outln!(
-        "Protect:           {:08x}  {}",
-        detail.protect,
-        page_protection_name(detail.protect)
+    region_field(
+        "Protect",
+        format!(
+            "{:08x}  {}",
+            detail.protect,
+            page_protection_name(detail.protect)
+        ),
     );
-    outln!(
-        "Type:              {:08x}  {}",
-        detail.kind,
-        memory_type_name(detail.kind)
+    region_field(
+        "Type",
+        format!("{:08x}  {}", detail.kind, memory_type_name(detail.kind)),
     );
-    outln!();
 }
 
 #[cfg(test)]

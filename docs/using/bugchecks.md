@@ -26,7 +26,7 @@ If a session ends without cleanup, this breakpoint can stay in the guest, where 
 Resume the target, then crash it:
 
 ```text
-kdnet:p1.2> g
+1: kdnet> g
 VM running, waiting for stop (Ctrl+C to pause)...
 KDTARGET: Refreshing KD connection
 
@@ -44,20 +44,34 @@ KDTARGET: Refreshing KD connection
     ├─ #3 0000000000000000  value 0 = read operation, 1 = write operation, 2 or 8 = execute operation
     └─ #4 fffff808bb461730  address which referenced memory
 
- BREAK  p1.4 notmyfaultc64. (2012) at myfault+0x1730
+ BREAK  processor 3  notmyfaultc64. (2012) at myfault+0x1730
  ├─ stopped at nt!DbgBreakPointWithStatus
- └─ thread notmyfaultc64.  state Running  ethread ffffbe0ab9e42080  pid 2012  tid 2644
+ └─ thread ffffbe0ab9e42080  TID 2644  PID 2012  process notmyfaultc64.  state Running
+
+registers (trap frame)
+  rax 0000000000000000   rbx ffffce06dc2dd010   rcx 0000000000000802
 ...
+
 disasm
- > fffff808bb461730  8b 03                 mov  eax, dword [rbx]
-   fffff808bb461732  48 8d 9b 00 10 00 00  lea  rbx, [rbx+0x1000]
-   fffff808bb461739  89 44 24 30           mov  dword [rsp+0x30], eax
-   fffff808bb46173d  eb f1                 jmp  0xFFFFF808BB461730
-   fffff808bb46173f  cc                    int3
-   fffff808bb461740  40 53                 push rbx
-   fffff808bb461742  56                    push rsi
+     fffff808bb46171b +0x171b  mov  rbx, rax
+     fffff808bb46171e +0x171e  call qword [rip+0x2964]     myfault+0x4088
+     fffff808bb461724 +0x1724  mov  cl, 2
+     fffff808bb461726 +0x1726  call qword [rip+0x28f4]     myfault+0x4020
+     fffff808bb46172c +0x172c  nop  dword [rax]
+╭▶ > fffff808bb461730 +0x1730  mov  eax, dword [rbx]
+│    fffff808bb461732 +0x1732  lea  rbx, [rbx+0x1000]
+│    fffff808bb461739 +0x1739  mov  dword [rsp+0x30], eax
+╰─   fffff808bb46173d +0x173d  jmp  +0x1730
+
+stack
+  00–05  nt!DbgBreakPointWithStatus … nt!KiPageFault+0x468
+      ┄┄ trap ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+  06  fffff808bb461730  myfault+0x1730
+  07  fffff808bb461bd2  myfault+0x1bd2
+  08  fffff808bb461d54  myfault+0x1d54
 ...
-kdnet:p1.4>
+
+3: kdnet>
 ```
 
 Windows writes the first lines, and the debugger prints them. The `BUGCHECK` block is the `ntoseye` interpretation of these lines, and shows:
@@ -71,29 +85,29 @@ In this example, a driver, `myfault.sys`, read memory that it must not access at
 
 The `BREAK` header shows the processor and the thread, and puts the stop at the fault, `myfault+0x1730`. Windows is actually stopped in `nt!DbgBreakPointWithStatus`, where it gives control to the debugger.
 
-The disassembly starts at the fault, in a loop that reads a dword and then moves forward by one page. The registers and the stack are those of the processor at the time it stopped.
+The disassembly shows the function around the fault: a loop that reads a dword and then moves forward by one page, its jump drawn back to the faulting instruction. The registers are the ones that instruction ran with: those of the trap frame that the page fault built, with the registers a trap frame does not save recovered by the stack walk, so `rbx` holds the address in argument 1. When no trap frame is at the fault, the heading says `registers (unwound)` for what the stack walk recovered, or `registers (at stop)` for those of the processor where it stopped. The stack starts at the frame that faulted; the frames of the bugcheck itself, from `nt!DbgBreakPointWithStatus` to `nt!KiPageFault`, fold into its first line, and {command}`k` shows them.
 
 ## Analyze it
 
 {command}`!analyze` shows the bugcheck, a failure signature that you can use to compare crashes, and the culprit module with a confidence level.
 
 ```text
-kdnet:p1.4> !analyze
+3: kdnet> !analyze
 crash analysis
-
 bugcheck 0x000000d1 DRIVER_IRQL_NOT_LESS_OR_EQUAL  driver myfault.sys
 
 failure signature
-  bugcheck:000000d1|module:myfault
-  source: bugcheck fault
+  bucket  bugcheck:000000d1|module:myfault
+  source  bugcheck fault
 
 culprit attribution
-  myfault.sys  medium confidence
-  BugcheckFaultAddress fffff808bb461730  bugcheck fault address resolves to myfault.sys
+  culprit        myfault.sys
+  confidence     medium
+  fault address  fffff808bb461730  bugcheck fault address resolves to myfault.sys
 
 loaded modules
-  ntoskrnl.exe             fffff803e9a00000-fffff803eae50000  0x1450000 bytes
-  myfault.sys              fffff808bb460000-fffff808bb46b000  0xb000 bytes
+  ntoskrnl.exe  fffff803e9a00000-fffff803eae50000  0x1450000 bytes
+  myfault.sys   fffff808bb460000-fffff808bb46b000  0xb000 bytes
   174 loaded modules total
 ```
 
@@ -116,7 +130,8 @@ To select the trap frame, give its address to {command}`.trap`. {command}`k` and
 
 
 ```text
-kdnet:p1.4> k
+3: kdnet> k
+  # Child-SP          IP                Call Site
  00 fffffb84648d08b8  fffff803e9efdfb0  nt!DbgBreakPointWithStatus
  01 fffffb84648d08c0  fffff803e9fb3622  nt!KiBugCheckDebugBreak+0x12
  02 fffffb84648d0920  fffff803e9fb2b4e  nt!KeBugCheck2+0xb2e
@@ -148,7 +163,7 @@ kdnet:p1.4> k
 The `myfault` frames show `module+offset` because the Microsoft symbol server has no PDB for `myfault`, as {command}`lm` shows:
 
 ```text
-kdnet:p1.4> lm m myfault
+3: kdnet> lm m myfault
 Start             End               Module   Version  Symbols  Source  Image
 fffff808bb460000  fffff808bb46b000  myfault  -        failed   -       myfault.sys
 ```
@@ -172,7 +187,7 @@ The IRP's current stack location belongs to the lowest driver the IRP has reache
 `!analyze -show 9f` reads what the parameters point to in the target, so you can try it on any power IRP that {command}`!poaction` lists. This guest has no bugcheck; the IRP is a wait/wake request that USBHUB3 holds, as a bus driver does until its device signals a wake. Parameter 3 is not a `TRIAGE_9F_POWER` block here, so `ntoseye` walks the kernel's lists, and says so:
 
 ```text
-mem:1> !analyze -show 9f 3 ffffb28a86bae780 0 ffffb28a8c5cd010
+1: mem> !analyze -show 9f 3 ffffb28a86bae780 0 ffffb28a8c5cd010
 ...
 power failure
   subtype 0x3: a device blocked a power IRP for too long
@@ -191,9 +206,9 @@ power failure
     THREAD ffffb28a7f721040 (static)  waiting for work
     THREAD ffffb28a7f6f9040 (static)  waiting for work
   thread ffffb28a7f721040  IRP worker, waiting for work
-#0  fffffc01d5414800  fffff802bcdb64d6  nt!KiSwapContext+0x76
+    00  fffff802bcdb64d6  nt!KiSwapContext+0x76
 ...
-  parameter 3 (0x0) is not a readable TRIAGE_9F_POWER: Bad virtual address: 0; walked nt!PopIrpList and nt!PopIrpThreadList
+  parameter 3 (0x0) is not a readable TRIAGE_9F_POWER: bad virtual address: 0x0; walked nt!PopIrpList and nt!PopIrpThreadList
 ```
 
 A wait/wake IRP stays pending by design, and its watchdog does not run. A set-power or query-power IRP that has been pending in a driver for many seconds is the hang.
@@ -207,7 +222,7 @@ To look at a power transition that is slow or stuck before the watchdog fires, u
 - {command}`!popolicy` shows the system power policy in effect (`SYSTEM_POWER_POLICY` at `nt!PopPolicy`): the actions for the buttons, the lid, idling, and overheating, the sleep states, and the timeouts.
 
 ```text
-mem:1> !podev ffffb28a86bae780
+1: mem> !podev ffffb28a86bae780
 Device object ffffb28a86bae780 is for:
   \Driver\USBHUB3 (UsbHub3.sys)
   Flags 00003044 DO_POWER_PAGABLE
@@ -231,7 +246,7 @@ This USB tablet is selectively suspended in D2, as Device Manager's power data f
 `!analyze -show` decodes a bugcheck code and arguments that you got from a different source, such as a photo of a blue screen or an event log entry.
 
 ```text
-kdnet:p1.1> !analyze -show 0x50
+0: kdnet> !analyze -show 0x50
  BUGCHECK  PAGE_FAULT_IN_NONPAGED_AREA (0x00000050)
  ├─ reason Invalid system memory was referenced. This cannot be protected by try-except. Typically the address is just plain bad or it is pointing at freed memory.
  └─ args
@@ -246,10 +261,10 @@ kdnet:p1.1> !analyze -show 0x50
 The crashed system cannot continue to run, but it has not written its crash dump yet. When you enter {command}`g`, Windows writes the dump and reboots, and `ntoseye` follows the reboot and stops at the first boot notification of the new kernel.
 
 ```text
-kdnet:p1.4> g
+3: kdnet> g
 VM running, waiting for stop (Ctrl+C to pause)...
 
- BREAK  p1.1 kernel at nt!DebugService2+0x5
+ BREAK  processor 0  kernel at nt!DebugService2+0x5
  └─ guest rebooted; kernel reloaded, module list not available yet (continue to finish)
 ```
 

@@ -7,13 +7,14 @@ use super::{
     DownloadJob, LoadedModule, ModuleSymbolDiscovery, ModuleSymbolLoad, ModuleSymbolSource,
     ModuleSymbolStatus, PdbIdentity, SymbolStore,
 };
+use crate::arch::Arch;
 use crate::{
     base::{
         error::{Error, Result},
         memory,
         memory::MemoryOps,
         output,
-        types::{Arch, Dtb, PhysAddr, VirtAddr},
+        types::{Dtb, PhysAddr, VirtAddr},
     },
     nt::{
         guest::{Image, ModuleInfo},
@@ -126,7 +127,7 @@ impl SymbolStore {
     pub fn load_from_binary(&self, object: &mut Image, name: &str) -> Result<Option<u128>> {
         let view = object.view().ok_or(Error::ViewFailed)?;
         if name.eq_ignore_ascii_case("ntoskrnl.exe")
-            && !matches!(view.file_header().Machine, 0x8664 | 0xaa64)
+            && Arch::from_machine_type(view.file_header().Machine).is_none()
         {
             return Err(Error::UnsupportedArchitecture(format!(
                 "kernel image {} (machine {:#06x})",

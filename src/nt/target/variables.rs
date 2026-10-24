@@ -3,10 +3,7 @@
 
 use super::{BuiltinVar, Target, ThreadInfo};
 use crate::{
-    base::{
-        memory::{MemoryOps, PAGE_SIZE},
-        types::{Arch, VirtAddr},
-    },
+    base::{memory::PAGE_SIZE, types::VirtAddr},
     nt::unwind::return_address_for_register_values,
 };
 
@@ -159,11 +156,11 @@ impl Target {
             // inventing a number.
             // WinDbg's `$ip` is the whole instruction pointer, not x86's
             // 16-bit IP: `? $ip` on a kernel address must not truncate.
-            "ip" => self.register_value(self.instruction_pointer_register()),
+            "ip" => self.register_value(self.arch().pc_register()),
             // The caller of the current scope, one unwind step away.
             "ra" => self.scope_return_address(),
-            "csp" => self.register_value(self.stack_pointer_register()),
-            "retreg" => self.register_value(self.return_value_register()),
+            "csp" => self.register_value(self.arch().sp_register()),
+            "retreg" => self.register_value(self.arch().return_register()),
             // Both supported architectures are LP64.
             "ptrsize" => Some(8),
             "pagesize" => Some(
@@ -187,7 +184,7 @@ impl Target {
                 .selected_frame
                 .as_ref()
                 .map(|frame| frame.ip)
-                .or_else(|| self.register_value(self.instruction_pointer_register())),
+                .or_else(|| self.register_value(self.arch().pc_register())),
             "exp" => self.results.first().copied(),
             "exr_code" => self.last_exception_code.map(u64::from),
             // `nt!KiBugCheckData` holds the code and its four parameters; the
@@ -221,15 +218,6 @@ impl Target {
         Some(target)
     }
 
-    /// The stack-pointer register this architecture calls its own, behind
-    /// WinDbg's `$csp`.
-    pub fn stack_pointer_register(&self) -> &'static str {
-        match self.arch() {
-            Arch::Amd64 => "rsp",
-            Arch::Arm64 => "sp",
-        }
-    }
-
     /// Caller of the current scope, behind WinDbg's `$ra`. A selected frame
     /// unwinds from its own recovered context, so `.frame 2` then `$ra`
     /// names frame 3.
@@ -247,14 +235,14 @@ impl Target {
     /// expression reports an error rather than handing back zero.
     fn current_process_peb(&self) -> Option<u64> {
         let eprocess_va = self.process.as_ref()?.eprocess;
-        let peb: VirtAddr = self
+        let peb = self
             .guest()
             .ok()?
             .ntoskrnl
             .types_in(self.kernel_dtb())
             .struct_at("_EPROCESS", eprocess_va)
             .ok()?
-            .read_field("Peb")
+            .read_pointer("Peb")
             .ok()?;
         (!peb.is_zero()).then_some(peb.0)
     }
@@ -263,44 +251,30 @@ impl Target {
     /// `ImageBaseAddress`. `None` for a kernel-only process.
     fn current_process_image_base(&self) -> Option<u64> {
         let peb = VirtAddr(self.current_process_peb()?);
-        let base: VirtAddr = self
+        let base = self
             .types_in(self.process_dtb())
             .struct_at("_PEB", peb)
             .ok()?
-            .read_field("ImageBaseAddress")
+            .read_pointer("ImageBaseAddress")
             .ok()?;
         Some(base.0)
     }
 
-    /// One entry of `nt!KiBugCheckData`: the bugcheck code at index 0 and its
-    /// four parameters after it. Zero when the target has not bugchecked,
-    /// which is what the array itself reports.
+    /// One entry of `nt!KiBugCheckData`, an array of `ULONG_PTR`: the
+    /// bugcheck code at index 0 and its four parameters after it. Zero when
+    /// the target has not bugchecked, which is what the array itself
+    /// reports.
     fn bugcheck_data(&self, index: u64) -> Option<u64> {
         let address = self
             .symbols
             .find_symbol_across_modules(self.kernel_dtb(), "nt!KiBugCheckData")
             .ok()
             .flatten()?;
-        self.address_space(self.kernel_dtb())
-            .read::<u64>(address + index * 8)
+        let memory = self.address_space(self.kernel_dtb());
+        memory
+            .read_pointer(address + index * self.arch().pointer_size())
             .ok()
-    }
-
-    /// The instruction pointer this architecture calls its own, behind `$ip`
-    /// and `$scopeip`.
-    pub fn instruction_pointer_register(&self) -> &'static str {
-        match self.arch() {
-            Arch::Amd64 => "rip",
-            Arch::Arm64 => "pc",
-        }
-    }
-
-    /// The register a function's return value arrives in, behind `$retreg`.
-    fn return_value_register(&self) -> &'static str {
-        match self.arch() {
-            Arch::Amd64 => "rax",
-            Arch::Arm64 => "x0",
-        }
+            .map(|value| value.0)
     }
 
     /// `t0`..`t19` and nothing else: `t20`, `t007`, and `ta` are not slots.

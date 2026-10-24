@@ -5,7 +5,10 @@ use std::rc::Rc;
 use super::memory::MAX_DISASSEMBLE_INSTRUCTIONS;
 use super::variables::VARIABLES_BASE;
 use super::*;
-use crate::backend::cpu_context::amd64::{OFFSET_RIP, OFFSET_RSP};
+use crate::arch::{
+    Arch,
+    amd64::{OFFSET_RIP, OFFSET_RSP},
+};
 use crate::nt::expr::Expr;
 use crate::nt::guest::ProcessInfo;
 use crate::nt::layout::{FieldInfo, TypeInfo};
@@ -444,7 +447,10 @@ fn a_console_cxr_invalidates_the_clients_view() {
         .unwrap();
 
     let result = response["result"].as_str().unwrap();
-    assert!(result.contains("selected context"), "{result}");
+    assert!(
+        result.contains(&format!("{:#x}", base + record as u64)),
+        "{result}"
+    );
     let messages = decode_sink(&sink);
     assert!(
         messages
@@ -485,6 +491,7 @@ fn walking_another_vcpu_keeps_the_consoles_context() {
     let mut session = session_with_mock(MockBackend::default().one_vcpu());
     session.current_thread = "p01.01".to_string();
     session.select_frame(SelectedFrame::from_registers(
+        Arch::Amd64,
         0,
         HashMap::from([("rip".to_string(), 0x1010), ("rsp".to_string(), 0x1080)]),
     ));

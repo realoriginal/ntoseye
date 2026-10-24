@@ -10,16 +10,16 @@ use iced_x86::{
     Mnemonic, OpAccess, OpKind, Register,
 };
 
+use crate::arch::{Arch, Family, HwBreakpointAccess, RegisterMap};
 use crate::backend::dbg_backend::{
-    ContinueDisposition, DebugBackend, HwBreakpointAccess, RegisterMap,
-    STEP_UNDER_WINDOWS_HYPERVISOR, StopEvent, clear_trap_flag,
+    ContinueDisposition, DebugBackend, STEP_UNDER_WINDOWS_HYPERVISOR, StopEvent, clear_trap_flag,
     processor_index_from_backend_thread_id,
 };
-use crate::base::disasm::{ControlFlow, classify};
+use crate::base::disasm::{ControlFlow, classify, decode_first};
 use crate::base::error::{Error, Result};
 use crate::base::memory::MemoryOps;
 use crate::base::notice::Notice;
-use crate::base::types::{Arch, Dtb, VirtAddr};
+use crate::base::types::{Dtb, VirtAddr};
 use crate::nt::breakpoints::{
     BreakpointManager, StepFrame, ThreadScope, lift_target_site, plant_target_site,
 };
@@ -95,6 +95,7 @@ impl Session {
             )?,
             None => {
                 step_one_and_clear_tf(
+                    self.target.arch(),
                     self.backend.as_mut(),
                     &self.register_map,
                     &self.target.interrupt,
@@ -199,7 +200,9 @@ impl Session {
             return self.step_over_breakpoint_at_pc();
         }
         let regs = self.backend.read_registers()?;
-        let rip = self.register_map.read_u64("rip", &regs)?;
+        let rip = self
+            .register_map
+            .read_u64(self.target.arch().pc_register(), &regs)?;
         let Some(index) = self
             .module_traps
             .iter()
@@ -268,7 +271,9 @@ impl Session {
         self.backend.set_current_thread(&self.current_thread)?;
         let regs = self.backend.read_registers()?;
         self.target.registers = Some(self.register_map.to_hashmap(&regs));
-        let pc = self.register_map.read_u64("rip", &regs)?;
+        let pc = self
+            .register_map
+            .read_u64(self.target.arch().pc_register(), &regs)?;
         let (code_dtb, active_dtb) = match self
             .register_map
             .read_u64(self.target.arch().dtb_register(), &regs)
@@ -287,37 +292,12 @@ impl Session {
         memory.read_bytes(VirtAddr(pc), &mut bytes)?;
         self.mask_code(VirtAddr(pc), &mut bytes, active_dtb);
 
-        if self.target.arch() == Arch::Arm64 {
-            let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            let Ok(instruction) = bad64::decode(word, pc) else {
-                return Err(Error::DebugInfo(format!(
-                    "failed to decode instruction at {pc:#x}"
-                )));
-            };
-            let mnem = instruction.op().mnem();
-            // `bl`/`blr` are the call forms; AArch64 instructions are 4 bytes.
-            return Ok(CurrentInstruction {
-                is_call: mnem == "bl" || mnem == "blr",
-                next_ip: pc.wrapping_add(4),
-            });
-        }
-
-        let bitness = self.target.code_bitness(VirtAddr(pc));
-        let mut decoder = Decoder::with_ip(bitness, &bytes, pc, DecoderOptions::NONE);
-        let instruction = decoder.decode();
-        if instruction.code() == Code::INVALID {
-            return Err(Error::DebugInfo(format!(
-                "failed to decode instruction at {pc:#x}"
-            )));
-        }
-        let next_ip = if bitness == 32 {
-            instruction.next_ip() & u64::from(u32::MAX)
-        } else {
-            instruction.next_ip()
-        };
+        let machine = self.target.executing_machine(VirtAddr(pc));
+        let (length, flow) = decode_first(&bytes, machine)
+            .ok_or_else(|| Error::DebugInfo(format!("failed to decode instruction at {pc:#x}")))?;
         Ok(CurrentInstruction {
-            is_call: instruction.mnemonic() == Mnemonic::Call,
-            next_ip,
+            is_call: flow == ControlFlow::Call,
+            next_ip: machine.code_address(pc.wrapping_add(length as u64)),
         })
     }
 
@@ -343,8 +323,7 @@ impl Session {
     fn undecodable_step_over(&mut self, error: Error) -> Error {
         let ip = self.read_registers().ok().and_then(|registers| {
             self.register_map
-                .read_u64("rip", &registers)
-                .or_else(|_| self.register_map.read_u64("pc", &registers))
+                .read_u64(self.target.arch().pc_register(), &registers)
                 .ok()
         });
         Error::DebugInfo(match (&error, ip) {
@@ -386,31 +365,22 @@ impl Session {
     /// instruction bytes it was read from.
     fn read_control(&mut self) -> Result<(ControlState, Vec<u8>, [u8; 16])> {
         let registers = self.read_registers()?;
-        let ip = self
-            .register_map
-            .read_u64("rip", &registers)
-            .or_else(|_| self.register_map.read_u64("pc", &registers))?;
-        let sp = self
-            .register_map
-            .read_u64("rsp", &registers)
-            .or_else(|_| self.register_map.read_u64("sp", &registers))?;
+        let arch = self.target.arch();
+        let ip = self.register_map.read_u64(arch.pc_register(), &registers)?;
+        let sp = self.register_map.read_u64(arch.sp_register(), &registers)?;
         let dtb = self
             .register_map
-            .read_u64(self.target.arch().dtb_register(), &registers)
+            .read_u64(arch.dtb_register(), &registers)
             .unwrap_or(0);
         let mut bytes = [0u8; 16];
-        let length = if self.target.arch() == Arch::Arm64 {
-            4
-        } else {
-            bytes.len()
-        };
+        let machine = self.target.executing_machine(VirtAddr(ip));
+        let length = machine.max_instruction_bytes();
         self.read_masked(VirtAddr(ip), &mut bytes[..length])?;
-        let bitness = self.target.code_bitness(VirtAddr(ip));
         let state = ControlState {
             ip,
             sp,
             dtb,
-            flow: classify(&bytes[..length], self.target.arch(), bitness),
+            flow: classify(&bytes[..length], machine),
         };
         Ok((state, registers, bytes))
     }
@@ -611,12 +581,14 @@ impl Session {
         walked: Option<&ThreadScope>,
     ) -> Result<WalkStep> {
         // An instruction without known successors is not followed; one run
-        // alone fails its step the same way.
-        let (successors, floor) = match walked {
-            Some(_) if self.target.arch() != Arch::Arm64 => self
-                .walk_continuation(state, registers, bytes)
-                .unwrap_or_default(),
-            _ => (Vec::new(), None),
+        // alone fails its step the same way. Successors are decoded for x86
+        // code only.
+        let follows = self.target.arch().family() == Family::X86 && walked.is_some();
+        let (successors, floor) = if follows {
+            self.walk_continuation(state, registers, bytes)
+                .unwrap_or_default()
+        } else {
+            (Vec::new(), None)
         };
         let vcpu = self.current_thread.clone();
         let (outcome, stepped) = self.step_once()?;
@@ -672,7 +644,9 @@ impl Session {
             && self
                 .read_registers()
                 .ok()
-                .and_then(|registers| stack_pointer(&self.register_map, &registers))
+                .and_then(|registers| {
+                    stack_pointer(self.target.arch(), &self.register_map, &registers)
+                })
                 .is_some_and(|sp| floor.is_none_or(|floor| sp >= floor));
         if completed_elsewhere {
             return Ok(WalkStep::At(rip));
@@ -728,7 +702,7 @@ impl Session {
         };
         self.read_registers()
             .ok()
-            .and_then(|registers| stack_pointer(&self.register_map, &registers))
+            .and_then(|registers| stack_pointer(self.target.arch(), &self.register_map, &registers))
             .is_some_and(|sp| !(limit.0..base.0).contains(&sp))
     }
 
@@ -801,7 +775,7 @@ impl Session {
         // Each open frame with the stack pointer it was entered with.
         let mut stack = vec![(frame(name(&self.target, &current)), current.sp)];
         let mut instructions = 0usize;
-        let arm64 = self.target.arch() == Arch::Arm64;
+        let arch = self.target.arch();
         // The user breakpoint the trace ended at, whose action runs then.
         let mut hit = None;
         let end = loop {
@@ -865,7 +839,7 @@ impl Session {
             if current.flow == ControlFlow::Call {
                 stack.push((frame(name(&self.target, &next)), next.sp));
             } else if current.flow == ControlFlow::Ret
-                && (next.sp > *entry_sp || (arm64 && next.sp >= *entry_sp))
+                && (next.sp > *entry_sp || (!arch.return_pops_address() && next.sp >= *entry_sp))
             {
                 let (completed, _) = stack.pop().expect("an open frame");
                 match stack.last_mut() {
@@ -918,10 +892,12 @@ impl Session {
             StepStack::Any => None,
             StepStack::CallReturn | StepStack::FunctionReturn => {
                 let registers = self.read_registers()?;
-                stack_pointer(&self.register_map, &registers).map(|sp| {
-                    // An x86 `ret` pops its return address; an AArch64 `ret`
-                    // leaves the stack pointer where the callee found it.
-                    if stack == StepStack::FunctionReturn && self.target.arch() != Arch::Arm64 {
+                stack_pointer(self.target.arch(), &self.register_map, &registers).map(|sp| {
+                    // A popping `ret` leaves the stack above where the callee
+                    // found it; a register `ret` leaves it in place.
+                    if stack == StepStack::FunctionReturn
+                        && self.target.arch().return_pops_address()
+                    {
                         sp + 1
                     } else {
                         sp
@@ -1201,13 +1177,14 @@ impl Session {
 /// A fault or bugcheck instead of the step trap is returned as an error.
 /// `interrupt` (Ctrl+C) ends the wait with a break-in.
 pub fn step_one_and_clear_tf(
+    arch: Arch,
     backend: &mut dyn DebugBackend,
     register_map: &RegisterMap,
     interrupt: &AtomicBool,
 ) -> Result<()> {
     backend.step()?;
     let event = wait_for_step_stop(backend, interrupt)?;
-    clear_trap_flag(backend, register_map)?;
+    clear_trap_flag(arch, backend, register_map)?;
     if event.is_bugcheck {
         return Err(Error::DebugInfo(
             "target bugchecked while single-stepping".into(),
@@ -1256,12 +1233,11 @@ pub fn step_over_current_breakpoint(
     thread: &str,
 ) -> Result<Option<RunPast>> {
     let regs = backend.read_registers()?;
-    let rip = register_map.read_u64("rip", &regs)?;
+    let arch = debugger.arch();
+    let rip = register_map.read_u64(arch.pc_register(), &regs)?;
     // Only the shared-page fallback below needs the address space; a stub
     // without its DTB register still gets the plain step-over.
-    let cr3 = register_map
-        .read_u64(debugger.arch().dtb_register(), &regs)
-        .ok();
+    let cr3 = register_map.read_u64(arch.dtb_register(), &regs).ok();
 
     // Scope-agnostic: a wrong-process hit on a shared-page BP still needs the
     // disable/step/enable dance so the wrong process can make forward progress.
@@ -1272,7 +1248,7 @@ pub fn step_over_current_breakpoint(
     // An execution interrupted on the site that got back onto it some other
     // way than hitting it (stepped through its handler) runs past it now;
     // its remembered hit must not absorb a later, real one.
-    if let Ok(rsp) = register_map.read_u64("rsp", &regs) {
+    if let Ok(rsp) = register_map.read_u64(arch.sp_register(), &regs) {
         breakpoints.forget_interrupted_hit(bp_id, rsp);
     }
 
@@ -1342,7 +1318,8 @@ fn execute_lifted_site(
             cr3,
         )
     } else {
-        step_one_and_clear_tf(backend, register_map, &debugger.interrupt).map(|()| RunPast::Reached)
+        step_one_and_clear_tf(debugger.arch(), backend, register_map, &debugger.interrupt)
+            .map(|()| RunPast::Reached)
     }
 }
 
@@ -1360,7 +1337,9 @@ fn interrupted_on(
     rip: u64,
     cr3: Option<u64>,
 ) -> Option<u64> {
-    let rsp = register_map.read_u64("rsp", regs).ok()?;
+    let rsp = register_map
+        .read_u64(debugger.arch().sp_register(), regs)
+        .ok()?;
     let memory = debugger.address_space(code_root(debugger, cr3, rip));
     let mut frame = [0u8; 40];
     let base = (rsp & !0xf).wrapping_sub(frame.len() as u64);
@@ -1539,10 +1518,15 @@ fn keeper_slot(
 /// Set `RF` on the selected vCPU when it stands on `rip`, where a keeper
 /// would otherwise trap it before it executes the instruction: an execute
 /// breakpoint is a fault, and `RF` suppresses it for one instruction.
-fn pass_keeper(backend: &mut dyn DebugBackend, register_map: &RegisterMap, rip: u64) -> Result<()> {
+fn pass_keeper(
+    backend: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    arch: Arch,
+    rip: u64,
+) -> Result<()> {
     const RF: u64 = 1 << 16;
     let mut regs = backend.read_registers()?;
-    if register_map.read_u64("rip", &regs)? != rip {
+    if register_map.read_u64(arch.pc_register(), &regs)? != rip {
         return Ok(());
     }
     let eflags = register_map.read_u64("eflags", &regs)?;
@@ -1565,10 +1549,9 @@ fn step_without_trap(
     thread: &str,
 ) -> Result<RunPast> {
     let regs = backend.read_registers()?;
-    let rip = register_map.read_u64("rip", &regs)?;
-    let cr3 = register_map
-        .read_u64(debugger.arch().dtb_register(), &regs)
-        .ok();
+    let arch = debugger.arch();
+    let rip = register_map.read_u64(arch.pc_register(), &regs)?;
+    let cr3 = register_map.read_u64(arch.dtb_register(), &regs).ok();
     let successors = site_successors(debugger, register_map, thread, &regs, rip, cr3)?;
     let sites = temporary_sites(backend, debugger, breakpoints, rip, cr3, &successors)?;
     run_past(
@@ -1605,7 +1588,10 @@ fn temporary_sites(
             .any(|&address| debugger.is_secure_address(VirtAddr(address)));
     let user_space = !backend.supports_user_mode_breakpoints()
         && successors.iter().any(|&address| {
-            !BreakpointManager::is_kernel_space(debugger.arch(), VirtAddr(address))
+            !debugger
+                .arch()
+                .paging()
+                .is_kernel_address(VirtAddr(address))
         });
     if !secure && !user_space {
         return Ok(TemporarySites::Software);
@@ -1724,12 +1710,13 @@ fn run_to_successors(
     keeper: Option<usize>,
     planted: &mut Vec<(u64, Option<usize>)>,
 ) -> Result<RunPast> {
-    let rip = register_map.read_u64("rip", regs)?;
+    let arch = debugger.arch();
+    let rip = register_map.read_u64(arch.pc_register(), regs)?;
     for (index, &address) in successors.iter().enumerate() {
         let slot = sites.plant(backend, index, address)?;
         planted.push((address, slot));
     }
-    let rsp = register_map.read_u64("rsp", regs).ok();
+    let rsp = register_map.read_u64(arch.sp_register(), regs).ok();
     // Best effort: without the keeper the site goes unmarked, as it did.
     let mut keeper = keeper.filter(|&slot| {
         backend
@@ -1746,7 +1733,7 @@ fn run_to_successors(
     let mut release = Release::new(rip, rsp);
     loop {
         if keeper.is_some() {
-            pass_keeper(backend, register_map, rip)?;
+            pass_keeper(backend, register_map, arch, rip)?;
         }
         backend.continue_current_thread()?;
         let (event, timed_out) = match backend.try_wait_for_stop(RUN_PAST_TIMEOUT)? {
@@ -1765,7 +1752,7 @@ fn run_to_successors(
             )));
         }
         let now_regs = backend.read_registers()?;
-        let now = register_map.read_u64("rip", &now_regs)?;
+        let now = register_map.read_u64(arch.pc_register(), &now_regs)?;
         step_trace!(
             "run past {thread} at {rip:#x}: {:?} stopped at {now:#x}{}{}",
             event.thread_id,
@@ -1777,7 +1764,7 @@ fn run_to_successors(
                 && let Some(slot) = keeper
             {
                 let same = nt_thread_on(debugger, thread) == nt_thread
-                    && register_map.read_u64("rsp", &now_regs).ok() == rsp;
+                    && register_map.read_u64(arch.sp_register(), &now_regs).ok() == rsp;
                 if !same {
                     // Another execution reached the site, which the
                     // planted breakpoint takes once the run is over.
@@ -1897,7 +1884,8 @@ fn outside_nt(
     regs: &[u8],
 ) -> Option<String> {
     let value = |name| register_map.read_u64(name, regs).ok();
-    let (cr3, rip) = (value(debugger.arch().dtb_register())?, value("rip")?);
+    let arch = debugger.arch();
+    let (cr3, rip) = (value(arch.dtb_register())?, value(arch.pc_register())?);
     if halted_in_windows_hypervisor(debugger, cr3, rip) {
         return Some("the Windows hypervisor".to_string());
     }
@@ -2042,6 +2030,7 @@ impl Release {
         &mut self,
         backend: &mut dyn DebugBackend,
         register_map: &RegisterMap,
+        arch: Arch,
         stopper: Option<&str>,
         stopper_rip: Option<u64>,
     ) {
@@ -2051,7 +2040,7 @@ impl Release {
                 .into_iter()
                 .filter(|(vcpu, at)| {
                     Some(vcpu.as_str()) != stopper
-                        && rip_of(backend, register_map, vcpu) == Some(*at)
+                        && rip_of(backend, register_map, arch, vcpu) == Some(*at)
                 })
                 .collect();
         }
@@ -2127,10 +2116,11 @@ impl Release {
         // ends every run after at once, and a watchpoint's hit is told from
         // a site's by it.
         let stopper = stopped.as_deref().filter(|&by| by != thread);
-        let stopper_rip = stopper.and_then(|by| rip_of(backend, register_map, by));
+        let arch = debugger.arch();
+        let stopper_rip = stopper.and_then(|by| rip_of(backend, register_map, arch, by));
         backend.set_current_thread(thread)?;
         let regs = backend.read_registers()?;
-        let now = register_map.read_u64("rip", &regs)?;
+        let now = register_map.read_u64(arch.pc_register(), &regs)?;
         // NT does not run on the vCPU while it is in the hypervisor, or runs
         // a guest partition's VP: whatever NT's thread was is not what the
         // vCPU shows, so the step waits for NT to run there again.
@@ -2181,7 +2171,7 @@ impl Release {
         {
             return Ok(Released::Kept);
         }
-        self.note_parked(backend, register_map, stopper, stopper_rip);
+        self.note_parked(backend, register_map, arch, stopper, stopper_rip);
         backend.set_current_thread(thread)?;
         if outside.is_some() {
             return Ok(Released::Waiting { in_handler: false });
@@ -2195,11 +2185,13 @@ impl Release {
         if now == self.rip {
             // The same thread back on the instruction at another stack
             // depth entered it anew, from the handler it was interrupted by.
-            return Ok(if register_map.read_u64("rsp", &regs).ok() == self.rsp {
-                Released::Back
-            } else {
-                Released::Diverted
-            });
+            return Ok(
+                if register_map.read_u64(arch.sp_register(), &regs).ok() == self.rsp {
+                    Released::Back
+                } else {
+                    Released::Diverted
+                },
+            );
         }
         // Stopped by itself short of the marked sites, it hit a breakpoint
         // (or the bugcheck trap) in the handler: the step ends there.
@@ -2220,10 +2212,15 @@ fn nt_thread_on(debugger: &Target, thread: &str) -> Option<u64> {
 }
 
 /// The IP of the halted vCPU backend `thread` stands for, which it selects.
-fn rip_of(backend: &mut dyn DebugBackend, register_map: &RegisterMap, thread: &str) -> Option<u64> {
+fn rip_of(
+    backend: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    arch: Arch,
+    thread: &str,
+) -> Option<u64> {
     backend.set_current_thread(thread).ok()?;
     let registers = backend.read_registers().ok()?;
-    register_map.read_u64("rip", &registers).ok()
+    register_map.read_u64(arch.pc_register(), &registers).ok()
 }
 
 /// Every address execution can continue at after the instruction at `rip`,

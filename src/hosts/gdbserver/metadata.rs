@@ -14,7 +14,8 @@ use gdbstub::target::ext::target_description_xml_override::TargetDescriptionXmlO
 use gdbstub::target::{TargetError, TargetResult};
 use pelite::PeView;
 
-use crate::base::types::Arch;
+use crate::arch::Arch;
+use crate::backend::dbg_backend::{thread_kind, thread_label};
 use crate::nt::guest::ModuleInfo;
 use crate::nt::pe::{HeaderPage, image_base};
 use crate::session::VcpuInfo;
@@ -61,11 +62,14 @@ impl GdbTarget<'_> {
             return b"E00".to_vec();
         };
         if offset == 0 {
-            let names = match self.session.vcpus() {
+            let names: Vec<String> = match self.session.vcpus() {
                 Ok(vcpus) => vcpus.iter().map(VcpuInfo::label).collect(),
                 Err(_) => {
                     self.sync_threads();
-                    self.threads.clone()
+                    self.threads
+                        .iter()
+                        .map(|id| format!("{} {}", thread_kind(id), thread_label(id)))
+                        .collect()
                 }
             };
             self.thread_list =
@@ -141,10 +145,7 @@ struct Span<'m> {
 /// half stops a page short of the top so its end fits in 64 bits. Empty
 /// stretches are left out: a zero-length region is malformed to IDA.
 fn address_layout<'m>(arch: Arch, images: &[(u64, u64, &'m str)]) -> Vec<Span<'m>> {
-    let (user_len, kernel_start) = match arch {
-        Arch::Amd64 => (0x0000_8000_0000_0000u64, 0xFFFF_8000_0000_0000u64),
-        Arch::Arm64 => (0x0001_0000_0000_0000, 0xFFFF_0000_0000_0000),
-    };
+    let (user_len, kernel_start) = arch.paging().canonical_halves();
     let kernel_end = 0u64.wrapping_sub(0x1000);
     let mut images: Vec<(u64, u64, &str)> = images
         .iter()
@@ -389,7 +390,7 @@ impl SectionOffsets for GdbTarget<'_> {
 #[cfg(test)]
 mod tests {
     use super::{address_layout, library_list_xml, memory_map_xml, proc_maps};
-    use crate::base::types::Arch;
+    use crate::arch::Arch;
 
     /// IDA subtracts 0x1000 from an x86 library's segment address before
     /// rebasing (gdb's PE convention) and takes ARM64's as the image base. A

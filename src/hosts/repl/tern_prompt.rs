@@ -26,9 +26,11 @@ use super::native::completions::{Popup, PopupKey};
 use super::native::palette::{Outcome, Palette, Tab};
 use super::native::{self, DIM, MNEMONIC, MUTED, NUMBER, REGISTER, STRING, SYMBOL, span};
 use super::palette::{RECENT_LINES, initial_tab};
+use super::terminal::{self, PromptMark};
 use super::{
     CustomPrompt, MyCompleter, NATIVE_PROMPT, ReplState, TargetLoan, termination_requested,
 };
+use crate::backend::dbg_backend::{thread_kind, thread_label};
 use crate::base::output::prompting;
 
 /// The input's id: key `ed` in the dock.
@@ -100,6 +102,10 @@ impl TernPrompt {
             wire::feature::UNDO,
             wire::feature::SEND,
         ];
+        // The row the field takes is where the line is echoed: the prompt
+        // starts there, and input is awaited, as Tern sees it.
+        terminal::mark(PromptMark::Prompt);
+        terminal::mark(PromptMark::Input);
         // A paste arrives whole, to be joined into one line rather than run
         // line by line as typed.
         let Some(mut session) = native::connect_with::<()>(&features, true) else {
@@ -129,7 +135,7 @@ impl TernPrompt {
                 // The removed surface leaves its anchor row empty, with the
                 // cursor under it: the echo takes that row.
                 write_now(b"\x1b[A\r");
-                let prompt = CustomPrompt::new(state.ctx.backend.name(), &state.ctx.current_thread);
+                let prompt = CustomPrompt::new(&state.prompt_backend(), &state.prompt_thread());
                 let trimmed = line.trim_start();
                 outln!(
                     "{} {}",
@@ -625,7 +631,10 @@ impl<'a> Line<'a> {
         let running = state.ctx.backend.is_running();
         let mut status = ui::status().child(ui::seg(backend).icon(Icon::Plug));
         if !thread.is_empty() {
-            status = status.child(ui::seg([span("thread ", MUTED), span(thread, "info")]));
+            status = status.child(ui::seg([
+                span(format!("{} ", thread_kind(thread)), MUTED),
+                span(thread_label(thread), "info"),
+            ]));
         }
         status = status.child(if running {
             ui::seg("running").icon(Icon::Play)

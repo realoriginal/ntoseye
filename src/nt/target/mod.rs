@@ -65,6 +65,7 @@ pub use vtl::{
     SavedVtlContext, ServedVp, VP_STATE_REGISTERS, exit_registers,
 };
 
+use crate::arch::Arch;
 use crate::{
     backend::{
         debugger_data::{DebuggerDataBlock, MetadataSource, MetadataValue},
@@ -73,7 +74,7 @@ use crate::{
     base::{
         error::{Error, Result},
         memory::DTB_IDENTITY,
-        types::{Arch, CodeMachine, Dtb, VirtAddr},
+        types::{CodeMachine, Dtb, VirtAddr},
     },
     nt::{
         breakpoints::SiteJournal,
@@ -293,17 +294,9 @@ impl SelectedFrame {
 
     /// Select a context given only register values (`.cxr`, `.ecxr`, `.trap`),
     /// which carry no unwind metadata and therefore no frame base.
-    pub fn from_registers(index: usize, registers: HashMap<String, u64>) -> Self {
-        let ip = registers
-            .get("rip")
-            .copied()
-            .or_else(|| registers.get("pc").copied())
-            .unwrap_or(0);
-        let sp = registers
-            .get("rsp")
-            .copied()
-            .or_else(|| registers.get("sp").copied())
-            .unwrap_or(0);
+    pub fn from_registers(arch: Arch, index: usize, registers: HashMap<String, u64>) -> Self {
+        let ip = registers.get(arch.pc_register()).copied().unwrap_or(0);
+        let sp = registers.get(arch.sp_register()).copied().unwrap_or(0);
         let seed_registers = registers.clone();
         Self {
             index,
@@ -377,7 +370,7 @@ pub struct Arm64SavedRegisters {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SavedThreadRegisters {
+pub struct Amd64SavedRegisters {
     pub rip: Option<u64>,
     pub rsp: Option<u64>,
     pub rax: Option<u64>,
@@ -396,20 +389,11 @@ pub struct SavedThreadRegisters {
     pub r14: Option<u64>,
     pub r15: Option<u64>,
     pub rflags: Option<u64>,
-    pub arm64: Option<Arm64SavedRegisters>,
 }
 
-impl SavedThreadRegisters {
+impl Amd64SavedRegisters {
     pub fn get(&self, name: &str) -> Option<u64> {
-        let name = name.to_ascii_lowercase();
-        if let Some(index) = name
-            .strip_prefix('x')
-            .and_then(|index| index.parse::<usize>().ok())
-            .filter(|&index| index < 31)
-        {
-            return self.arm64.as_ref()?.x[index];
-        }
-        match name.as_str() {
+        match name {
             "rip" => self.rip,
             "rsp" => self.rsp,
             "rax" => self.rax,
@@ -428,12 +412,52 @@ impl SavedThreadRegisters {
             "r14" => self.r14,
             "r15" => self.r15,
             "rflags" | "eflags" => self.rflags,
-            "sp" => self.arm64.as_ref()?.sp,
-            "pc" => self.arm64.as_ref()?.pc,
-            "cpsr" => self.arm64.as_ref()?.cpsr,
-            "fp" => self.arm64.as_ref()?.fp,
-            "lr" => self.arm64.as_ref()?.lr,
             _ => None,
+        }
+    }
+}
+
+impl Arm64SavedRegisters {
+    pub fn get(&self, name: &str) -> Option<u64> {
+        if let Some(index) = name
+            .strip_prefix('x')
+            .and_then(|index| index.parse::<usize>().ok())
+            .filter(|&index| index < 31)
+        {
+            return self.x[index];
+        }
+        match name {
+            "sp" => self.sp,
+            "pc" => self.pc,
+            "cpsr" => self.cpsr,
+            "fp" => self.fp,
+            "lr" => self.lr,
+            _ => None,
+        }
+    }
+}
+
+/// Registers a thread saved when it left the processor, per architecture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedThreadRegisters {
+    Amd64(Amd64SavedRegisters),
+    Arm64(Arm64SavedRegisters),
+}
+
+impl SavedThreadRegisters {
+    /// The architecture whose registers these are.
+    pub fn arch(&self) -> Arch {
+        match self {
+            Self::Amd64(_) => Arch::Amd64,
+            Self::Arm64(_) => Arch::Arm64,
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<u64> {
+        let name = name.to_ascii_lowercase();
+        match self {
+            Self::Amd64(registers) => registers.get(&name),
+            Self::Arm64(registers) => registers.get(&name),
         }
     }
 }

@@ -11,15 +11,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ntoseye_macros::record;
 
-use crate::nt::dmp::structs::{ExceptionRecord64, Header64};
-
-use crate::backend::cpu_context::{amd64, arm64};
-use crate::backend::dbg_backend::RegisterMap;
+use crate::arch::{Arch, RegisterMap};
 use crate::base::bytes::{write_u32, write_u64};
 use crate::base::error::{Error, Result};
 use crate::base::memory::{MemoryOps, PAGE_SIZE};
-use crate::base::types::{Arch, MAX_PROCESSORS, PhysAddr, VirtAddr};
-use crate::nt::dmp::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64};
+use crate::base::types::{MAX_PROCESSORS, PhysAddr};
+use crate::nt::dmp::structs::{ExceptionRecord64, Header64};
 use crate::nt::layout::{FieldInfo, ParsedType};
 use crate::nt::target::Target;
 
@@ -39,51 +36,23 @@ pub struct DumpWrite {
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-fn machine_image_type(arch: Arch) -> u32 {
-    match arch {
-        Arch::Amd64 => IMAGE_FILE_MACHINE_AMD64,
-        Arch::Arm64 => IMAGE_FILE_MACHINE_ARM64,
-    }
-}
-
 /// Rebuild a `CONTEXT` from a register file in another layout (a GDB stub's),
 /// register by register. Registers the source lacks stay zero, and
 /// `ContextFlags` claims the control and integer state (and segments on
 /// AMD64) that every stub reports.
 pub fn context_from_registers(arch: Arch, source: &RegisterMap, registers: &[u8]) -> Vec<u8> {
-    let (layout, flags_offset, flags) = match arch {
-        Arch::Amd64 => (
-            amd64::build_register_map(),
-            amd64::OFFSET_CONTEXT_FLAGS,
-            amd64::CONTEXT_CONTROL | amd64::CONTEXT_INTEGER | amd64::CONTEXT_SEGMENTS,
-        ),
-        Arch::Arm64 => (
-            arm64::build_register_map(),
-            arm64::OFFSET_CONTEXT_FLAGS,
-            arm64::CONTEXT_CONTROL | arm64::CONTEXT_INTEGER,
-        ),
-    };
-    let mut context = vec![0u8; context_size(arch)];
-    for register in layout.registers() {
-        let end = register.offset + register.size;
-        // The layout's synthetic slots (control registers, descriptor
-        // tables) sit past the CONTEXT proper.
-        if end > context.len() {
-            continue;
-        }
-        if let Ok(value) = source.read_u128(&register.name, registers) {
-            context[register.offset..end].copy_from_slice(&value.to_le_bytes()[..register.size]);
-        }
-    }
-    write_u32(&mut context, flags_offset, flags);
+    let mut context = vec![0u8; arch.context_size()];
+    // The layout's synthetic slots (control registers, descriptor tables)
+    // sit past the CONTEXT proper, so the copy leaves them out.
+    arch.register_map()
+        .copy_from(&mut context, source, registers);
+    let flags = arch.context_flags();
+    write_u32(
+        &mut context,
+        flags.offset,
+        flags.control | flags.integer | flags.segments,
+    );
     context
-}
-
-fn context_size(arch: Arch) -> usize {
-    match arch {
-        Arch::Amd64 => amd64::CONTEXT_SIZE,
-        Arch::Arm64 => arm64::CONTEXT_SIZE,
-    }
 }
 
 #[repr(C)]
@@ -164,7 +133,7 @@ impl DumpMetadata {
                 MAX_PHYSICAL_MEMORY_RUNS
             )));
         }
-        let context_size = context_size(self.arch);
+        let context_size = self.arch.context_size();
         if self.context.len() < context_size {
             return Err(Error::DebugInfo(format!(
                 "KD CONTEXT is too short: {} bytes, expected at least {context_size}",
@@ -302,7 +271,7 @@ fn build_header(metadata: &DumpMetadata, pages: u64) -> Result<Vec<u8>> {
     write_u32(
         &mut header,
         offset_of!(Header64, machine_image_type),
-        machine_image_type(metadata.arch),
+        u32::from(metadata.arch.machine_type()),
     );
     write_u32(
         &mut header,
@@ -355,7 +324,7 @@ fn build_header(metadata: &DumpMetadata, pages: u64) -> Result<Vec<u8>> {
     }
 
     let context_offset = offset_of!(Header64, context_record_buffer);
-    let context_size = context_size(metadata.arch);
+    let context_size = metadata.arch.context_size();
     header[context_offset..context_offset + context_size]
         .copy_from_slice(&metadata.context[..context_size]);
 
@@ -477,7 +446,7 @@ fn physical_runs_from_symbol(target: &Target) -> Result<Option<Vec<(u64, u64)>>>
         Err(Error::SymbolNotFound(_)) | Err(Error::ExpectedSymbols) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let descriptor_address: VirtAddr = symbol.read()?;
+    let descriptor_address = symbol.read_pointer()?;
     if descriptor_address.is_zero() {
         return Err(Error::DebugInfo("nt!MmPhysicalMemoryBlock is null".into()));
     }
@@ -657,7 +626,7 @@ pub fn physical_runs(target: &Target) -> Result<Vec<(u64, u64)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::dbg_backend::RegisterInfo;
+    use crate::arch::{RegisterInfo, amd64, arm64};
     use crate::base::bytes::write_u64;
     use crate::nt::dmp::DmpMem;
     use std::cell::Cell;
@@ -694,7 +663,7 @@ mod tests {
         let converted = context_from_registers(Arch::Amd64, &stub, &registers);
 
         assert_eq!(converted.len(), amd64::CONTEXT_SIZE);
-        let layout = amd64::build_register_map();
+        let layout = Arch::Amd64.register_map();
         assert_eq!(
             layout.read_u64("rip", &converted).unwrap(),
             0xffff_f805_aed1_950f
@@ -823,7 +792,7 @@ mod tests {
         let info = dump.info();
         assert_eq!(info.directory_table_base, metadata.directory_table_base);
         assert_eq!(info.number_processors, 1);
-        assert_eq!(info.context.rip, 0xffff_f800_1234_5678);
+        assert_eq!(info.context.instruction_pointer(), 0xffff_f800_1234_5678);
         let system_info = info.system_info.as_ref().unwrap();
         assert_eq!(system_info.major_version, metadata.major_version);
         assert_eq!(system_info.minor_version, metadata.minor_version);
@@ -900,7 +869,7 @@ mod tests {
         let machine = offset_of!(Header64, machine_image_type);
         assert_eq!(
             u32::from_le_bytes(raw[machine..machine + 4].try_into().unwrap()),
-            IMAGE_FILE_MACHINE_ARM64,
+            u32::from(Arch::Arm64.machine_type()),
             "the header must declare ARM64, not AMD64"
         );
         let ctx = offset_of!(Header64, context_record_buffer);
@@ -918,14 +887,10 @@ mod tests {
 
         let dump = DmpMem::open(&path).unwrap();
         let info = dump.info();
-        let arm = info
-            .context
-            .arm64
-            .as_ref()
-            .expect("reopened ARM64 dump must decode an ARM64 context");
-        assert_eq!(arm.pc, 0xffff_8000_dead_0000);
-        assert_eq!(arm.sp, 0xffff_8000_beef_1000);
-        assert_eq!(arm.x[0], 0x5a5a_5a5a);
+        assert_eq!(info.context.arch(), Arch::Arm64);
+        assert_eq!(info.context.instruction_pointer(), 0xffff_8000_dead_0000);
+        assert_eq!(info.context.stack_pointer(), 0xffff_8000_beef_1000);
+        assert_eq!(info.context.read("x0"), Some(0x5a5a_5a5a));
         assert_eq!(info.directory_table_base, 0x4321_0000);
 
         let mut actual = [0u8; PAGE_SIZE];

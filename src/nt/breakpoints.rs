@@ -7,7 +7,8 @@ use std::{
     sync::Arc,
 };
 
-use crate::backend::dbg_backend::{HwBreakpointAccess, WatchpointAccess};
+use crate::arch::HwBreakpointAccess;
+use crate::backend::dbg_backend::WatchpointAccess;
 use crate::base::types::{Dtb, VirtAddr};
 use crate::nt::expr::Expr;
 use crate::nt::guest::hypercalls::tlfs_hypercall;
@@ -26,7 +27,7 @@ mod spec;
 mod test_backend;
 
 use install::BreakpointBackend;
-pub use install::{breakpoint_opcode, lift_target_site, plant_target_site};
+pub use install::{lift_target_site, plant_target_site};
 pub use journal::{Repair, SiteJournal};
 
 /// A hardware (debug-register) breakpoint's parameters: the access it traps on,

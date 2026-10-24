@@ -11,12 +11,11 @@ use std::sync::atomic::Ordering;
 
 use crate::base::error::Result;
 use crate::base::output;
+use crate::hosts::repl::commands::frames::print_indexed_stacktrace;
 use crate::nt::expr::Expr;
 use crate::nt::guest::ModuleInfo;
 use crate::nt::symbols::ModuleSymbolStatus;
 use crate::nt::target::{SelectedFrame, ThreadInfo};
-
-use crate::hosts::repl::commands::frames::print_indexed_stacktrace;
 use ntoseye_macros::command;
 
 use crate::hosts::repl::*;
@@ -77,7 +76,7 @@ fn foreach(
     #[arg(invoked)] name: &str,
 ) -> Result<Flow> {
     if tail.is_empty() {
-        outln!("{}\n", command_help(name));
+        outln!("{}", command_help(name));
         return Ok(Flow::Continue);
     }
     let spec = match parse_foreach(&tail) {
@@ -348,13 +347,13 @@ fn for_each_frame(
     if command.is_empty() {
         let selected = previous.as_ref().map(|frame| frame.index);
         print_indexed_stacktrace(
+            state.ctx.target.arch(),
             &trace,
             FOR_EACH_FRAME_LIMIT,
             0,
             crate::hosts::repl::disasm::StackColumns::default(),
             selected,
         );
-        outln!();
         return Ok(Flow::Continue);
     }
     let flow = state.in_command_loop(name, |state| {
@@ -838,7 +837,7 @@ impl ReplState<'_> {
     /// malformed.
     fn for_each_command(&self, name: &str, tail: &str, default: &str) -> Option<String> {
         if tail == "-?" {
-            outln!("{}\n", command_help(name));
+            outln!("{}", command_help(name));
             return None;
         }
         match command_string(tail) {

@@ -8,8 +8,10 @@ use super::{
     BreakpointConfig, BreakpointInfo, BreakpointManager, BreakpointScope, HypercallFilter,
     PartitionFilter, ThreadScope,
 };
+use crate::arch::Arch;
 use crate::base::error::{Error, Result};
-use crate::base::types::{Arch, VirtAddr};
+use crate::base::types::VirtAddr;
+use crate::nt::bugchecks::looks_like_kernel_pointer;
 use crate::nt::expr::Expr;
 use crate::nt::guest::{
     ProcessInfo,
@@ -84,7 +86,7 @@ impl BreakpointScope {
     pub fn label(&self) -> String {
         match self {
             Self::Kernel => "global".to_string(),
-            Self::Process { pid, name, .. } => format!("{name} ({pid})"),
+            Self::Process { pid, name, .. } => format!("{name} (PID {pid})"),
         }
     }
 }
@@ -120,7 +122,7 @@ impl ThreadScope {
 
     pub fn label(&self) -> String {
         match self.tid {
-            Some(tid) => format!("tid {tid}"),
+            Some(tid) => format!("TID {tid}"),
             None => format!("ethread {:#x}", self.ethread.0),
         }
     }
@@ -233,8 +235,7 @@ impl BreakpointManager {
         address: VirtAddr,
         fallback: &BreakpointScope,
     ) -> BreakpointScope {
-        const WINDOWS_X64_KERNEL_START: u64 = 0xffff_8000_0000_0000;
-        if address.0 >= WINDOWS_X64_KERNEL_START
+        if looks_like_kernel_pointer(debugger.arch(), address.0)
             || Self::find_kernel_module_containing_address(debugger, address).is_some()
         {
             BreakpointScope::Kernel

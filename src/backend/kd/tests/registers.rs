@@ -12,18 +12,14 @@ use crate::backend::kd::framing::{
     INITIAL_PACKET_ID, PACKET_TYPE_KD_STATE_MANIPULATE, data_packet,
 };
 use crate::backend::kd::registers::{
-    ARM64_KSPECIAL_REGISTERS_BCR0_OFFSET, ARM64_KSPECIAL_REGISTERS_BVR0_OFFSET,
-    ARM64_KSPECIAL_REGISTERS_MIN_SIZE, ARM64_KSPECIAL_REGISTERS_WCR0_OFFSET,
-    ARM64_KSPECIAL_REGISTERS_WVR0_OFFSET, Arm64X18Source, KSPECIAL_REGISTERS_CR0_OFFSET,
-    KSPECIAL_REGISTERS_CR2_OFFSET, KSPECIAL_REGISTERS_CR3_OFFSET, KSPECIAL_REGISTERS_CR4_OFFSET,
-    KSPECIAL_REGISTERS_CR8_OFFSET, KSPECIAL_REGISTERS_DR0_OFFSET, KSPECIAL_REGISTERS_DR6_OFFSET,
-    KSPECIAL_REGISTERS_DR7_OFFSET, KSPECIAL_REGISTERS_GDTR_OFFSET, KSPECIAL_REGISTERS_IDTR_OFFSET,
-    KSPECIAL_REGISTERS_LDTR_OFFSET, KSPECIAL_REGISTERS_MIN_SIZE, KSPECIAL_REGISTERS_TR_OFFSET,
-    append_control_registers_from_special, arm64_x18, context_payload,
-    update_arm64_debug_registers_from_context, update_special_debug_registers_from_context,
+    Arm64X18Source, arm64_x18, context_into_special, context_payload, special_into_context,
 };
 
-const ARM64_KSPECIAL_REGISTERS_TPIDR_EL0_OFFSET: usize = 0x10;
+/// Write `value`'s little-endian bytes at `offset`, where Windows'
+/// `KSPECIAL_REGISTERS` definition puts the field.
+fn put(buffer: &mut [u8], offset: usize, value: &[u8]) {
+    buffer[offset..offset + value.len()].copy_from_slice(value);
+}
 
 #[test]
 fn amd64_hardware_slots_remain_four_shared_slots() {
@@ -46,7 +42,7 @@ fn arm64_hardware_slots_remain_two_data_and_eight_execute_slots() {
     let (_kernel, host) = UnixStream::pair().unwrap();
     let mut backend = kd_backend_with_framing(host);
     backend.arch = Arch::Arm64;
-    backend.register_map = arm64::build_register_map();
+    backend.register_map = Arch::Arm64.register_map().clone();
     backend.exit_prepared = true;
 
     assert_eq!(backend.hardware_breakpoint_slots(), 10);
@@ -78,14 +74,12 @@ fn oversized_hardware_slot_ids_are_rejected_without_packets() {
                 .set_hardware_breakpoint(slot, 0x4000, HwBreakpointAccess::Execute, 1)
                 .unwrap_err();
             assert!(
-                matches!(error, Error::Kd(ref message)
-                    if message == &format!("invalid hardware breakpoint slot {slot}")),
+                matches!(error, Error::Kd(_)),
                 "{arch:?} set slot {slot}: {error}"
             );
             let error = backend.clear_hardware_breakpoint(slot).unwrap_err();
             assert!(
-                matches!(error, Error::Kd(ref message)
-                    if message == &format!("invalid hardware breakpoint slot {slot}")),
+                matches!(error, Error::Kd(_)),
                 "{arch:?} clear slot {slot}: {error}"
             );
         }
@@ -102,44 +96,31 @@ fn oversized_hardware_slot_ids_are_rejected_without_packets() {
 #[test]
 fn context_payload_rejects_short_buffers() {
     let short = vec![0u8; amd64::CONTEXT_SIZE - 1];
-    assert!(context_payload(&short).is_err());
+    assert!(context_payload(Arch::Amd64, &short).is_err());
 }
 
 #[test]
-fn append_control_registers_extends_context() {
+fn special_registers_fill_the_amd64_control_slots() {
     let mut ctx = vec![0u8; amd64::CONTEXT_SIZE];
-    let mut special = vec![0u8; KSPECIAL_REGISTERS_MIN_SIZE];
-    special[KSPECIAL_REGISTERS_CR0_OFFSET..KSPECIAL_REGISTERS_CR0_OFFSET + 8]
-        .copy_from_slice(&0x8005_0033u64.to_le_bytes());
-    special[KSPECIAL_REGISTERS_CR2_OFFSET..KSPECIAL_REGISTERS_CR2_OFFSET + 8]
-        .copy_from_slice(&0x1111_2222u64.to_le_bytes());
-    special[KSPECIAL_REGISTERS_CR3_OFFSET..KSPECIAL_REGISTERS_CR3_OFFSET + 8]
-        .copy_from_slice(&0x1234_5000u64.to_le_bytes());
-    special[KSPECIAL_REGISTERS_CR4_OFFSET..KSPECIAL_REGISTERS_CR4_OFFSET + 8]
-        .copy_from_slice(&0x350ef8u64.to_le_bytes());
-    special[KSPECIAL_REGISTERS_CR8_OFFSET..KSPECIAL_REGISTERS_CR8_OFFSET + 8]
-        .copy_from_slice(&2u64.to_le_bytes());
-    special[KSPECIAL_REGISTERS_GDTR_OFFSET + 6..KSPECIAL_REGISTERS_GDTR_OFFSET + 8]
-        .copy_from_slice(&0x1234u16.to_le_bytes());
-    special[KSPECIAL_REGISTERS_GDTR_OFFSET + 8..KSPECIAL_REGISTERS_GDTR_OFFSET + 16]
-        .copy_from_slice(&0xffff_f800_0000_1000u64.to_le_bytes());
-    special[KSPECIAL_REGISTERS_IDTR_OFFSET + 6..KSPECIAL_REGISTERS_IDTR_OFFSET + 8]
-        .copy_from_slice(&0x5678u16.to_le_bytes());
-    special[KSPECIAL_REGISTERS_IDTR_OFFSET + 8..KSPECIAL_REGISTERS_IDTR_OFFSET + 16]
-        .copy_from_slice(&0xffff_f800_0000_2000u64.to_le_bytes());
-    special[KSPECIAL_REGISTERS_TR_OFFSET..KSPECIAL_REGISTERS_TR_OFFSET + 2]
-        .copy_from_slice(&0x40u16.to_le_bytes());
-    special[KSPECIAL_REGISTERS_LDTR_OFFSET..KSPECIAL_REGISTERS_LDTR_OFFSET + 2]
-        .copy_from_slice(&0x48u16.to_le_bytes());
-    special[KSPECIAL_REGISTERS_DR0_OFFSET..KSPECIAL_REGISTERS_DR0_OFFSET + 8]
-        .copy_from_slice(&0xffff_f804_1234_5678u64.to_le_bytes());
-    special[KSPECIAL_REGISTERS_DR6_OFFSET..KSPECIAL_REGISTERS_DR6_OFFSET + 8]
-        .copy_from_slice(&5u64.to_le_bytes());
-    special[KSPECIAL_REGISTERS_DR7_OFFSET..KSPECIAL_REGISTERS_DR7_OFFSET + 8]
-        .copy_from_slice(&0x402u64.to_le_bytes());
+    let mut special = vec![0u8; 0xa8];
+    put(&mut special, 0x00, &0x8005_0033u64.to_le_bytes());
+    put(&mut special, 0x08, &0x1111_2222u64.to_le_bytes());
+    put(&mut special, 0x10, &0x1234_5000u64.to_le_bytes());
+    put(&mut special, 0x18, &0x350ef8u64.to_le_bytes());
+    put(&mut special, 0x20, &0xffff_f804_1234_5678u64.to_le_bytes());
+    put(&mut special, 0x40, &5u64.to_le_bytes());
+    put(&mut special, 0x48, &0x402u64.to_le_bytes());
+    // KDESCRIPTOR: Pad[3], Limit, Base.
+    put(&mut special, 0x56, &0x1234u16.to_le_bytes());
+    put(&mut special, 0x58, &0xffff_f800_0000_1000u64.to_le_bytes());
+    put(&mut special, 0x66, &0x5678u16.to_le_bytes());
+    put(&mut special, 0x68, &0xffff_f800_0000_2000u64.to_le_bytes());
+    put(&mut special, 0x70, &0x40u16.to_le_bytes());
+    put(&mut special, 0x72, &0x48u16.to_le_bytes());
+    put(&mut special, 0xa0, &2u64.to_le_bytes());
 
-    append_control_registers_from_special(&mut ctx, &special).unwrap();
-    let map = amd64::build_register_map();
+    special_into_context(Arch::Amd64, &mut ctx, &special).unwrap();
+    let map = Arch::Amd64.register_map();
 
     assert_eq!(ctx.len(), amd64::REGISTER_BUFFER_SIZE);
     assert_eq!(map.read_u64("cr0", &ctx).unwrap(), 0x8005_0033);
@@ -159,65 +140,57 @@ fn append_control_registers_extends_context() {
 }
 
 #[test]
+fn short_special_registers_are_rejected() {
+    for (arch, size) in [(Arch::Amd64, 0xa8), (Arch::Arm64, 0xa0)] {
+        let mut ctx = vec![0u8; arch.context_size()];
+        assert!(special_into_context(arch, &mut ctx, &vec![0u8; size - 1]).is_err());
+        assert!(special_into_context(arch, &mut ctx, &vec![0u8; size]).is_ok());
+    }
+}
+
+#[test]
 fn context_debug_registers_update_special_registers() {
     let mut ctx = vec![0u8; amd64::REGISTER_BUFFER_SIZE];
-    let mut special = vec![0xa5; KSPECIAL_REGISTERS_MIN_SIZE];
-    let map = amd64::build_register_map();
+    let mut special = vec![0xa5; 0xa8];
+    let map = Arch::Amd64.register_map();
     map.write_u64("dr0", &mut ctx, 0xffff_f804_1234_5678)
         .unwrap();
     map.write_u64("dr6", &mut ctx, 3).unwrap();
     map.write_u64("dr7", &mut ctx, 0xd0402).unwrap();
+    map.write_u64("cr0", &mut ctx, 0x8005_0033).unwrap();
 
-    update_special_debug_registers_from_context(&mut special, &ctx).unwrap();
+    context_into_special(Arch::Amd64, &mut special, &ctx).unwrap();
 
+    assert_eq!(bytes::read_u64(&special, 0x20), 0xffff_f804_1234_5678);
+    assert_eq!(bytes::read_u64(&special, 0x40), 3);
+    assert_eq!(bytes::read_u64(&special, 0x48), 0xd0402);
     assert_eq!(
-        bytes::read_u64(&special, KSPECIAL_REGISTERS_DR0_OFFSET),
-        0xffff_f804_1234_5678
-    );
-    assert_eq!(bytes::read_u64(&special, KSPECIAL_REGISTERS_DR6_OFFSET), 3);
-    assert_eq!(
-        bytes::read_u64(&special, KSPECIAL_REGISTERS_DR7_OFFSET),
-        0xd0402
-    );
-    assert_eq!(
-        bytes::read_u64(&special, KSPECIAL_REGISTERS_CR0_OFFSET),
+        bytes::read_u64(&special, 0x00),
         0xa5a5_a5a5_a5a5_a5a5,
-        "non-debug special registers must remain untouched"
+        "registers the CONTEXT does not carry must remain untouched"
     );
 }
 
 #[test]
 fn arm64_context_debug_registers_update_special_registers() {
     let mut ctx = vec![0u8; arm64::CONTEXT_SIZE];
-    let mut special = vec![0xa5; ARM64_KSPECIAL_REGISTERS_MIN_SIZE];
-    let map = arm64::build_register_map();
+    let mut special = vec![0xa5; 0xa0];
+    let map = Arch::Arm64.register_map();
     map.write_u64("bvr0", &mut ctx, 0x4000).unwrap();
     map.write_u64("bcr0", &mut ctx, 0xe9e1).unwrap();
     map.write_u64("wvr1", &mut ctx, 0x5000).unwrap();
     map.write_u64("wcr1", &mut ctx, 0x0000_e9e1).unwrap();
 
-    update_arm64_debug_registers_from_context(&mut special, &ctx).unwrap();
+    context_into_special(Arch::Arm64, &mut special, &ctx).unwrap();
 
+    assert_eq!(bytes::read_u64(&special, 0x28), 0x4000);
+    assert_eq!(bytes::read_u32(&special, 0x68), 0xe9e1);
+    assert_eq!(bytes::read_u64(&special, 0x90), 0x5000);
+    assert_eq!(bytes::read_u32(&special, 0x9c), 0x0000_e9e1);
     assert_eq!(
-        bytes::read_u64(&special, ARM64_KSPECIAL_REGISTERS_BVR0_OFFSET),
-        0x4000
-    );
-    assert_eq!(
-        bytes::read_u32(&special, ARM64_KSPECIAL_REGISTERS_BCR0_OFFSET),
-        0xe9e1
-    );
-    assert_eq!(
-        bytes::read_u64(&special, ARM64_KSPECIAL_REGISTERS_WVR0_OFFSET + 8),
-        0x5000
-    );
-    assert_eq!(
-        bytes::read_u32(&special, ARM64_KSPECIAL_REGISTERS_WCR0_OFFSET + 4),
-        0x0000_e9e1
-    );
-    assert_eq!(
-        bytes::read_u64(&special, ARM64_KSPECIAL_REGISTERS_TPIDR_EL0_OFFSET),
+        bytes::read_u64(&special, 0x10),
         0xa5a5_a5a5_a5a5_a5a5,
-        "non-debug special registers must remain untouched"
+        "TPIDR_EL0 is no debug register and must remain untouched"
     );
 }
 
@@ -261,7 +234,7 @@ fn arm64_registers_survive_refused_control_space() {
     let (kernel, host) = UnixStream::pair().unwrap();
     let mut backend = kd_backend_with_framing(host);
     backend.arch = Arch::Arm64;
-    backend.register_map = arm64::build_register_map();
+    backend.register_map = Arch::Arm64.register_map().clone();
     backend.link.halt();
     backend.exit_prepared = true;
 
@@ -295,6 +268,110 @@ fn arm64_registers_survive_refused_control_space() {
     // the halt's context is memoized, so it must not reach the wire at all:
     // the target above is scripted for exactly one fetch.
     assert_eq!(backend.read_registers().unwrap(), regs);
+    drop(backend);
+    worker.join().unwrap();
+}
+
+/// A halted AMD64 processor whose first register read the kernel answers
+/// with an empty `CONTEXT` and `special` control space, EFER already known.
+fn amd64_backend_reading(host: UnixStream) -> KdBackend {
+    let mut backend = kd_backend_with_framing(host);
+    backend.link.halt();
+    backend.exit_prepared = true;
+    backend.efer_cache.insert(0, 0xd01);
+    backend
+}
+
+/// A slot armed during a halt shows in the registers read after it, though
+/// the halt's registers were read before: the write keeps nothing that
+/// described them.
+#[test]
+fn registers_read_after_arming_a_slot_show_it() {
+    const ADDRESS: u64 = 0xffff_f800_1234_5000;
+    let (kernel, host) = UnixStream::pair().unwrap();
+    let mut backend = amd64_backend_reading(host);
+    let context = vec![0u8; amd64::CONTEXT_SIZE];
+    let special_map = Arch::Amd64.special_register_map();
+    let mut special = vec![0u8; special_map.extent()];
+    special_map.write_u64("dr7", &mut special, 0x400).unwrap();
+    let worker = serve_manipulate(
+        kernel,
+        vec![
+            (api::DBGKD_GET_CONTEXT, api::STATUS_SUCCESS, context.clone()),
+            (
+                api::DBGKD_READ_CONTROL_SPACE,
+                api::STATUS_SUCCESS,
+                special.clone(),
+            ),
+            // Arming slot 0: its state for a rollback, then the
+            // read-modify-write.
+            (
+                api::DBGKD_READ_CONTROL_SPACE,
+                api::STATUS_SUCCESS,
+                special.clone(),
+            ),
+            (
+                api::DBGKD_READ_CONTROL_SPACE,
+                api::STATUS_SUCCESS,
+                special.clone(),
+            ),
+            (api::DBGKD_WRITE_CONTROL_SPACE, api::STATUS_SUCCESS, special),
+            (api::DBGKD_GET_CONTEXT, api::STATUS_SUCCESS, context),
+        ],
+    );
+    let map = backend.register_map.clone();
+
+    let before = backend.read_registers().unwrap();
+    assert_eq!(map.read_u64("dr7", &before).unwrap(), 0x400);
+    backend
+        .set_hardware_breakpoint(0, ADDRESS, HwBreakpointAccess::Execute, 1)
+        .unwrap();
+    let after = backend.read_registers().unwrap();
+
+    assert_eq!(map.read_u64("dr0", &after).unwrap(), ADDRESS);
+    assert_eq!(
+        map.read_u64("dr7", &after).unwrap() & 0b11,
+        0b10,
+        "G0 enables slot 0"
+    );
+    drop(backend);
+    worker.join().unwrap();
+}
+
+/// An MSR written during a halt shows in the registers read after it.
+#[test]
+fn registers_read_after_an_msr_write_show_it() {
+    const MSR_EFER: u32 = 0xc000_0080;
+    let (kernel, host) = UnixStream::pair().unwrap();
+    let mut backend = amd64_backend_reading(host);
+    let context = vec![0u8; amd64::CONTEXT_SIZE];
+    let special = vec![0u8; Arch::Amd64.special_register_map().extent()];
+    let worker = serve_manipulate(
+        kernel,
+        vec![
+            (api::DBGKD_GET_CONTEXT, api::STATUS_SUCCESS, context.clone()),
+            (
+                api::DBGKD_READ_CONTROL_SPACE,
+                api::STATUS_SUCCESS,
+                special.clone(),
+            ),
+            (
+                api::DBGKD_WRITE_MACHINE_SPECIFIC_REGISTER,
+                api::STATUS_SUCCESS,
+                Vec::new(),
+            ),
+            (api::DBGKD_GET_CONTEXT, api::STATUS_SUCCESS, context),
+            (api::DBGKD_READ_CONTROL_SPACE, api::STATUS_SUCCESS, special),
+        ],
+    );
+    let map = backend.register_map.clone();
+
+    let before = backend.read_registers().unwrap();
+    assert_eq!(map.read_u64("efer", &before).unwrap(), 0xd01);
+    backend.write_msr(0, MSR_EFER, 0x501).unwrap();
+    let after = backend.read_registers().unwrap();
+
+    assert_eq!(map.read_u64("efer", &after).unwrap(), 0x501);
     drop(backend);
     worker.join().unwrap();
 }

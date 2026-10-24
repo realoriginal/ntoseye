@@ -7,12 +7,15 @@ use std::sync::Arc;
 
 use pelite::pe64::{Pe, PeView, image::IMAGE_SCN_MEM_EXECUTE};
 
-use super::{CachedModule, OwnedModule, StackPage, StackTracer, ThreadTraceContext};
+use super::{
+    CachedModule, OwnedModule, RegisterContext, StackPage, StackTracer, ThreadTraceContext,
+    unwinder,
+};
 use crate::{
     base::{
         error::{Error, Result},
         memory::{MemoryOps, PAGE_SIZE, read_page_chunks},
-        types::{Arch, CodeMachine, VirtAddr},
+        types::{CodeMachine, VirtAddr},
     },
     nt::{
         guest::{Image, ModuleInfo},
@@ -40,6 +43,23 @@ impl<'a> StackTracer<'a> {
     /// A stack slot, from the per-trace page cache.
     pub(super) fn stack_u64(&self, address: u64) -> Result<u64> {
         let mut bytes = [0u8; 8];
+        self.stack_bytes(address, &mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    /// A pointer-sized stack slot, as wide as the traced space's
+    /// architecture's pointers.
+    fn stack_pointer(&self, address: u64) -> Result<u64> {
+        let arch = self.memory.arch();
+        let mut bytes = [0u8; 8];
+        let bytes = &mut bytes[..arch.pointer_size() as usize];
+        self.stack_bytes(address, bytes)?;
+        Ok(arch.decode_pointer(bytes).0)
+    }
+
+    /// `bytes.len()` bytes of stack at `address`, from the per-trace page
+    /// cache.
+    fn stack_bytes(&self, address: u64, bytes: &mut [u8]) -> Result<()> {
         let mut done = 0usize;
         while done < bytes.len() {
             let at = address
@@ -72,7 +92,7 @@ impl<'a> StackTracer<'a> {
             bytes[done..done + take].copy_from_slice(&data.bytes[offset..offset + take]);
             done += take;
         }
-        Ok(u64::from_le_bytes(bytes))
+        Ok(())
     }
 
     pub(super) fn scan_stack(
@@ -91,7 +111,8 @@ impl<'a> StackTracer<'a> {
             return frames;
         }
 
-        for slot in 0..(STACK_SCAN_BYTES / 8) {
+        let slot_size = self.memory.arch().pointer_size() as usize;
+        for slot in 0..(STACK_SCAN_BYTES / slot_size) {
             if frames.len() >= limit {
                 break;
             }
@@ -99,8 +120,8 @@ impl<'a> StackTracer<'a> {
                 break;
             }
 
-            let sp = start_rsp.saturating_add((slot * 8) as u64);
-            let potential_ip = match self.stack_u64(sp) {
+            let sp = start_rsp.saturating_add((slot * slot_size) as u64);
+            let potential_ip = match self.stack_pointer(sp) {
                 Ok(addr) => {
                     failures = 0;
                     addr
@@ -168,22 +189,24 @@ impl<'a> StackTracer<'a> {
             .map(|cached| (cached.image.clone(), cached.layout.clone()))
     }
 
-    /// The instruction set of the code at `address`, which picks the
-    /// unwinder for its frame. On ARM64 an emulated x64 image, or the x64
-    /// ranges of a hybrid one, are AMD64; code outside any image (the
-    /// emulator's translation cache) is the processor's own.
-    pub(super) fn code_machine_at(&mut self, address: u64) -> CodeMachine {
-        if self.target.arch() == Arch::Amd64 {
-            return CodeMachine::Amd64;
-        }
-        let Some(module) = self.module_containing(address) else {
-            return CodeMachine::Arm64;
+    /// Whether `context` is at a Windows hypervisor VM-exit entry, where its
+    /// stack begins.
+    pub fn at_hypervisor_stack_base(&self, context: &RegisterContext) -> bool {
+        let (Some(symbols), Some(image)) = (&self.trace.hypervisor, &self.trace.foreign_image)
+        else {
+            return false;
         };
-        let rva = (address - module.info.base_address.0) as u32;
-        module
-            .layout
-            .as_ref()
-            .map_or(CodeMachine::Arm64, |layout| layout.machine_at(rva))
+        context
+            .pc
+            .checked_sub(image.base_address.0)
+            .and_then(|rva| u32::try_from(rva).ok())
+            .is_some_and(|rva| symbols.in_exit_entry(rva))
+    }
+
+    /// The instruction set of the code at `address`, which picks the
+    /// unwinder for its frame.
+    pub(super) fn code_machine_at(&mut self, address: u64) -> CodeMachine {
+        unwinder(self.target.arch()).code_machine_at(self, address)
     }
 
     /// Replace a module's holed in-memory image with the complete on-disk one,

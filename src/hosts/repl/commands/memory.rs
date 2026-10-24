@@ -6,6 +6,7 @@ use owo_colors::OwoColorize;
 
 use ntoseye_macros::{command, grammar};
 
+use crate::arch::Arch;
 use crate::base::bytes::utf16le_lossy;
 use crate::base::error::{Error, Result, best_effort};
 use crate::base::memory::{
@@ -14,6 +15,7 @@ use crate::base::memory::{
 use crate::base::time::days_to_ymd;
 use crate::base::types::VirtAddr;
 use crate::hosts::repl::args::{ArgCursor, ArgCx, ArgError};
+use crate::hosts::repl::*;
 use crate::hosts::ui;
 use crate::nt::expr::Expr;
 use crate::nt::guest::ProcessInfo;
@@ -25,8 +27,6 @@ use crate::nt::target::{
 };
 use crate::nt::unwind::{resolve_thread_trace_context, try_format_symbol};
 use crate::session::Session;
-
-use crate::hosts::repl::*;
 
 pub const MAX_DISPLAY_BYTES: usize = 1024 * 1024;
 pub const MAX_DISASSEMBLY_INSTRUCTIONS: usize = 4096;
@@ -150,15 +150,7 @@ pub(super) fn dump_memory(
 
 impl Render for MemoryDump {
     fn render(&self, _: &mut ReplState<'_>, (): ()) {
-        let print_text =
-            || display_memory_with_validity(self.start, &self.data, Some(&self.valid), &self.mode);
-        #[cfg(feature = "cli")]
-        native::render(
-            || native::memory::dump(self.start, &self.data, Some(&self.valid), &self.mode),
-            print_text,
-        );
-        #[cfg(not(feature = "cli"))]
-        print_text();
+        display_memory_with_validity(self.start, &self.data, Some(&self.valid), &self.mode);
     }
 }
 
@@ -412,50 +404,111 @@ fn symbol_values(
 }
 
 impl SymbolValues {
-    fn show(&self) {
-        let print_text = || print_symbol_values(&self.rows, self.item_size);
-        #[cfg(feature = "cli")]
-        native::render(
-            || native::memory::symbol_values(&self.rows, self.item_size),
-            print_text,
-        );
-        #[cfg(not(feature = "cli"))]
-        print_text();
+    fn show(&self, session: &Session) {
+        print_symbol_values(session, &self.rows, self.item_size);
     }
 }
 
 impl Render for SymbolValues {
-    fn render(&self, _: &mut ReplState<'_>, (): ()) {
-        self.show();
+    fn render(&self, repl: &mut ReplState<'_>, (): ()) {
+        self.show(repl.ctx);
     }
 }
 
-/// `dds`/`dqs` as text: a line per item, values `item_size * 2` digits wide.
-fn print_symbol_values(rows: &[SymbolValueRow], item_size: usize) {
+/// `arch`'s registers whose values a `dqs` slot can hold the address of,
+/// the stack and frame pointers first.
+fn slot_registers(arch: Arch) -> impl Iterator<Item = &'static str> {
+    let first = [arch.sp_register(), arch.frame_register()];
+    let rest = arch
+        .general_registers()
+        .iter()
+        .copied()
+        .filter(move |name| !first.contains(name) && *name != arch.flags_register());
+    first.into_iter().chain(rest)
+}
+
+/// `dds`/`dqs` as text, a line per item, values `item_size * 2` digits
+/// wide, read as a stack: each slot a register points into named before it
+/// (`rsp ▶`), and a value that is a return address (the code before it
+/// ends in a call) marked `↩` before its symbol.
+fn print_symbol_values(session: &Session, rows: &[SymbolValueRow], item_size: usize) {
+    let target = &session.target;
+    // The selected frame's registers, else the selected thread's.
+    let registers = target
+        .selected_frame
+        .as_ref()
+        .map(|frame| &frame.registers)
+        .or(target.registers.as_ref());
+    let pointing = |address: u64| -> Vec<&str> {
+        let Some(registers) = registers else {
+            return Vec::new();
+        };
+        let slot = address..address.saturating_add(item_size as u64);
+        slot_registers(target.arch())
+            .filter(|name| {
+                registers
+                    .get(*name)
+                    .is_some_and(|value| slot.contains(value))
+            })
+            .collect()
+    };
+    let markers: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let names = pointing(row.address.0);
+            if names.is_empty() {
+                String::new()
+            } else {
+                format!("{} \u{25b6}", names.join(" "))
+            }
+        })
+        .collect();
+    let marker_width = markers
+        .iter()
+        .map(|marker| marker.chars().count())
+        .max()
+        .unwrap_or(0);
+    // A return address: the code before it, as the code there decodes,
+    // ends in a call.
+    let returns = |value: u64| {
+        let mut before = [0u8; 8];
+        value.checked_sub(before.len() as u64).is_some_and(|from| {
+            session.read_masked(VirtAddr(from), &mut before).is_ok()
+                && target
+                    .code_machine(VirtAddr(value))
+                    .instruction_set()
+                    .ends_in_call(&before)
+        })
+    };
     let width = item_size * 2;
-    for row in rows {
+    for (row, marker) in rows.iter().zip(&markers) {
+        let marker = match marker_width {
+            0 => String::new(),
+            width => format!("{} ", format!("{marker:>width$}").cyan()),
+        };
         let address = ui::addr(row.address.0);
         match &row.value {
-            SymbolValue::Partial => outln!("{address}  <partial>"),
-            SymbolValue::Unreadable => outln!("{address}  <unreadable>"),
-            SymbolValue::Value {
-                value,
-                symbol: Some(symbol),
-            } => outln!("{address}  {value:0width$x}  {}", ui::symbol(symbol)),
-            SymbolValue::Value {
-                value,
-                symbol: None,
-            } => outln!("{address}  {value:0width$x}"),
+            SymbolValue::Partial => outln!("{marker}{address}  <partial>"),
+            SymbolValue::Unreadable => outln!("{marker}{address}  <unreadable>"),
+            SymbolValue::Value { value, symbol } => {
+                let symbol = match symbol {
+                    Some(symbol) if returns(*value) => {
+                        format!("  \u{21a9} {}", ui::symbol(symbol))
+                    }
+                    Some(symbol) => format!("  {}", ui::symbol(symbol)),
+                    None => String::new(),
+                };
+                outln!("{marker}{address}  {value:0width$x}{symbol}");
+            }
         }
     }
-    outln!();
 }
 
 impl ReplState<'_> {
     /// `dds`/`dqs` over `range`: each value, and the symbol it resolves to.
     pub fn display_symbol_range(&self, range: &AddressRange, item_size: usize) -> Result<()> {
         match symbol_values(self.ctx, range, item_size) {
-            Ok(values) => values.show(),
+            Ok(values) => values.show(self.ctx),
             Err(error) => error!("{error}"),
         }
         Ok(())
@@ -631,7 +684,6 @@ impl Render for Pointers {
             }
             outln!("{}", line);
         }
-        outln!();
     }
 }
 
@@ -666,14 +718,14 @@ fn dpp(
     pointers(session, &range, item_size, pointee)
 }
 
-/// The NUL-terminated string of `char_size`-wide units, quoted and escaped
-/// as `da`/`du` show it, marked when it is cut short by `max_chars` or an
-/// unreadable page.
+/// The NUL-terminated string of `char_size`-wide units, quoted, with what it
+/// cannot print shown as `.`, as `da`/`du` show it, marked when it is cut
+/// short by `max_chars` or an unreadable page.
 fn quote_terminated(read: &TerminatedRead, max_chars: usize, char_size: usize) -> String {
     let text: String = if char_size == 1 {
-        read.bytes.iter().map(|&byte| char::from(byte)).collect()
+        read.bytes.iter().map(|&byte| ascii_char(byte)).collect()
     } else {
-        utf16le_lossy(&read.bytes)
+        printable_text(&utf16le_lossy(&read.bytes))
     };
     let suffix = if read.unreadable {
         " <unreadable>".red().to_string()
@@ -682,7 +734,21 @@ fn quote_terminated(read: &TerminatedRead, max_chars: usize, char_size: usize) -
     } else {
         String::new()
     };
-    format!("\"{}\"{}", text.escape_debug(), suffix)
+    format!("\"{text}\"{suffix}")
+}
+
+/// `text` with each control character shown as `.`, as `db`'s ASCII column
+/// shows a byte it cannot print.
+fn printable_text(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                '.'
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// A NUL-terminated string `da`/`du` read.
@@ -721,7 +787,7 @@ fn terminated_string(
 impl Render for TerminatedString {
     fn render(&self, _: &mut ReplState<'_>, (): ()) {
         outln!(
-            "{}  {}\n",
+            "{}  {}",
             ui::addr(self.address.0),
             quote_terminated(&self.read, self.max_chars, self.char_size)
         );
@@ -828,7 +894,7 @@ fn string_descriptor_fields(
     let buffer = if bits == CODE_BITNESS_X86 {
         best_effort(mem.read::<u32>(address + 4u64))?.map(VirtAddr::from)
     } else {
-        best_effort(mem.read::<VirtAddr>(address + 8u64))?
+        best_effort(mem.read_pointer(address + mem.arch().pointer_size()))?
     };
     Ok(StringDescriptorFields {
         length: best_effort(mem.read(address))?,
@@ -863,6 +929,9 @@ fn counted_string(
     };
     let text = match (length, buffer) {
         (Some(length), Some(buffer)) => {
+            // A Length past MaximumLength is a corrupt or unrelated
+            // descriptor; the buffer holds no more than MaximumLength bytes.
+            let length = maximum_length.map_or(length, |maximum| length.min(maximum));
             let byte_len = (length as usize / unit_size) * unit_size;
             if byte_len == 0 || buffer.is_zero() {
                 CountedText::Empty
@@ -873,8 +942,8 @@ fn counted_string(
                 };
                 let (data, valid) = read_best_effort(session, MemoryKind::Virtual, &range)?;
                 let text = match kind {
-                    StringDescriptor::Unicode => utf16le_lossy(&data),
-                    StringDescriptor::Ansi => String::from_utf8_lossy(&data).into_owned(),
+                    StringDescriptor::Unicode => printable_text(&utf16le_lossy(&data)),
+                    StringDescriptor::Ansi => data.iter().map(|&byte| ascii_char(byte)).collect(),
                 };
                 CountedText::Text {
                     text,
@@ -895,13 +964,13 @@ fn counted_string(
 
 impl Render for CountedString {
     fn render(&self, _: &mut ReplState<'_>, (): ()) {
-        let unreadable = || "<unreadable>".to_string();
+        let unreadable = || "-".to_string();
         let length = self
             .length
-            .map_or_else(unreadable, |value| value.to_string());
+            .map_or_else(unreadable, |value| format!("{value:#x}"));
         let maximum_length = self
             .maximum_length
-            .map_or_else(unreadable, |value| value.to_string());
+            .map_or_else(unreadable, |value| format!("{value:#x}"));
         let buffer = self
             .buffer
             .map_or_else(unreadable, |value| ui::addr(value.0));
@@ -910,7 +979,7 @@ impl Render for CountedString {
             CountedText::Empty => "\"\"".to_string(),
             CountedText::Text { text, complete } => format!(
                 "\"{}\"{}",
-                text.escape_debug(),
+                text,
                 if *complete {
                     String::new()
                 } else {
@@ -919,7 +988,7 @@ impl Render for CountedString {
             ),
         };
         outln!(
-            "{}  Length={} MaximumLength={} Buffer={}  {}\n",
+            "{}  Length={} MaximumLength={} Buffer={}  {}",
             ui::addr(self.address.0),
             length,
             maximum_length,
@@ -1145,7 +1214,7 @@ impl Render for ValuesWritten {
             }
         };
         outln!(
-            "{} {} -> {}\n",
+            "{} {} -> {}",
             "wrote".green(),
             shown.join(" "),
             ui::addr(self.address.0)
@@ -1419,7 +1488,7 @@ pub struct StringWritten {
 impl Render for StringWritten {
     fn render(&self, _: &mut ReplState<'_>, (): ()) {
         outln!(
-            "{} {} bytes -> {}\n",
+            "{} {} bytes -> {}",
             "wrote".green(),
             self.len,
             ui::addr(self.address.0)
@@ -1580,10 +1649,10 @@ fn writemem(
 impl Render for MemoryToFile {
     fn render(&self, _: &mut ReplState<'_>, (): ()) {
         if self.unreadable == 0 {
-            outln!("wrote {:#x} bytes to '{}'\n", self.len, self.path);
+            outln!("wrote {:#x} bytes to '{}'", self.len, self.path);
         } else {
             outln!(
-                "wrote {:#x} bytes to '{}' ({} unreadable bytes written as zero)\n",
+                "wrote {:#x} bytes to '{}' ({} unreadable bytes written as zero)",
                 self.len,
                 self.path,
                 self.unreadable
@@ -1666,14 +1735,14 @@ impl Render for FileToMemory {
         }
         if self.unwritten == 0 {
             outln!(
-                "read {:#x} bytes from '{}' into {}\n",
+                "read {:#x} bytes from '{}' into {}",
                 self.len,
                 self.path,
                 ui::addr(self.start.0)
             );
         } else {
             outln!(
-                "read {:#x} bytes from '{}' ({} bytes not written)\n",
+                "read {:#x} bytes from '{}' ({} bytes not written)",
                 self.len,
                 self.path,
                 self.unwritten
@@ -1714,13 +1783,15 @@ fn formats(_session: &Session, #[arg(parse = formats_value)] value: u64) -> Resu
 impl Render for NumberFormats {
     fn render(&self, _: &mut ReplState<'_>, (): ()) {
         let value = self.0;
-        outln!("hexadecimal: 0x{value:016x}");
-        outln!("decimal: {value} (signed {})", value as i64);
-        outln!("octal: 0o{value:o}");
-        outln!("binary: 0b{value:064b}");
-        outln!("characters: \"{}\"", format_characters(value));
-        outln!("float: {}", format_float(f32::from_bits(value as u32)));
-        outln!("double: {}", format_float(f64::from_bits(value)));
+        // The labels pad to the longest one, `time (Unix seconds)`.
+        let field = |label: &str, text: String| outln!("{label:<19}  {text}");
+        field("hexadecimal", format!("0x{value:016x}"));
+        field("decimal", format!("{value} (signed {})", value as i64));
+        field("octal", format!("0o{value:o}"));
+        field("binary", format!("0b{value:064b}"));
+        field("characters", format!("\"{}\"", format_characters(value)));
+        field("float", format_float(f32::from_bits(value as u32)));
+        field("double", format_float(f64::from_bits(value)));
 
         const FILETIME_UNIX_OFFSET_SECONDS: i64 = 11_644_473_600;
         const FILETIME_MAX_TICKS: u64 = 265_046_774_400_000_000;
@@ -1731,24 +1802,23 @@ impl Render for NumberFormats {
             && (FILETIME_UNIX_MIN_SECONDS..=FILETIME_UNIX_MAX_SECONDS)
                 .contains(&filetime_unix_seconds)
         {
-            let nanos = ((value % 10_000_000) * 100) as u32;
-            outln!(
-                "time (FILETIME): {} UTC",
-                format_unix_timestamp(filetime_unix_seconds, nanos)
+            let ticks = (value % 10_000_000) as u32;
+            field(
+                "time (FILETIME)",
+                format_unix_timestamp(filetime_unix_seconds, ticks),
             );
         } else {
-            outln!("time (FILETIME): out of range");
+            field("time (FILETIME)", "out of range".to_string());
         }
         let unix_seconds = value as i64;
         if (FILETIME_UNIX_MIN_SECONDS..=FILETIME_UNIX_MAX_SECONDS).contains(&unix_seconds) {
-            outln!(
-                "time (Unix seconds): {} UTC",
-                format_unix_timestamp(unix_seconds, 0)
+            field(
+                "time (Unix seconds)",
+                format_unix_timestamp(unix_seconds, 0),
             );
         } else {
-            outln!("time (Unix seconds): out of range");
+            field("time (Unix seconds)", "out of range".to_string());
         }
-        outln!();
     }
 }
 
@@ -1812,7 +1882,7 @@ pub struct MemoryFilled {
 impl Render for MemoryFilled {
     fn render(&self, _: &mut ReplState<'_>, (): ()) {
         outln!(
-            "{} {:#x} bytes at {} with {}\n",
+            "{} {:#x} bytes at {} with {}",
             "filled".green(),
             self.len,
             ui::addr(self.address.0),
@@ -1919,7 +1989,6 @@ impl Render for CompareResult {
             );
         }
         print_search_stop(self.stopped, "differences");
-        outln!();
     }
 }
 
@@ -1945,7 +2014,7 @@ pub struct MemoryCopied {
 impl Render for MemoryCopied {
     fn render(&self, _: &mut ReplState<'_>, (): ()) {
         outln!(
-            "copied {:#x} bytes from {} to {}\n",
+            "copied {:#x} bytes from {} to {}",
             self.len,
             ui::addr(self.source.0),
             ui::addr(self.destination.0)
@@ -2131,19 +2200,29 @@ impl Render for SearchResult {
     fn render(&self, repl: &mut ReplState<'_>, (): ()) {
         let hits = &self.matches;
         for &address in hits {
-            let symbol = repl
+            // A hit outside any module shows only its address, as `dqs`
+            // shows a value with no symbol.
+            match repl
                 .ctx
                 .target
                 .closest_symbol_current_context(VirtAddr(address))
-                .unwrap_or_default();
-            outln!("{}  {}", ui::addr(address), ui::symbol(&symbol));
+            {
+                Some(symbol) => outln!("{}  {}", ui::addr(address), ui::symbol(&symbol)),
+                None => outln!("{}", ui::addr(address)),
+            }
         }
-        if hits.is_empty() {
+        if hits.is_empty() && self.length > 0 && self.unreadable >= self.length {
+            // Nothing was searched, so "no matches" would claim too much.
+            error!(
+                "none of the {:#x} bytes at {:#x} can be read",
+                self.length, self.start.0
+            );
+        } else if hits.is_empty() {
             outln!(
-                "{} (searched {:#x} bytes at {})",
+                "{} (searched {:#x} bytes at {:#x})",
                 "no matches found".bright_black(),
                 self.length,
-                ui::addr(self.start.0)
+                self.start.0
             );
         } else {
             outln!(
@@ -2153,7 +2232,7 @@ impl Render for SearchResult {
                 hits.len() - 1
             );
         }
-        if self.unreadable > 0 {
+        if self.unreadable > 0 && self.unreadable < self.length {
             outln!(
                 "{}",
                 format!("{:#x} unreadable bytes skipped", self.unreadable).bright_black()
@@ -2162,7 +2241,6 @@ impl Render for SearchResult {
         print_search_stop(self.stopped, "matches");
         let origin = repl.line.clone();
         repl.ctx.target.set_results(hits.clone(), origin);
-        outln!();
     }
 }
 
@@ -2181,20 +2259,20 @@ fn format_characters(value: u64) -> String {
     value.to_le_bytes().into_iter().map(ascii_char).collect()
 }
 
-/// Format a proleptic-Gregorian UTC timestamp without pulling a date/time
-/// dependency into the debugger. `seconds` is Unix time and `nanos` is the
-/// fractional second component.
-fn format_unix_timestamp(seconds: i64, nanos: u32) -> String {
+/// Format a proleptic-Gregorian UTC timestamp in ISO 8601 (`…Z`) without
+/// pulling a date/time dependency into the debugger. `seconds` is Unix time
+/// and `ticks` the fractional second in FILETIME's 100 ns units.
+fn format_unix_timestamp(seconds: i64, ticks: u32) -> String {
     let days = seconds.div_euclid(86_400);
     let day_seconds = seconds.rem_euclid(86_400);
     let hour = day_seconds / 3_600;
     let minute = (day_seconds % 3_600) / 60;
     let second = day_seconds % 60;
     let (year, month, day) = days_to_ymd(days);
-    if nanos == 0 {
-        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
+    if ticks == 0 {
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
     } else {
-        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}")
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{ticks:07}Z")
     }
 }
 

@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::backend::cpu_context::{amd64, arm64};
 use crate::backend::dbg_backend::{ContinueDisposition, processor_index_from_backend_thread_id};
 use crate::base::bytes;
 use crate::base::disasm::{
@@ -16,7 +15,7 @@ use crate::base::error::{Error, Result};
 use crate::base::memory::{
     self, MemoryOps, PAGE_SIZE, ScanFault, TerminatedRead, read_page_chunks,
 };
-use crate::base::types::{Arch, CodeMachine, Dtb, VirtAddr};
+use crate::base::types::{CodeMachine, Dtb, VirtAddr};
 use crate::nt::bugchecks::{
     BugcheckAnalysis, analyze_bugcheck, bugcheck_from_dump_info, current_bugcheck,
 };
@@ -26,7 +25,7 @@ use crate::nt::target::usermode::ImageCheck;
 use crate::nt::target::{CompareResult, SearchResult, SelectedFrame, ThreadInfo, exit_registers};
 use crate::nt::unwind::{
     FunctionEntry, RecoveredStackTrace, StackTrace, ThreadStackSource, ThreadStackTrace,
-    build_parked_thread_recovered_stack, build_parked_thread_stack,
+    ThreadTraceContext, build_parked_thread_recovered_stack, build_parked_thread_stack,
     build_stacktrace_with_register_values, build_thread_stacktrace, format_symbol, function_entry,
     function_range, guest_vp_running, halted_in_windows_hypervisor, resolve_thread_trace_context,
     saved_vtls,
@@ -90,13 +89,10 @@ impl Session {
     /// Decode the `CONTEXT` record at `address` into a register map, without
     /// changing the selected backend context (`.cxr`).
     pub fn read_context_record(&self, address: VirtAddr) -> Result<HashMap<String, u64>> {
-        let (size, map) = match self.target.arch() {
-            Arch::Amd64 => (amd64::CONTEXT_SIZE, amd64::build_register_map()),
-            Arch::Arm64 => (arm64::CONTEXT_SIZE, arm64::build_register_map()),
-        };
-        let mut bytes = vec![0u8; size];
+        let arch = self.target.arch();
+        let mut bytes = vec![0u8; arch.context_size()];
         self.read_record_bytes(address, &mut bytes)?;
-        Ok(map.to_hashmap(&bytes))
+        Ok(arch.register_map().to_hashmap(&bytes))
     }
 
     /// The current `.exr -1` view, when the last event contains exception
@@ -150,11 +146,11 @@ impl Session {
             .as_ref()
             .ok_or_else(|| Error::DebugInfo("the minidump records no exception".into()))?;
         let thread = info.backend_thread_id(exception.thread_id);
-        let registers = self.target.user_exception_registers(&self.register_map)?;
+        let registers = self.target.user_exception_registers()?;
         if self.current_thread != thread {
             self.set_current_thread(&thread)?;
         }
-        let selected = SelectedFrame::from_registers(0, registers);
+        let selected = SelectedFrame::from_registers(self.target.arch(), 0, registers);
         self.select_frame(selected.clone());
         Ok((selected, thread))
     }
@@ -427,6 +423,19 @@ impl Session {
             length: len,
             rows,
         })
+    }
+
+    /// Where the function containing `addr` begins and ends, in the code
+    /// `trace` runs: its runtime function entry, or else the leaf its symbol
+    /// starts (see [`Self::leaf_function_range`]).
+    pub fn function_bounds(
+        &self,
+        trace: &ThreadTraceContext,
+        addr: VirtAddr,
+    ) -> Option<(u64, u64)> {
+        function_range(&self.target, trace, addr.0)
+            .or_else(|| self.leaf_function_range(trace.active_dtb, addr).ok())
+            .filter(|(start, end)| (*start..*end).contains(&addr.0))
     }
 
     /// The function containing `addr` that no runtime function entry
@@ -713,8 +722,9 @@ impl Session {
             return Ok(None);
         };
         let live = self.register_map.to_hashmap(&registers);
+        let arch = self.target.arch();
         let (Some(&cr3), Some(&rip)) =
-            (live.get(self.target.arch().dtb_register()), live.get("rip"))
+            (live.get(arch.dtb_register()), live.get(arch.pc_register()))
         else {
             return Ok(None);
         };
@@ -742,7 +752,8 @@ impl Session {
             .read_vcpu_registers(vcpu)?
             .ok_or_else(|| Error::DebugInfo(format!("{vcpu}'s registers are unavailable")))?;
         let live = self.register_map.to_hashmap(&registers);
-        let in_hypervisor = match (live.get(self.target.arch().dtb_register()), live.get("rip")) {
+        let arch = self.target.arch();
+        let in_hypervisor = match (live.get(arch.dtb_register()), live.get(arch.pc_register())) {
             (Some(&cr3), Some(&rip)) => {
                 halted_in_windows_hypervisor(&self.target, cr3, rip).then_some((cr3, rip))
             }
@@ -913,19 +924,17 @@ impl Session {
         worker_break: VirtAddr,
     ) -> PageInReport {
         let registers = self.backend.read_registers().ok();
-        let pc = registers
-            .as_ref()
-            .and_then(|regs| self.register_map.read_u64("rip", regs).ok());
-        let first_argument = match self.target.arch() {
-            Arch::Amd64 => "rcx",
-            Arch::Arm64 => "x0",
-        };
-        let status = registers
-            .as_ref()
-            .and_then(|regs| self.register_map.read_u64(first_argument, regs).ok());
-        // `DbgBreakPointWithStatus` takes its status in the first argument
-        // register, so a worker break is distinguishable from any other
-        // hard-coded break at the same address.
+        let pc = registers.as_ref().and_then(|regs| {
+            self.register_map
+                .read_u64(self.target.arch().pc_register(), regs)
+                .ok()
+        });
+        let status = registers.as_ref().and_then(|regs| {
+            self.argument_on_entry(0, |name| self.register_map.read_u64(name, regs).ok())
+        });
+        // `DbgBreakPointWithStatus` takes its status as its first argument,
+        // so a worker break is distinguishable from any other hard-coded
+        // break at the same address.
         let from_worker = pc == Some(worker_break.0) && status == Some(DBG_STATUS_WORKER);
         let mut probe = [0u8; 1];
         let resident = self
@@ -1050,7 +1059,8 @@ impl Session {
             self.backend.set_current_thread(&self.current_thread)?;
             let registers = registers?;
             let (Ok(rip), Ok(cr3)) = (
-                self.register_map.read_u64("rip", &registers),
+                self.register_map
+                    .read_u64(self.target.arch().pc_register(), &registers),
                 self.register_map
                     .read_u64(self.target.arch().dtb_register(), &registers),
             ) else {

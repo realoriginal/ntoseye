@@ -4,13 +4,14 @@ use std::net::TcpStream;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use crate::arch::{
+    Arch, Family, HwBreakpointAccess, RegisterInfo, RegisterMap, registers::push_synonyms,
+};
 use crate::backend::dbg_backend::{
-    DebugBackend, HW_BREAKPOINT_SLOTS, HwBreakpointAccess, PciConfigAddress, RegisterInfo,
-    RegisterMap, STEP_UNDER_WINDOWS_HYPERVISOR, StopEvent, push_arm64_aliases,
+    DebugBackend, PciConfigAddress, STEP_UNDER_WINDOWS_HYPERVISOR, StopEvent,
 };
 use crate::backend::phys::HaltClock;
 use crate::base::error::{Error, Result};
-use crate::base::types::Arch;
 
 mod target_xml;
 
@@ -201,13 +202,11 @@ fn description_arch(xml: &str) -> Result<Arch> {
             "the stub's target description declares no architecture".into(),
         ));
     };
-    match architecture {
-        "i386:x86-64" => Ok(Arch::Amd64),
-        "aarch64" => Ok(Arch::Arm64),
-        other => Err(Error::UnsupportedArchitecture(format!(
-            "{other}; ntoseye debugs AMD64 and ARM64 Windows"
-        ))),
-    }
+    Arch::from_gdb_architecture(architecture).ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!(
+            "{architecture}; ntoseye debugs AMD64 and ARM64 Windows"
+        ))
+    })
 }
 
 /// System registers ntoseye needs, spelled the way it spells them elsewhere.
@@ -333,9 +332,6 @@ const GDB_STUB_NEEDS_HALT: &str = "the GDB stub serves no requests while the tar
 /// hex, inside QEMU's 4 KiB packet buffer.
 const PHYSICAL_READ_CHUNK: usize = 0x400;
 
-/// The first canonical upper-half (kernel) address on AMD64.
-const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
-
 /// The read timeout of a wait asked not to wait: a socket refuses zero.
 const MIN_READ_TIMEOUT: Duration = Duration::from_millis(1);
 
@@ -372,7 +368,10 @@ impl GdbClient {
             features: StubFeatures::default(),
             rx_state: PacketReadState::default(),
             no_ack_mode: false,
-            arch: Arch::default(),
+            // Replaced from the target description below, before anything
+            // reads it: the handshake packets before it are the same for
+            // every architecture.
+            arch: Arch::Amd64,
             register_map: RegisterMap::default(),
             // Resuming the VM from outside (a hypervisor GUI) goes unseen here.
             halts,
@@ -675,7 +674,11 @@ impl GdbClient {
     fn software_breakpoint_packet(&mut self, op: char, addr: u64) -> Result<String> {
         let packet = format!("{op}0,{addr:x},{}", self.arch.breakpoint_size());
         let response = self.send_packet(&packet)?;
-        if !response.starts_with('E') || self.arch != Arch::Amd64 || addr < KERNEL_HALF {
+        let borrows_kernel_root = self.arch.family() == Family::X86;
+        if !response.starts_with('E')
+            || !borrows_kernel_root
+            || addr < self.arch.paging().system_range_start()
+        {
             return Ok(response);
         }
         if let Some(response) = self.through_another_vcpu(&packet)? {
@@ -1248,7 +1251,7 @@ impl GdbClient {
     /// Only the registers the `g` packet actually carries can be addressed by
     /// offset into its reply, so the description is cut to that length and
     /// the few system registers ntoseye needs are appended behind it, read
-    /// individually. ARM64 also gets the x64 spellings the shared code uses.
+    /// individually. Each register also answers to its synonyms.
     fn build_register_map(&mut self, description: &RegisterMap) -> Result<RegisterMap> {
         let g_bytes = GdbClient::read_registers(self)?.len();
         let mut registers: Vec<RegisterInfo> = description
@@ -1257,36 +1260,39 @@ impl GdbClient {
             .filter(|reg| reg.offset + reg.size <= g_bytes)
             .cloned()
             .collect();
+        push_synonyms(&mut registers, self.arch.register_synonyms()).map_err(|missing| {
+            Error::UnsupportedArchitecture(format!(
+                "the stub's {} description has no `{missing}` register",
+                self.arch.label()
+            ))
+        })?;
 
-        if self.arch == Arch::Arm64 {
-            push_arm64_aliases(&mut registers).map_err(|missing| {
-                Error::UnsupportedArchitecture(format!(
-                    "the stub's AArch64 description has no `{missing}` register"
-                ))
-            })?;
-
-            let mut offset = g_bytes;
-            for (name, system_register) in ARM64_SYSTEM_REGISTERS {
-                let Some(source) = description
-                    .registers()
-                    .iter()
-                    .find(|reg| reg.name == system_register)
-                else {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "the stub's AArch64 description has no `{system_register}`, \
+        match self.arch {
+            Arch::Amd64 => {}
+            Arch::Arm64 => {
+                let mut offset = g_bytes;
+                for (name, system_register) in ARM64_SYSTEM_REGISTERS {
+                    let Some(source) = description
+                        .registers()
+                        .iter()
+                        .find(|reg| reg.name == system_register)
+                    else {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "the stub's AArch64 description has no `{system_register}`, \
                          which ntoseye needs to follow the guest's page tables"
-                    )));
-                };
-                self.extra_registers.push(ExtraRegister {
-                    regnum: source.regnum,
-                });
-                registers.push(RegisterInfo {
-                    name: name.to_string(),
-                    offset,
-                    size: 8,
-                    regnum: source.regnum,
-                });
-                offset += 8;
+                        )));
+                    };
+                    self.extra_registers.push(ExtraRegister {
+                        regnum: source.regnum,
+                    });
+                    registers.push(RegisterInfo {
+                        name: name.to_string(),
+                        offset,
+                        size: 8,
+                        regnum: source.regnum,
+                    });
+                    offset += 8;
+                }
             }
         }
 
@@ -1475,7 +1481,8 @@ impl DebugBackend for GdbClient {
     /// RSP sites have no physical slot number. Keep spare records for steps
     /// and new breakpoints; the stub enforces its own limit (none on QEMU TCG).
     fn hardware_breakpoint_slots(&self) -> usize {
-        self.hardware_sites.len() + usize::from(HW_BREAKPOINT_SLOTS)
+        const SPARE_SITES: usize = 4;
+        self.hardware_sites.len() + SPARE_SITES
     }
 
     fn set_hardware_breakpoint(
@@ -1612,10 +1619,11 @@ mod tests {
         GdbClient, HaltCache, PacketReadState, RegisterMap, StopReply, StubFeatures, append_packet,
         description_arch, holds_stop_reply,
     };
-    use crate::backend::dbg_backend::{DebugBackend, HwBreakpointAccess, RegisterInfo};
+    use crate::arch::{Arch, HwBreakpointAccess, RegisterInfo};
+    use crate::backend::dbg_backend::DebugBackend;
     use crate::backend::phys::HaltClock;
     use crate::base::error::Error;
-    use crate::base::types::{Arch, VirtAddr};
+    use crate::base::types::VirtAddr;
     use crate::nt::breakpoints::{BreakpointConfig, BreakpointManager};
     use crate::session::{hits::hardware_breakpoint_hit, session_over_memory};
 
@@ -1742,7 +1750,7 @@ mod tests {
         let mut event = StopReply::parse("S05").into_event();
         event.program_counter = Some(0x112b);
         let map = RegisterMap::default();
-        let hit = hardware_breakpoint_hit(&mut client, &map, &manager, &event)
+        let hit = hardware_breakpoint_hit(&mut client, &map, &manager, &event, Arch::Amd64)
             .unwrap()
             .unwrap();
         assert_eq!(hit.hardware.unwrap().slot, 299);
@@ -1854,9 +1862,15 @@ mod tests {
         manager.enable(&mut client, &session.target, 299).unwrap();
         assert_eq!(client.hardware_sites[299].unwrap().addr, 0x112b);
         let event = StopReply::parse("T05watch:2002;").into_event();
-        let hit = hardware_breakpoint_hit(&mut client, &RegisterMap::default(), &manager, &event)
-            .unwrap()
-            .unwrap();
+        let hit = hardware_breakpoint_hit(
+            &mut client,
+            &RegisterMap::default(),
+            &manager,
+            &event,
+            Arch::Amd64,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(hit.id, id);
         manager.remove_all(&mut client, &session.target).unwrap();
         assert!(client.hardware_sites.iter().all(Option::is_none));

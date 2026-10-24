@@ -214,7 +214,7 @@ impl Target {
         })?;
         let base = module.base_address;
         let dtb = image.dtb.unwrap_or_else(|| {
-            if looks_like_kernel_pointer(base.0) {
+            if looks_like_kernel_pointer(self.arch(), base.0) {
                 self.kernel_dtb()
             } else {
                 self.process_dtb()
@@ -339,10 +339,15 @@ impl Target {
         if let Some(module) = self.module_named(text) {
             return Ok((module.base_address, Some(module)));
         }
-        let address = eval(text).map_err(|error| {
-            Error::InvalidArgument(format!(
+        let address = eval(text).map_err(|error| match error {
+            // The name alone says it all; an expression's error explains what
+            // in it went wrong.
+            Error::SymbolNotFound(_) => Error::InvalidArgument(format!(
+                "'{text}' is neither a loaded module nor an address"
+            )),
+            error => Error::InvalidArgument(format!(
                 "'{text}' is neither a loaded module nor an address: {error}"
-            ))
+            )),
         })?;
         if let Some(module) = self.module_containing(address) {
             return Ok((module.base_address, Some(module)));

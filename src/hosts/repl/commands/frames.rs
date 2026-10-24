@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 
-use owo_colors::OwoColorize;
-
-use crate::backend::dbg_backend::{RegisterMap, processor_index_from_backend_thread_id};
+use crate::arch::{Arch, RegisterMap};
+use crate::backend::dbg_backend::processor_index_from_backend_thread_id;
 use crate::base::diagnostics;
 use crate::nt::bugchecks::{bugcheck_trap_frame_address, looks_like_kernel_pointer};
 use ntoseye_macros::{command, grammar};
 
 use crate::base::error::{Error, Result};
-use crate::base::ntstatus::exception_code_name;
-use crate::base::types::{Arch, VirtAddr};
+use crate::base::ntstatus::ntstatus_name;
+use crate::base::types::VirtAddr;
+use crate::hosts::repl::args::{ArgCursor, ArgCx, ArgError, virtual_memory};
+use crate::hosts::repl::*;
 use crate::nt::target::{MemoryKind, SavedThreadRegisters, SelectedFrame, lookup_register};
 use crate::nt::trapframe::{KtrapFrame, read_ktrap_frame_at_or_current, trap_frame_rip_symbol};
 use crate::nt::unwind::{
@@ -19,9 +20,6 @@ use crate::nt::unwind::{
 };
 use crate::session::effects::{Effects, Writes};
 use crate::session::{ExceptionRecord, Session};
-
-use crate::hosts::repl::args::{ArgCursor, ArgCx, ArgError, virtual_memory};
-use crate::hosts::repl::*;
 
 const MAX_FRAME_INDEX: usize = 4095;
 
@@ -53,7 +51,7 @@ pub struct FrameLine {
 
 /// The `.frame` text: the frame row, its frame base, and with
 /// `show_registers` the frame's registers.
-fn print_frame_line(line: &FrameLine, frame: &SelectedFrame, show_registers: bool) {
+fn print_frame_line(line: &FrameLine, frame: &SelectedFrame, arch: Arch, show_registers: bool) {
     let tag = if line.inline {
         format!("  {}", inline_tag())
     } else {
@@ -64,9 +62,11 @@ fn print_frame_line(line: &FrameLine, frame: &SelectedFrame, show_registers: boo
         .as_ref()
         .map(|location| format!("  [{location}]"))
         .unwrap_or_default();
+    // The frame row as `k` lists it: the number, the child SP and the
+    // instruction address, then the call site, in `k`'s columns.
     outln!(
-        "{} {} {}  {}{tag}{location}",
-        ui::muted(&format!("#{:02}", frame.index)),
+        " {:02} {}  {}  {}{tag}{location}",
+        frame.index,
         ui::addr(frame.sp),
         ui::addr(frame.ip),
         ui::symbol(&line.symbol),
@@ -75,9 +75,21 @@ fn print_frame_line(line: &FrameLine, frame: &SelectedFrame, show_registers: boo
         outln!("  frame base {}", ui::addr(base));
     }
     if show_registers {
-        print_sparse_registers(&frame.registers, Some("  registers:"), 4);
+        print_known_registers(&frame.registers, arch, "registers");
     }
-    outln!();
+}
+
+/// What a selection's registers are of, for `r`'s heading and errors: a
+/// frame of a stack walk (`frame 1`), or a context read whole from memory
+/// or a dump (`.cxr`, `.ecxr`, `.trap`), which no walk recovered.
+fn selection_name(frame: &SelectedFrame) -> String {
+    // Only a context selected from its registers alone has no address
+    // space of a walk behind it.
+    if frame.dtb.is_none() {
+        "the selected context".to_string()
+    } else {
+        format!("frame {}", frame.index)
+    }
 }
 
 /// Select or show a stack frame.
@@ -218,25 +230,35 @@ fn cxr(
     #[arg(parse = lone_address)] address: Option<VirtAddr>,
 ) -> Result<()> {
     let Some(address) = address else {
-        state.ctx.clear_selected_frame();
-        outln!("selected context reset\n");
+        report_context_reset(state);
         return Ok(());
     };
     let registers = match state.ctx.read_context_record(address) {
         Ok(registers) => registers,
         Err(error) => {
-            error!(
-                "could not read a CONTEXT at {}: {error}",
-                ui::addr(address.0)
-            );
+            error!("could not read a CONTEXT at {:#x}: {error}", address.0);
             return Ok(());
         }
     };
-    let selected = SelectedFrame::from_registers(0, registers);
+    let selected = SelectedFrame::from_registers(state.ctx.target.arch(), 0, registers);
     state.set_selected_frame(selected.clone());
-    outln!("selected context {}", ui::addr(address.0));
+    outln!("selected the CONTEXT at {:#x}", address.0);
     state.print_selected_frame(&selected, false);
     Ok(())
+}
+
+/// `.cxr` or `.trap` with nothing to select: go back to the processor's own
+/// registers, and say so only when a context was selected.
+fn report_context_reset(state: &mut ReplState<'_>) {
+    if state.ctx.target.selected_frame.is_none() {
+        outln!("no context is selected");
+        return;
+    }
+    state.ctx.clear_selected_frame();
+    outln!(
+        "selected context cleared; registers are {}'s own",
+        ui::thread(&state.ctx.current_thread)
+    );
 }
 
 /// One optional expression; a second word prints the help.
@@ -280,24 +302,20 @@ fn ecxr(state: &mut ReplState<'_>) -> Result<()> {
         .and_then(|event| event.stop.bugcheck.as_ref())
         && matches!(info.code, 0x8e | 0x1000_008e)
     {
-        let Some(address) = bugcheck_trap_frame_address(info) else {
+        let Some(address) = bugcheck_trap_frame_address(state.ctx.target.arch(), info) else {
             error!("no trap frame is available for the current bugcheck");
             return Ok(());
         };
         match read_ktrap_frame_at_or_current(&state.ctx.target, Some(VirtAddr(address))) {
             Ok(frame) => {
                 let registers = registers_from_trap_frame(&frame);
-                let selected = SelectedFrame::from_registers(0, registers);
+                let selected = SelectedFrame::from_registers(state.ctx.target.arch(), 0, registers);
                 state.set_selected_frame(selected.clone());
-                outln!("exception trap frame {}", ui::addr(address));
+                outln!("selected the exception's trap frame at {address:#x}");
                 state.print_selected_frame(&selected, false);
             }
             Err(error) => {
-                error!(
-                    "could not read exception trap frame at {}: {}",
-                    ui::addr(address),
-                    error
-                );
+                error!("could not read the exception's trap frame at {address:#x}: {error}");
             }
         }
         return Ok(());
@@ -306,15 +324,14 @@ fn ecxr(state: &mut ReplState<'_>) -> Result<()> {
     if let Some(address) = state.exception_context_pointer() {
         match state.ctx.read_context_record(VirtAddr(address)) {
             Ok(registers) => {
-                let selected = SelectedFrame::from_registers(0, registers);
+                let selected = SelectedFrame::from_registers(state.ctx.target.arch(), 0, registers);
                 state.set_selected_frame(selected.clone());
-                outln!("exception context {}", ui::addr(address));
+                outln!("selected the exception's CONTEXT at {address:#x}");
                 state.print_selected_frame(&selected, false);
             }
-            Err(error) => error!(
-                "could not read exception context at {}: {error}",
-                ui::addr(address)
-            ),
+            Err(error) => {
+                error!("could not read the exception's CONTEXT at {address:#x}: {error}")
+            }
         }
         return Ok(());
     }
@@ -332,7 +349,7 @@ fn ecxr(state: &mut ReplState<'_>) -> Result<()> {
             error!("exception context is unavailable");
             return Ok(());
         };
-        let selected = SelectedFrame::from_registers(0, registers);
+        let selected = SelectedFrame::from_registers(state.ctx.target.arch(), 0, registers);
         state.set_selected_frame(selected.clone());
         outln!("exception context from current stop");
         state.print_selected_frame(&selected, false);
@@ -392,7 +409,7 @@ fn vtlcxr(state: &mut ReplState<'_>, #[arg(parse = vtl_choice)] vtl: u8) -> Resu
     let map = &state.ctx.register_map;
     let (Ok(cr3), Ok(rip)) = (
         map.read_u64(target.arch().dtb_register(), &regs),
-        map.read_u64("rip", &regs),
+        map.read_u64(target.arch().pc_register(), &regs),
     ) else {
         error!("the vCPU's CR3 and RIP are unavailable");
         return Ok(());
@@ -400,7 +417,7 @@ fn vtlcxr(state: &mut ReplState<'_>, #[arg(parse = vtl_choice)] vtl: u8) -> Resu
     if !halted_in_windows_hypervisor(target, cr3, rip) {
         error!(
             "{} is not halted in the Windows hypervisor",
-            ui::thread_id(&state.ctx.current_thread)
+            ui::thread(&state.ctx.current_thread)
         );
         return Ok(());
     }
@@ -469,7 +486,8 @@ fn vtlcxr(state: &mut ReplState<'_>, #[arg(parse = vtl_choice)] vtl: u8) -> Resu
     {
         error!("the secure kernel's symbols: {error}");
     }
-    let selected = SelectedFrame::from_registers(0, chosen.context.registers());
+    let selected =
+        SelectedFrame::from_registers(state.ctx.target.arch(), 0, chosen.context.registers());
     state.set_selected_frame(selected.clone());
     if vtl == 1 {
         state.caches.refresh_symbol_context(&state.ctx.target);
@@ -536,8 +554,8 @@ fn exr(
     match address {
         Some(address) => session.read_exception_record(address).map_err(|error| {
             Error::DebugInfo(format!(
-                "could not read an EXCEPTION_RECORD64 at {}: {error}",
-                ui::addr(address.0)
+                "could not read an EXCEPTION_RECORD64 at {:#x}: {error}",
+                address.0
             ))
         }),
         None => session
@@ -606,22 +624,30 @@ fn registers(
             );
             return Ok(());
         }
-        outln!("registers (frame {})", frame.index);
+        let source = selection_name(frame);
         if !tail.is_empty() {
+            // Named registers print as plain `r rip` prints them, with no
+            // heading; one the selection lacks is named in the error.
             let mut shown = Vec::new();
             for name in register_list(tail) {
                 match lookup_register(&frame.registers, &name) {
                     Some(value) => shown.push(format!("{name}={}", ui::addr(value))),
-                    None => error!("register not recovered in frame {}: {name}", frame.index),
+                    None if state.ctx.register_map.contains(&name) => {
+                        error!("register '{name}' not recovered in {source}")
+                    }
+                    None => error!("register '{name}' not found"),
                 }
             }
             if !shown.is_empty() {
                 outln!("{}", shown.join("  "));
             }
         } else {
-            print_sparse_registers(&frame.registers, None, 2);
+            print_known_registers(
+                &frame.registers,
+                state.ctx.target.arch(),
+                &format!("registers ({})", source.trim_start_matches("the ")),
+            );
         }
-        outln!();
         return Ok(());
     }
     if state.ctx.parked_windows_thread().is_some() {
@@ -687,7 +713,7 @@ fn registers(
         };
         let expression = expression.trim();
         if name.is_empty() || expression.is_empty() {
-            outln!("{}\n", command_help(invoked));
+            outln!("{}", command_help(invoked));
             return Ok(());
         }
         // Reading is this command's effect; setting a register is a write,
@@ -721,20 +747,7 @@ fn registers(
     let arch = state.ctx.target.arch();
     // A user dump's contexts record no control registers.
     let control = state.ctx.target.user_dump().is_none();
-    let print_text = || print_register_grid(register_map, &regs, arch, control);
-    #[cfg(feature = "cli")]
-    native::render(
-        || {
-            native::frames::registers(
-                &|name: &str| register_map.read_u64(name, &regs).ok(),
-                arch == Arch::Arm64,
-                control,
-            )
-        },
-        print_text,
-    );
-    #[cfg(not(feature = "cli"))]
-    print_text();
+    print_register_grid(register_map, &regs, arch, control);
 
     Ok(())
 }
@@ -772,27 +785,15 @@ fn stack(
         let trace = match state.ctx.backtrace(frame_limit) {
             Ok(trace) => trace,
             Err(error) => {
-                error!("failed to unwind parked thread stack: {error}");
+                // The walk's error says the stack is unavailable and why.
+                error!("{error}");
                 return Ok(());
             }
         };
+        print_stacktrace_data_with(state.ctx.target.arch(), &trace, frame_limit, false, columns);
         if name.eq_ignore_ascii_case("kp") {
-            print_stacktrace_data_with(&trace, frame_limit, false, columns);
             state.print_stack_parameters(&trace, 0)?;
-            outln!();
-            return Ok(());
         }
-        let print_text = || {
-            print_stacktrace_data_with(&trace, frame_limit, false, columns);
-            outln!();
-        };
-        #[cfg(feature = "cli")]
-        native::render(
-            || native::frames::stack(&trace, frame_limit, columns, 0, None),
-            print_text,
-        );
-        #[cfg(not(feature = "cli"))]
-        print_text();
         return Ok(());
     }
 
@@ -815,7 +816,7 @@ fn stack(
                 trace
             }
             Err(error) => {
-                error!("failed to unwind parked thread stack: {error}");
+                error!("{error}");
                 return Ok(());
             }
         }
@@ -842,6 +843,23 @@ fn stack(
                 return Ok(());
             }
         };
+        // A dump records a processor it captured no context for with every
+        // register zero, as `~` lists it: a walk from there would invent a
+        // frame at address 0.
+        let pc = state
+            .ctx
+            .register_map
+            .read_u64(state.ctx.target.arch().pc_register(), &regs);
+        if matches!(pc, Ok(0)) {
+            outln!(
+                "{}",
+                ui::muted(&format!(
+                    "no register context for {}: the dump captured none for it",
+                    ui::thread(&state.ctx.current_thread)
+                ))
+            );
+            return Ok(());
+        }
         build_thread_stacktrace(
             &state.ctx.target,
             &state.ctx.register_map,
@@ -858,31 +876,20 @@ fn stack(
         .map(|frame| frame.index)
         .unwrap_or(0);
     let selected = state.ctx.target.selected_frame.as_ref().map(|_| offset);
+    if !trace.frames.is_empty() {
+        print_stack_header(columns);
+    }
+    print_indexed_stacktrace(
+        state.ctx.target.arch(),
+        &trace,
+        frame_limit,
+        offset,
+        columns,
+        selected,
+    );
     if !name.eq_ignore_ascii_case("kp") {
-        let print_text = || {
-            print_indexed_stacktrace(&trace, frame_limit, offset, columns, selected);
-            outln!();
-        };
-        #[cfg(feature = "cli")]
-        native::render(
-            || {
-                let plain = StackTrace {
-                    frames: trace
-                        .frames
-                        .iter()
-                        .map(|frame| frame.frame.clone())
-                        .collect(),
-                    truncated: trace.truncated,
-                };
-                native::frames::stack(&plain, frame_limit, columns, offset, selected)
-            },
-            print_text,
-        );
-        #[cfg(not(feature = "cli"))]
-        print_text();
         return Ok(());
     }
-    print_indexed_stacktrace(&trace, frame_limit, offset, columns, selected);
     let plain = StackTrace {
         frames: trace
             .frames
@@ -892,7 +899,6 @@ fn stack(
         truncated: trace.truncated,
     };
     state.print_stack_parameters(&plain, offset)?;
-    outln!();
 
     Ok(())
 }
@@ -936,10 +942,7 @@ fn kd(state: &mut ReplState<'_>, #[arg(default = 20, name = "count")] words: u64
         .checked_mul(8)
         .and_then(|length| sp.checked_add(length))
     else {
-        error!(
-            "{words:#x} words from {} overflow the address space",
-            ui::addr(sp)
-        );
+        error!("{words} words from {sp:#x} overflow the address space");
         return Ok(());
     };
     let range = AddressRange {
@@ -975,8 +978,7 @@ fn trap(
             .current_thread_pseudo_register("trapframe")
             .is_none()
     {
-        state.ctx.clear_selected_frame();
-        outln!("selected context reset\n");
+        report_context_reset(state);
         return Ok(());
     }
     match read_ktrap_frame_at_or_current(&state.ctx.target, address) {
@@ -985,22 +987,9 @@ fn trap(
                 .unwrap_or_else(|| format!("{:#x}", frame.instruction_pointer()));
             let registers = registers_from_trap_frame(&frame);
             let selected = state.select_register_values(0, registers);
-            let print_text = || {
-                print_ktrap_frame(&frame, Some(&symbol));
-                outln!("selected trap context frame 00 at {}", ui::addr(selected));
-            };
-            #[cfg(feature = "cli")]
-            native::render(
-                || native::frames::trap(&frame, Some(&symbol), selected),
-                print_text,
-            );
-            #[cfg(not(feature = "cli"))]
-            print_text();
+            print_ktrap_frame(&frame, Some(&symbol));
+            outln!("selected the trap frame's context: frame 00 at {selected:#x}");
             state.warn_if_user_frame_is_out_of_view(frame.instruction_pointer());
-            #[cfg(feature = "cli")]
-            native::omit(|| outln!());
-            #[cfg(not(feature = "cli"))]
-            outln!();
         }
         Err(e) => {
             error!("{}", e);
@@ -1039,26 +1028,22 @@ impl ReplState<'_> {
     }
 
     pub fn select_register_values(&mut self, index: usize, registers: HashMap<String, u64>) -> u64 {
-        let selected = SelectedFrame::from_registers(index, registers);
+        let selected = SelectedFrame::from_registers(self.ctx.target.arch(), index, registers);
         let ip = selected.ip;
         self.set_selected_frame(selected);
         ip
     }
 
     pub fn print_selected_frame(&self, frame: &SelectedFrame, show_registers: bool) {
-        print_frame_line(&self.frame_line(frame), frame, show_registers);
+        let arch = self.ctx.target.arch();
+        print_frame_line(&self.frame_line(frame), frame, arch, show_registers);
     }
 
-    /// `.frame`: the selected frame, natively in Tern.
+    /// `.frame`: the selected frame.
     fn show_selected_frame(&self, frame: &SelectedFrame, show_registers: bool) {
         let line = self.frame_line(frame);
-        #[cfg(feature = "cli")]
-        native::render(
-            || native::inspect::frame(&line, frame, show_registers),
-            || print_frame_line(&line, frame, show_registers),
-        );
-        #[cfg(not(feature = "cli"))]
-        print_frame_line(&line, frame, show_registers);
+        let arch = self.ctx.target.arch();
+        print_frame_line(&line, frame, arch, show_registers);
     }
 
     /// What `.frame` shows for `frame`: its symbol, inline tag and source line.
@@ -1114,27 +1099,31 @@ impl ReplState<'_> {
         candidates
             .iter()
             .map(|index| info.parameters[*index])
-            .find(|address| looks_like_kernel_pointer(*address))
+            .find(|address| looks_like_kernel_pointer(self.ctx.target.arch(), *address))
     }
 
     fn print_stack_parameters(&self, trace: &StackTrace, frame_offset: usize) -> Result<()> {
         let mut printed_header = false;
+        // Whether any frame is in a procedure private symbols describe:
+        // without one, public symbols record no parameters to locate.
+        let mut private = false;
         for (index, frame) in trace.frames.iter().enumerate() {
             let Some(locals) = self.ctx.target.frame_locals(frame.code)? else {
                 continue;
             };
+            private = true;
             let parameters: Vec<_> = locals.iter().filter(|local| local.is_parameter).collect();
             if parameters.is_empty() {
                 continue;
             }
             if !printed_header {
-                outln!("{}", ui::label("parameters (PDB locations)"));
+                print_section("parameters (PDB locations)");
                 printed_header = true;
             }
             for parameter in parameters {
                 let location = parameter.location.describe();
                 outln!(
-                    "  #{:02}  {:<24} {:<20} {}",
+                    "  {:02}  {:<24} {:<20} {}",
                     index + frame_offset,
                     parameter.name,
                     parameter.type_name,
@@ -1143,10 +1132,12 @@ impl ReplState<'_> {
             }
         }
         if !printed_header {
-            outln!(
-                "{}",
-                ui::muted("parameter locations unavailable from loaded private symbols")
-            );
+            let note = if private {
+                "no parameters: the private symbols record none for these frames"
+            } else {
+                "no parameter locations: no private symbols cover these frames (public symbols record none)"
+            };
+            outln!("{}", ui::muted(note));
         }
         Ok(())
     }
@@ -1156,7 +1147,7 @@ impl ReplState<'_> {
     /// the one the thread ran in. Say so when nothing there covers it.
     fn warn_if_user_frame_is_out_of_view(&self, pc: u64) {
         let target = &self.ctx.target;
-        if pc >> 63 != 0 {
+        if target.arch().paging().is_kernel_address(VirtAddr(pc)) {
             return;
         }
         let trace = resolve_thread_trace_context(target, target.current_dtb());
@@ -1179,55 +1170,82 @@ impl ReplState<'_> {
 
 pub fn registers_from_trap_frame(frame: &KtrapFrame) -> HashMap<String, u64> {
     let saved = SavedThreadRegisters::from(frame);
-    let mut registers = HashMap::new();
-    const AMD64_NAMES: [&str; 18] = [
-        "rip", "rsp", "rax", "rcx", "rdx", "rbx", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11",
-        "r12", "r13", "r14", "r15", "eflags",
-    ];
-    const ARM64_NAMES: [&str; 36] = [
-        "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
-        "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26",
-        "x27", "x28", "x29", "x30", "sp", "pc", "cpsr", "fp", "lr",
-    ];
-    let names = if frame.is_arm64() {
-        &ARM64_NAMES[..]
-    } else {
-        &AMD64_NAMES[..]
-    };
-    for name in names {
-        if let Some(value) = saved.get(name) {
-            registers.insert(name.to_string(), value);
-        }
-    }
-    registers
+    let arch = frame.arch();
+    let aliases = arch.register_synonyms().iter().map(|&(_, alias)| alias);
+    arch.general_registers()
+        .iter()
+        .copied()
+        .chain(aliases)
+        .filter_map(|name| Some((name.to_string(), saved.get(name)?)))
+        .collect()
 }
 
 fn print_exception_record(record: &ExceptionRecord) {
     let address = record.record_address.unwrap_or(0);
     if address != 0 {
-        outln!("ExceptionRecord {}", ui::addr(address));
+        outln!("EXCEPTION_RECORD {}", ui::addr(address));
     } else {
-        outln!("ExceptionRecord (current)");
+        outln!("EXCEPTION_RECORD of the current exception");
     }
-    outln!(
-        "  ExceptionCode: {:08x} ({})",
-        record.code,
-        exception_code_name(record.code)
+    let code = match ntstatus_name(record.code) {
+        Some(name) => format!("{name} ({:#010x})", record.code),
+        None => format!("{:#010x}", record.code),
+    };
+    let mut fields = vec![
+        ("ExceptionAddress".to_string(), ui::addr(record.address)),
+        ("ExceptionCode".to_string(), code),
+        ("ExceptionFlags".to_string(), exception_flags(record.flags)),
+        (
+            "ExceptionRecord".to_string(),
+            ui::addr_opt(VirtAddr(record.nested)),
+        ),
+        (
+            "NumberParameters".to_string(),
+            record.parameters.len().to_string(),
+        ),
+    ];
+    fields.extend(
+        record
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (format!("Parameter[{index}]"), ui::addr(*value))),
     );
-    outln!("  ExceptionFlags: {:08x}", record.flags);
-    outln!("  ExceptionRecord: {}", ui::addr(record.nested));
-    outln!("  ExceptionAddress: {}", ui::addr(record.address));
-    outln!("  NumberParameters: {}", record.parameters.len());
-    for (index, value) in record.parameters.iter().enumerate() {
-        outln!("  Parameter[{}]: {}", index, ui::addr(*value));
+    let width = fields.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+    for (name, value) in fields {
+        outln!("  {name:<width$} : {value}");
     }
-    outln!();
+}
+
+/// `ExceptionFlags` as a flag set: the value, then the `EXCEPTION_*` names
+/// of its bits.
+fn exception_flags(flags: u32) -> String {
+    const NAMES: &[(u32, &str)] = &[
+        (0x1, "EXCEPTION_NONCONTINUABLE"),
+        (0x2, "EXCEPTION_UNWINDING"),
+        (0x4, "EXCEPTION_EXIT_UNWIND"),
+        (0x8, "EXCEPTION_STACK_INVALID"),
+        (0x10, "EXCEPTION_NESTED_CALL"),
+        (0x20, "EXCEPTION_TARGET_UNWIND"),
+        (0x40, "EXCEPTION_COLLIDED_UNWIND"),
+        (0x80, "EXCEPTION_SOFTWARE_ORIGINATE"),
+    ];
+    let names: Vec<&str> = NAMES
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if names.is_empty() {
+        format!("{flags:#x}")
+    } else {
+        format!("{flags:#x} ({})", names.join(" | "))
+    }
 }
 
 /// `r`'s text: the general-purpose grid, then the control (when `control`)
 /// and segment registers.
 fn print_register_grid(register_map: &RegisterMap, regs: &[u8], arch: Arch, control: bool) {
-    print_registers(register_map, regs, None, false);
+    print_registers(register_map, arch, regs, None, None);
     // Control registers match the GP-register cluster's
     // styling; segment selectors are 16-bit, so render
     // them as 4 digits rather than padding to 64-bit
@@ -1245,42 +1263,45 @@ fn print_register_grid(register_map: &RegisterMap, regs: &[u8], arch: Arch, cont
     };
 
     outln!();
-    // The ARM64 maps answer `cr3` with TTBR1_EL1, the kernel's root.
-    if arch == Arch::Arm64 {
-        if control {
-            outln!("  ttbr0 {}   ttbr1 {}", read_cr("ttbr0"), read_cr("cr3"));
-            outln!("  esr   {}   far   {}", read_cr("esr"), read_cr("far"));
-            outln!();
+    // The rows below line up with the general-purpose grid's columns. The
+    // ARM64 maps answer `cr3` with TTBR1_EL1, the kernel's root.
+    match arch {
+        Arch::Amd64 => {}
+        Arch::Arm64 => {
+            if control {
+                outln!("ttbr0 {}   ttbr1 {}", read_cr("ttbr0"), read_cr("cr3"));
+                outln!("esr   {}   far   {}", read_cr("esr"), read_cr("far"));
+            }
+            return;
         }
-        return;
     }
     if control {
         outln!(
-            "  cr0 {}   cr2 {}   cr3 {}",
+            "cr0 {}   cr2 {}   cr3 {}",
             read_cr("cr0"),
             read_cr("cr2"),
             read_cr("cr3")
         );
-        outln!("  cr4 {}   cr8 {}", read_cr("cr4"), read_cr("cr8"));
+        outln!("cr4 {}   cr8 {}", read_cr("cr4"), read_cr("cr8"));
         outln!();
     }
 
     outln!(
-        "  cs  {}   ds  {}   es  {}",
+        "cs  {}   ds  {}   es  {}",
         read_seg("cs"),
         read_seg("ds"),
         read_seg("es")
     );
     outln!(
-        "  fs  {}   gs  {}   ss  {}",
+        "fs  {}   gs  {}   ss  {}",
         read_seg("fs"),
         read_seg("gs"),
         read_seg("ss")
     );
-    outln!();
 }
 
 pub fn print_indexed_stacktrace(
+    arch: Arch,
     trace: &RecoveredStackTrace,
     display_limit: usize,
     frame_offset: usize,
@@ -1291,17 +1312,20 @@ pub fn print_indexed_stacktrace(
     for (index, recovered) in trace.frames.iter().take(display_limit).enumerate() {
         let frame = &recovered.frame;
         let global_index = frame_offset + index;
+        if index > 0
+            && let Some(label) = crossing(arch, &trace.frames[index - 1].frame, frame)
+        {
+            outln!("{}", crossing_line(label, 4));
+        }
         let marker = if selected_index == Some(global_index) {
             "*"
         } else {
             " "
         };
-        let symbol = if frame.symbol.starts_with("0x") {
-            frame.symbol.clone()
-        } else if frame.inline {
-            format!("{} {}", ui::symbol(&frame.symbol), inline_tag())
+        let symbol = if frame.inline {
+            format!("{}  {}", call_site(frame), inline_tag())
         } else {
-            ui::symbol(&frame.symbol)
+            call_site(frame)
         };
         let provenance = if columns.provenance {
             format!("  [{}]", frame.source.as_str())
@@ -1325,7 +1349,7 @@ pub fn print_indexed_stacktrace(
         let location = frame
             .source_location
             .as_ref()
-            .map(|location| format!("  [{}:{}]", location.file, location.line))
+            .map(|location| format!("  {}", ui::muted(&format_source_location(location))))
             .unwrap_or_default();
         outln!(
             "{}{:02} {}{}  {}{}{}",
@@ -1334,17 +1358,13 @@ pub fn print_indexed_stacktrace(
             frame_size,
             ui::addr(frame.sp),
             ui::addr(frame.ip),
-            if symbol.is_empty() {
-                "".to_string()
-            } else {
-                format!("  {symbol}")
-            },
+            format!("  {symbol}"),
             format!("{provenance}{location}")
         );
     }
     let hidden = trace.frames.len().saturating_sub(display_limit) + trace.truncated;
     if hidden > 0 {
-        outln!("{}", format!("... {} more frames", hidden).bright_black());
+        outln!("{}", more_frames(hidden));
     }
 }
 
@@ -1353,17 +1373,10 @@ pub fn print_indexed_stacktrace(
 fn print_function_entry(detail: &FunctionEntry) {
     let base = detail.image_base;
     let va = |rva: u32| ui::addr(base.wrapping_add(u64::from(rva)));
-    let print_handler = |handler: &Option<UnwindHandler>| {
-        if let Some(handler) = handler {
-            outln!(
-                "    handler {} {}, data at {}",
-                ui::addr(handler.address),
-                ui::symbol(&handler.symbol),
-                ui::addr(handler.data)
-            );
-        }
-    };
     for (index, entry) in detail.entries.iter().enumerate() {
+        if index > 0 {
+            outln!();
+        }
         if index == 0 {
             outln!(
                 "{} in {} (image base {})",
@@ -1374,7 +1387,6 @@ fn print_function_entry(detail: &FunctionEntry) {
         } else {
             outln!("{} {}", ui::label("chained to"), ui::symbol(&entry.symbol));
         }
-        outln!();
         outln!(
             "  BeginAddress      = {:08x}  {}",
             entry.begin_rva,
@@ -1394,38 +1406,42 @@ fn print_function_entry(detail: &FunctionEntry) {
                 va(entry.unwind_data)
             );
         }
-        outln!();
         match &entry.unwind {
-            None => outln!("  unwind info unreadable"),
+            None => {
+                outln!();
+                outln!("{}", ui::muted("the unwind info is unreadable"));
+            }
             Some(Unwind::Amd64(info)) => {
-                outln!(
-                    "  Unwind info at {}, {} bytes",
+                print_section(&format!(
+                    "unwind info at {} ({:#x} bytes)",
                     va(entry.unwind_data),
                     info.size
-                );
+                ));
                 let flag_names: Vec<&str> = [(1, "EHANDLER"), (2, "UHANDLER"), (4, "CHAININFO")]
                     .into_iter()
                     .filter(|(bit, _)| info.flags & bit != 0)
                     .map(|(_, name)| name)
                     .collect();
-                outln!(
-                    "    version {}, flags {:#x}{}, prolog {:#x}, codes {}",
-                    info.version,
-                    info.flags,
-                    if flag_names.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", flag_names.join(" "))
-                    },
-                    info.prolog_size,
-                    info.code_count
-                );
+                let mut fields = vec![
+                    ("version", info.version.to_string()),
+                    (
+                        "flags",
+                        if flag_names.is_empty() {
+                            format!("{:#x}", info.flags)
+                        } else {
+                            format!("{:#x} ({})", info.flags, flag_names.join(" | "))
+                        },
+                    ),
+                    ("prolog size", format!("{:#x}", info.prolog_size)),
+                    ("codes", info.code_count.to_string()),
+                ];
                 if let Some(register) = info.frame_register {
-                    outln!(
-                        "    frame register {register}, frame offset {:#x}",
-                        info.frame_offset
-                    );
+                    fields.push(("frame register", register.to_string()));
+                    fields.push(("frame offset", format!("{:#x}", info.frame_offset)));
                 }
+                handler_fields(&mut fields, &info.handler);
+                print_unwind_fields(&fields);
+                outln!("  unwind codes");
                 for code in &info.codes {
                     outln!(
                         "    {:02}: offs {:#x}, unwind op {}, op info {}  {}",
@@ -1436,55 +1452,88 @@ fn print_function_entry(detail: &FunctionEntry) {
                         code.description
                     );
                 }
-                print_handler(&info.handler);
             }
             Some(Unwind::Packed(packed)) => {
-                outln!(
-                    "  Packed unwind data: flag {}, RegF {}, RegI {}, H {}, CR {}, frame size {:#x}",
-                    packed.flag,
-                    packed.reg_f,
-                    packed.reg_i,
-                    u8::from(packed.homes_arguments),
-                    packed.cr,
-                    packed.frame_size
-                );
-                outln!("    prolog codes:");
+                print_section("packed unwind data");
+                print_unwind_fields(&[
+                    ("flag", packed.flag.to_string()),
+                    ("RegF", packed.reg_f.to_string()),
+                    ("RegI", packed.reg_i.to_string()),
+                    ("H", u8::from(packed.homes_arguments).to_string()),
+                    ("CR", packed.cr.to_string()),
+                    ("frame size", format!("{:#x}", packed.frame_size)),
+                ]);
+                outln!("  prolog codes");
                 print_arm64_codes(&packed.codes);
             }
             Some(Unwind::Xdata(xdata)) => {
-                outln!(
-                    "  Unwind info at {}, {} bytes",
+                print_section(&format!(
+                    "unwind info at {} ({:#x} bytes)",
                     va(entry.unwind_data),
                     xdata.size
-                );
-                outln!(
-                    "    version {}, X {}, E {}, epilog {} {}, code words {}",
-                    xdata.version,
-                    u8::from(xdata.exception_data),
-                    u8::from(xdata.epilog_in_header),
-                    if xdata.epilog_in_header {
-                        "code index"
-                    } else {
-                        "count"
-                    },
-                    xdata.epilog_count,
-                    xdata.code_words
-                );
+                ));
+                let mut fields = vec![
+                    ("version", xdata.version.to_string()),
+                    ("X", u8::from(xdata.exception_data).to_string()),
+                    ("E", u8::from(xdata.epilog_in_header).to_string()),
+                    (
+                        if xdata.epilog_in_header {
+                            "epilog code index"
+                        } else {
+                            "epilog count"
+                        },
+                        xdata.epilog_count.to_string(),
+                    ),
+                    ("code words", xdata.code_words.to_string()),
+                ];
+                handler_fields(&mut fields, &xdata.handler);
+                print_unwind_fields(&fields);
+                if !xdata.epilog_scopes.is_empty() {
+                    outln!("  epilog scopes");
+                }
                 for scope in &xdata.epilog_scopes {
                     outln!(
-                        "    epilog at +{:#x}, codes from index {:#x}",
+                        "    at +{:#x}, codes from index {:#x}",
                         scope.start_offset,
                         scope.first_code
                     );
                 }
+                outln!("  unwind codes");
                 print_arm64_codes(&xdata.codes);
-                print_handler(&xdata.handler);
             }
         }
-        outln!();
     }
     if let Some(reason) = &detail.incomplete {
-        outln!("{}\n", ui::muted(reason));
+        outln!();
+        outln!("{}", ui::muted(reason));
+    }
+}
+
+/// The fields of `.fnent`'s unwind block, two spaces in, their values in one
+/// column.
+fn print_unwind_fields(fields: &[(&str, String)]) {
+    let width = fields
+        .iter()
+        .map(|(label, _)| label.len())
+        .max()
+        .unwrap_or(0);
+    for (label, value) in fields {
+        outln!("  {label:<width$}  {value}");
+    }
+}
+
+/// The exception or termination handler of an unwind block, as its fields.
+fn handler_fields(fields: &mut Vec<(&'static str, String)>, handler: &Option<UnwindHandler>) {
+    if let Some(handler) = handler {
+        fields.push((
+            "handler",
+            format!(
+                "{}  {}",
+                ui::addr(handler.address),
+                ui::symbol(&handler.symbol)
+            ),
+        ));
+        fields.push(("handler data", ui::addr(handler.data)));
     }
 }
 

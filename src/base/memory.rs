@@ -1,3 +1,4 @@
+use crate::arch::{Arch, MappingPermissions, TableEntry};
 use crate::base::error::{Error, Result};
 use crate::base::types::*;
 use std::collections::HashMap;
@@ -221,14 +222,23 @@ impl TranslationCache {
     }
 }
 
+/// One page-table entry a walk read.
+#[derive(Clone, Copy)]
+pub struct WalkStep {
+    pub level: PageTableLevel,
+    /// Where the entry sits in physical memory.
+    pub address: PhysAddr,
+    pub entry: PageTableEntry,
+}
+
 pub struct AddressSpace<'a, B: MemoryOps<PhysAddr>> {
     backend: &'a B,
     dtb: Dtb,
-    /// AArch64 TTBR1 (kernel-space root). Kernel VAs (bit 55 set) walk this;
-    /// `dtb` is the TTBR0/process root for the user half. Ignored on AMD64,
-    /// where one CR3 covers both halves.
-    kernel_dtb: Option<Dtb>,
-    arm64: bool,
+    /// The root kernel VAs walk where the architecture gives them one of
+    /// their own (AArch64's TTBR1, with `dtb` the TTBR0 of the user half).
+    /// Unused on AMD64, where one CR3 covers both halves.
+    kernel_dtb: Dtb,
+    arch: Arch,
 }
 
 #[derive(Clone, Copy)]
@@ -239,8 +249,7 @@ pub struct Translation {
     /// Effective execute-never for the selected address-space half: AMD64 NX,
     /// AArch64 PXN for TTBR1 addresses, or AArch64 UXN for TTBR0 addresses.
     pub nx: bool,
-    /// Effective AArch64 UXN, including ancestor UXNTable restrictions.
-    /// Always `false` on AMD64.
+    /// The AArch64 mapping descriptor's UXN. Always `false` on AMD64.
     pub uxn: bool,
     pub residency: Residency,
 }
@@ -267,45 +276,26 @@ impl Translation {
         self
     }
 
-    pub const fn new_huge(pml4e: PageTableEntry, pdpte: PageTableEntry, va: VirtAddr) -> Self {
+    /// A page or block the tables map at `address`, with the access they
+    /// grant.
+    const fn mapped(address: PhysAddr, large: bool, permissions: MappingPermissions) -> Self {
         Self {
-            address: pdpte.huge_page_frame() + va.huge_page_offset(),
-            large: true,
-            user: pml4e.is_user() && pdpte.is_user(),
-            nx: pml4e.is_nx() || pdpte.is_nx(),
-            uxn: false,
+            address,
+            large,
+            user: permissions.user,
+            nx: permissions.nx,
+            uxn: permissions.uxn,
             residency: Residency::Mapped,
         }
     }
 
-    pub const fn new_large(
-        pml4e: PageTableEntry,
-        pdpte: PageTableEntry,
-        pde: PageTableEntry,
-        va: VirtAddr,
-    ) -> Self {
+    /// `va` itself, as an identity root (a physical address space) maps it.
+    const fn identity(va: VirtAddr) -> Self {
         Self {
-            address: pde.large_page_frame() + va.large_page_offset(),
-            large: true,
-            user: pml4e.is_user() && pdpte.is_user() && pde.is_user(),
-            nx: pml4e.is_nx() || pdpte.is_nx() || pde.is_nx(),
-            uxn: false,
-            residency: Residency::Mapped,
-        }
-    }
-
-    pub const fn new(
-        pml4e: PageTableEntry,
-        pdpte: PageTableEntry,
-        pde: PageTableEntry,
-        pte: PageTableEntry,
-        va: VirtAddr,
-    ) -> Self {
-        Self {
-            address: pte.page_frame() + va.page_offset(),
+            address: va.0,
             large: false,
-            user: pml4e.is_user() && pdpte.is_user() && pde.is_user() && pte.is_user(),
-            nx: pml4e.is_nx() || pdpte.is_nx() || pde.is_nx() || pte.is_nx(),
+            user: false,
+            nx: false,
             uxn: false,
             residency: Residency::Mapped,
         }
@@ -337,41 +327,12 @@ impl Translation {
             residency: Residency::Section,
         }
     }
-
-    /// An AArch64 block (level 1 or 2) or page (level 3) descriptor
-    /// mapping `va` at `address`. Its permissions are the descriptor's own:
-    /// Windows sets `TCR_EL1.HPD`, so the table descriptors above keep their
-    /// own bits in APTable/PXNTable/UXNTable (a user page's level-0 entry has
-    /// APTable[0] set) and restrict nothing.
-    pub const fn arm64_mapping(
-        leaf: PageTableEntry,
-        address: PhysAddr,
-        large: bool,
-        va: VirtAddr,
-    ) -> Self {
-        Self {
-            address,
-            large,
-            user: leaf.arm64_is_user(),
-            nx: if va.0 & (1 << 55) != 0 {
-                leaf.arm64_is_pxn()
-            } else {
-                leaf.arm64_is_uxn()
-            },
-            uxn: leaf.arm64_is_uxn(),
-            residency: Residency::Mapped,
-        }
-    }
 }
 
 impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
-    pub fn new(backend: &'a B, dtb: Dtb) -> Self {
-        Self {
-            backend,
-            dtb,
-            kernel_dtb: None,
-            arm64: false,
-        }
+    /// AMD64 address space: one CR3 at `dtb` covers both halves.
+    pub fn new_amd64(backend: &'a B, dtb: Dtb) -> Self {
+        Self::for_arch(backend, dtb, dtb, Arch::Amd64)
     }
 
     /// The page-table root this space walks (TTBR0 on AArch64).
@@ -379,112 +340,54 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
         self.dtb
     }
 
+    /// The architecture whose page tables and pointers this space reads.
+    pub fn arch(&self) -> Arch {
+        self.arch
+    }
+
+    /// The kernel pointer at `va`, [`Arch::pointer_size`] bytes wide.
+    pub fn read_pointer(&self, va: VirtAddr) -> Result<VirtAddr> {
+        let mut bytes = [0u8; 8];
+        let size = self.arch.pointer_size() as usize;
+        self.read_bytes(va, &mut bytes[..size])?;
+        Ok(self.arch.decode_pointer(&bytes))
+    }
+
     /// AArch64 address space with separate TTBR0 (user) and TTBR1 (kernel)
     /// roots; the walk selects the root from the VA's bit 55.
     pub fn new_arm64(backend: &'a B, ttbr0: Dtb, ttbr1: Dtb) -> Self {
+        Self::for_arch(backend, ttbr0, ttbr1, Arch::Arm64)
+    }
+
+    /// The address space rooted at `dtb` for `arch`. Kernel VAs walk
+    /// `kernel_dtb` where the architecture gives them a root of their own
+    /// (AArch64's TTBR1); one AMD64 CR3 covers both halves.
+    pub fn for_arch(backend: &'a B, dtb: Dtb, kernel_dtb: Dtb, arch: Arch) -> Self {
         Self {
             backend,
-            dtb: ttbr0,
-            kernel_dtb: Some(ttbr1),
-            arm64: true,
+            dtb,
+            kernel_dtb,
+            arch,
         }
     }
 
-    /// The address space rooted at `dtb` for `arch`. AArch64 kernel VAs walk
-    /// `kernel_dtb` (TTBR1) whatever `dtb` is; one AMD64 CR3 covers both halves.
-    pub fn for_arch(backend: &'a B, dtb: Dtb, kernel_dtb: Dtb, arch: Arch) -> Self {
-        match arch {
-            Arch::Amd64 => Self::new(backend, dtb),
-            Arch::Arm64 => Self::new_arm64(backend, dtb, kernel_dtb),
-        }
-    }
-
-    fn read_pt_entry(&self, table_base: PhysAddr, index: usize) -> Result<Option<PageTableEntry>> {
+    fn read_pt_entry(&self, address: PhysAddr) -> Result<Option<PageTableEntry>> {
         let mut entry = [0u8; 8];
-        match self
-            .backend
-            .read_page_table_bytes(table_base + 8 * index as u64, &mut entry)
-        {
+        match self.backend.read_page_table_bytes(address, &mut entry) {
             Ok(()) => Ok(Some(PageTableEntry(u64::from_le_bytes(entry)))),
             Err(Error::BadPhysicalAddress(_)) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    /// Page-table root that maps `va`: AArch64 selects TTBR1 for the kernel
-    /// half by bit 55; one AMD64 CR3 covers both halves.
+    /// Page-table root that maps `va`.
     fn root_for(&self, va: VirtAddr) -> Dtb {
-        if self.arm64 && va.0 & (1 << 55) != 0 {
-            self.kernel_dtb.unwrap_or(self.dtb)
+        let paging = self.arch.paging();
+        if paging.separate_kernel_root() && paging.is_kernel_address(va) {
+            self.kernel_dtb
         } else {
             self.dtb
         }
-    }
-
-    /// The AArch64 table walk.
-    fn walk_arm64(&self, va: VirtAddr) -> Result<Walked> {
-        // AArch64: bit 55 selects TTBR1 (kernel) vs TTBR0 (user).
-        let root = self.root_for(va);
-
-        // Level 0 uses bits 47:39, like x64 PML4.
-        let Some(l0) = self.read_pt_entry(root, va.pml4_index())? else {
-            return Ok(Walked::Unmapped(None));
-        };
-        if !l0.arm64_is_valid() || l0.arm64_is_block() {
-            // 512 GiB L0 blocks are not used by Windows; treat as unmapped.
-            return Ok(Walked::Unmapped(None));
-        }
-
-        let Some(l1) = self.read_pt_entry(l0.arm64_page_frame(), va.pdpt_index())? else {
-            return Ok(Walked::Unmapped(None));
-        };
-        if !l1.arm64_is_valid() {
-            return Ok(Walked::Unmapped(None));
-        }
-        if l1.arm64_is_block() {
-            return Ok(Walked::Mapped(Translation::arm64_mapping(
-                l1,
-                l1.arm64_huge_block_frame() + va.huge_page_offset(),
-                true,
-                va,
-            )));
-        }
-
-        let Some(l2) = self.read_pt_entry(l1.arm64_page_frame(), va.pd_index())? else {
-            return Ok(Walked::Unmapped(None));
-        };
-        if !l2.arm64_is_valid() {
-            return Ok(Walked::Unmapped(None));
-        }
-        if l2.arm64_is_block() {
-            return Ok(Walked::Mapped(Translation::arm64_mapping(
-                l2,
-                l2.arm64_large_block_frame() + va.large_page_offset(),
-                true,
-                va,
-            )));
-        }
-
-        let Some(l3) = self.read_pt_entry(l2.arm64_page_frame(), va.pt_index())? else {
-            return Ok(Walked::Unmapped(None));
-        };
-        // At L3 only 0b11 is a page descriptor; 0b01 is reserved.
-        if l3.0 & 0b11 != 0b11 {
-            // A trimmed page (a swapped-out kernel stack among them) keeps its
-            // frame: ARM64's software PTEs lay out valid, prototype,
-            // transition, and the frame in the bits AMD64's do.
-            if l3.is_transition() {
-                let pte = l3.unswizzled(self.backend.invalid_pte_mask());
-                return Ok(Walked::Mapped(Translation::new_transition(pte, va)));
-            }
-            return Ok(Walked::Unmapped(Some(l3)));
-        }
-        Ok(Walked::Mapped(Translation::arm64_mapping(
-            l3,
-            l3.arm64_page_frame() + va.page_offset(),
-            false,
-            va,
-        )))
     }
 
     pub fn virt_to_phys(&self, va: VirtAddr) -> Result<Option<Translation>> {
@@ -519,10 +422,11 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
             let _ = visit(start, start.0, end.0 - start.0);
             return Ok(());
         }
-        // The table walk covers one 48-bit half: the upper half's addresses
-        // are sign-extended from bit 47.
-        let half = if start.0 & (1 << 47) != 0 {
-            0xffff_0000_0000_0000
+        // The root indexes the low `bits` of an address, and the upper half's
+        // addresses are sign-extended from the top one.
+        let bits = self.arch.paging().levels()[0].shift() + 9;
+        let half = if start.0 & (1 << (bits - 1)) != 0 {
+            !0 << bits
         } else {
             0
         };
@@ -530,18 +434,21 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
         Ok(())
     }
 
-    /// One table of [`Self::for_each_present_page`]: `level` 0 is the root,
-    /// covering from `base`; entries outside `[start, end)` are skipped.
+    /// One table of [`Self::for_each_present_page`], `depth` levels below
+    /// the root, covering from `base`; entries outside `[start, end)` are
+    /// skipped.
     fn visit_table(
         &self,
         table: PhysAddr,
-        level: u32,
+        depth: usize,
         base: u64,
         start: u64,
         end: u64,
         visit: &mut impl FnMut(VirtAddr, PhysAddr, u64) -> ControlFlow<()>,
     ) -> Result<ControlFlow<()>> {
-        let shift = 39 - 9 * level;
+        let paging = self.arch.paging();
+        let level = paging.levels()[depth];
+        let shift = level.shift();
         let span = 1u64 << shift;
         let mut entries = [0u8; PAGE_SIZE];
         match self.backend.read_page_table_bytes(table, &mut entries) {
@@ -557,39 +464,15 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
                 entries[at..at + 8].try_into().expect("8-byte entry"),
             ));
             let entry_base = base + index * span;
-            let leaf = if self.arm64 {
-                match level {
-                    _ if !entry.arm64_is_valid() => continue,
-                    // Windows maps no 512 GiB level-0 blocks.
-                    0 if entry.arm64_is_block() => continue,
-                    1 if entry.arm64_is_block() => Some(entry.arm64_huge_block_frame()),
-                    2 if entry.arm64_is_block() => Some(entry.arm64_large_block_frame()),
-                    3 if entry.0 & 0b11 != 0b11 => continue,
-                    3 => Some(entry.arm64_page_frame()),
-                    _ => None,
-                }
-            } else {
-                match level {
-                    _ if !entry.is_present() => continue,
-                    1 if entry.is_large_page() => Some(entry.huge_page_frame()),
-                    2 if entry.is_large_page() => Some(entry.large_page_frame()),
-                    3 => Some(entry.page_frame()),
-                    _ => None,
-                }
-            };
-            let flow = match leaf {
-                Some(frame) => {
+            let flow = match paging.decode_entry(level, entry) {
+                TableEntry::Absent => continue,
+                TableEntry::Leaf(frame) => {
                     let from = entry_base.max(start);
                     let to = (entry_base + (span - 1)).min(end - 1);
                     visit(VirtAddr(from), frame + (from - entry_base), to - from + 1)
                 }
-                None => {
-                    let next = if self.arm64 {
-                        entry.arm64_page_frame()
-                    } else {
-                        entry.page_frame()
-                    };
-                    self.visit_table(next, level + 1, entry_base, start, end, visit)?
+                TableEntry::Table(next) => {
+                    self.visit_table(next, depth + 1, entry_base, start, end, visit)?
                 }
             };
             if flow.is_break() {
@@ -601,79 +484,77 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
 
     fn walk(&self, va: VirtAddr) -> Result<Option<Translation>> {
         if self.dtb == DTB_IDENTITY {
-            return Ok(Some(Translation {
-                address: va.0,
-                large: false,
-                user: false,
-                nx: false,
-                uxn: false,
-                residency: Residency::Mapped,
-            }));
+            return Ok(Some(Translation::identity(va)));
         }
-        let walked = if self.arm64 {
-            self.walk_arm64(va)?
-        } else {
-            self.walk_amd64(va)?
-        };
-        match walked {
+        match self.walk_tables(va, |_| {})? {
             Walked::Mapped(translation) => Ok(Some(translation)),
             Walked::Unmapped(leaf) => Ok(self.section_page(va, leaf)),
         }
     }
 
-    /// The AMD64 table walk.
-    fn walk_amd64(&self, va: VirtAddr) -> Result<Walked> {
-        let Some(pml4e) = self.read_pt_entry(self.dtb, va.pml4_index())? else {
-            return Ok(Walked::Unmapped(None));
+    /// The translation of `va` (uncached), with the entries its walk read,
+    /// root first.
+    pub fn walk_steps(&self, va: VirtAddr) -> Result<(Vec<WalkStep>, Option<Translation>)> {
+        if self.dtb == DTB_IDENTITY {
+            return Ok((Vec::new(), Some(Translation::identity(va))));
+        }
+        let mut steps = Vec::with_capacity(PageTableLevel::ALL.len());
+        let translation = match self.walk_tables(va, |step| steps.push(step))? {
+            Walked::Mapped(translation) => Some(translation),
+            Walked::Unmapped(leaf) => self.section_page(va, leaf),
         };
+        Ok((steps, translation))
+    }
 
-        if !pml4e.is_present() {
-            return Ok(Walked::Unmapped(None));
-        }
-
-        let Some(pdpte) = self.read_pt_entry(pml4e.page_frame(), va.pdpt_index())? else {
-            return Ok(Walked::Unmapped(None));
-        };
-
-        if !pdpte.is_present() {
-            return Ok(Walked::Unmapped(None));
-        }
-
-        if pdpte.is_large_page() {
-            return Ok(Walked::Mapped(Translation::new_huge(pml4e, pdpte, va)));
-        }
-
-        let Some(pde) = self.read_pt_entry(pdpte.page_frame(), va.pd_index())? else {
-            return Ok(Walked::Unmapped(None));
-        };
-
-        if !pde.is_present() {
-            return Ok(Walked::Unmapped(None));
-        }
-
-        if pde.is_large_page() {
-            return Ok(Walked::Mapped(Translation::new_large(
-                pml4e, pdpte, pde, va,
-            )));
-        }
-
-        let Some(pte) = self.read_pt_entry(pde.page_frame(), va.pt_index())? else {
-            return Ok(Walked::Unmapped(None));
-        };
-
-        if !pte.is_present() {
-            // A working-set trim leaves the frame in memory with the valid
-            // bit clear. The kernel's own debug-memory path reads those, so
-            // refusing them here would report memory as gone that the target
-            // can still show.
-            if pte.is_transition() {
-                let pte = pte.unswizzled(self.backend.invalid_pte_mask());
-                return Ok(Walked::Mapped(Translation::new_transition(pte, va)));
+    /// Walk the tables for `va`, handing `on_step` each entry read.
+    fn walk_tables(&self, va: VirtAddr, mut on_step: impl FnMut(WalkStep)) -> Result<Walked> {
+        let paging = self.arch.paging();
+        let mut table = self.root_for(va);
+        let mut path = [PageTableEntry(0); PageTableLevel::ALL.len()];
+        for (depth, &level) in paging.levels().iter().enumerate() {
+            let shift = level.shift();
+            let index = (va.0 >> shift) & PT_INDEX_MASK;
+            let address = table + 8 * index;
+            let Some(entry) = self.read_pt_entry(address)? else {
+                return Ok(Walked::Unmapped(None));
+            };
+            on_step(WalkStep {
+                level,
+                address,
+                entry,
+            });
+            path[depth] = entry;
+            match paging.decode_entry(level, entry) {
+                TableEntry::Table(next) => table = next,
+                TableEntry::Leaf(frame) => {
+                    let permissions = paging.mapping_permissions(&path[..=depth], va);
+                    let offset = va.0 & ((1u64 << shift) - 1);
+                    return Ok(Walked::Mapped(Translation::mapped(
+                        frame + offset,
+                        level != PageTableLevel::Pte,
+                        permissions,
+                    )));
+                }
+                TableEntry::Absent if level != PageTableLevel::Pte => {
+                    return Ok(Walked::Unmapped(None));
+                }
+                TableEntry::Absent => {
+                    // A working-set trim leaves the frame in memory with the
+                    // valid bit clear. The kernel's own debug-memory path
+                    // reads those, so refusing them here would report memory
+                    // as gone that the target can still show. ARM64's
+                    // software PTEs lay out valid, prototype, transition and
+                    // the frame in the bits AMD64's do.
+                    if entry.is_transition() {
+                        let pte = entry.unswizzled(self.backend.invalid_pte_mask());
+                        return Ok(Walked::Mapped(Translation::new_transition(pte, va)));
+                    }
+                    return Ok(Walked::Unmapped(Some(entry)));
+                }
             }
-            return Ok(Walked::Unmapped(Some(pte)));
         }
-
-        Ok(Walked::Mapped(Translation::new(pml4e, pdpte, pde, pte, va)))
+        // The last level decodes no table.
+        Ok(Walked::Unmapped(None))
     }
 
     /// A user page of a mapped view that the tables do not map, read from
@@ -682,7 +563,8 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
     /// it is absent.
     fn section_page(&self, va: VirtAddr, leaf: Option<PageTableEntry>) -> Option<Translation> {
         // Views are mapped in a process's user half only.
-        if va.0 >> 47 != 0 {
+        let paging = self.arch.paging();
+        if paging.is_kernel_address(va) {
             return None;
         }
         let views = self.backend.section_views()?;
@@ -695,10 +577,9 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
             Some(_) => None,
         }?;
         let pte = PageTableEntry(self.read::<u64>(prototype).ok()?);
-        let valid = if self.arm64 {
-            (pte.0 & 0b11 == 0b11).then(|| pte.arm64_page_frame())
-        } else {
-            pte.is_present().then(|| pte.page_frame())
+        let valid = match paging.decode_entry(PageTableLevel::Pte, pte) {
+            TableEntry::Leaf(frame) => Some(frame),
+            TableEntry::Absent | TableEntry::Table(_) => None,
         };
         let frame = valid.or_else(|| {
             pte.is_transition()
@@ -875,7 +756,7 @@ mod tests {
             data,
             invalid_pte_mask: 0,
         };
-        let space = AddressSpace::new(&mem, 0x1000);
+        let space = AddressSpace::new_amd64(&mem, 0x1000);
         let base = 0xffff_f800_0000_0000u64;
         let mut visits = Vec::new();
         space
@@ -916,7 +797,7 @@ mod tests {
     fn transition_pte_reads_the_frame_it_still_owns() {
         // PFN 0x5, valid clear, transition (bit 11) set.
         let (mem, va) = amd64_space(0x5000 | (1 << 11));
-        let space = AddressSpace::new(&mem, 0x1000);
+        let space = AddressSpace::new_amd64(&mem, 0x1000);
 
         let mut buf = [0u8; 8];
         space.read_bytes(va, &mut buf).unwrap();
@@ -942,7 +823,7 @@ mod tests {
             let (mut mem, va) = amd64_space(leaf);
             mem.invalid_pte_mask = MASK;
             let mut buf = [0u8; 8];
-            AddressSpace::new(&mem, 0x1000)
+            AddressSpace::new_amd64(&mem, 0x1000)
                 .read_bytes(va, &mut buf)
                 .map(|()| u64::from_le_bytes(buf))
         };
@@ -965,7 +846,7 @@ mod tests {
             ("page file", 0x5000u64),
         ] {
             let (mem, va) = amd64_space(leaf);
-            let space = AddressSpace::new(&mem, 0x1000);
+            let space = AddressSpace::new_amd64(&mem, 0x1000);
             let mut buf = [0u8; 8];
             assert!(
                 space.read_bytes(va, &mut buf).is_err(),
@@ -993,34 +874,9 @@ mod tests {
             invalid_pte_mask: 0,
         };
 
-        let value: u64 = AddressSpace::new(&mem, 0x1000).read(va).unwrap();
+        let value: u64 = AddressSpace::new_amd64(&mem, 0x1000).read(va).unwrap();
 
         assert_eq!(value, 0xfeed_face);
-    }
-
-    #[test]
-    fn huge_page_translation_ignores_pat_bit() {
-        let pml4e = PageTableEntry(0x2000 | 0b111);
-        let pdpte = PageTableEntry(0x4000_0000 | (1 << 12) | 0x80 | 0b111);
-
-        let huge = Translation::new_huge(pml4e, pdpte, VirtAddr(0x1234_5678));
-
-        assert_eq!(huge.address, 0x4000_0000 + 0x1234_5678);
-    }
-
-    /// An AArch64 block descriptor's bits below the block size are `nT`
-    /// (bit 16) or RES0, not output address.
-    #[test]
-    fn arm64_block_translation_ignores_non_address_bits() {
-        const NT: u64 = 1 << 16;
-        assert_eq!(
-            PageTableEntry(0x4000_0000 | NT | 0b01).arm64_huge_block_frame(),
-            0x4000_0000
-        );
-        assert_eq!(
-            PageTableEntry(0x0060_0000 | NT | 0b01).arm64_large_block_frame(),
-            0x0060_0000
-        );
     }
 
     #[test]
@@ -1031,7 +887,7 @@ mod tests {
             data,
             invalid_pte_mask: 0,
         };
-        let space = AddressSpace::new(&mem, DTB_IDENTITY);
+        let space = AddressSpace::new_amd64(&mem, DTB_IDENTITY);
 
         let mut buf = [0u8; 8];
         space.read_bytes(VirtAddr(0x1000), &mut buf).unwrap();
@@ -1048,7 +904,7 @@ mod tests {
             data,
             invalid_pte_mask: 0,
         };
-        let space = AddressSpace::new(&mem, DTB_IDENTITY);
+        let space = AddressSpace::new_amd64(&mem, DTB_IDENTITY);
 
         let mut buf = [0u8; 0x20];
         space.read_bytes(VirtAddr(0xFF0), &mut buf).unwrap();
@@ -1199,18 +1055,18 @@ mod tests {
             cache: TranslationCache::default(),
         };
 
-        let first: u64 = AddressSpace::new(&mem, root as u64).read(va).unwrap();
+        let first: u64 = AddressSpace::new_amd64(&mem, root as u64).read(va).unwrap();
         assert_eq!(first, 0x1111_2222_3333_4444);
         assert_eq!(mem.reads.get(), 5);
 
-        let second: u64 = AddressSpace::new(&mem, root as u64)
+        let second: u64 = AddressSpace::new_amd64(&mem, root as u64)
             .read(VirtAddr(va.0 + 0x10))
             .unwrap();
         assert_eq!(second, 0x5555_6666_7777_8888);
         assert_eq!(mem.reads.get(), 6);
 
         mem.cache.clear();
-        let _: u64 = AddressSpace::new(&mem, root as u64).read(va).unwrap();
+        let _: u64 = AddressSpace::new_amd64(&mem, root as u64).read(va).unwrap();
         assert_eq!(mem.reads.get(), 11);
     }
 
@@ -1300,7 +1156,7 @@ mod tests {
             |space: &AddressSpace<'_, ViewedPhysMem>, va: VirtAddr| space.read::<u64>(va).ok();
 
         let (mem, va) = viewed_space(0, 0);
-        let space = AddressSpace::new(&mem, 0x1000);
+        let space = AddressSpace::new_amd64(&mem, 0x1000);
         assert_eq!(read(&space, va), Some(0x1122_3344_5566_7788));
         assert_eq!(read(&space, va + 0x1000u64), Some(0x9999_aaaa_bbbb_cccc));
         assert!(matches!(
@@ -1310,13 +1166,13 @@ mod tests {
 
         let pointer = (KERNEL + 0x308) << 16 | 1 << 10;
         let (mem, va) = viewed_space(pointer, 0);
-        let space = AddressSpace::new(&mem, 0x1000);
+        let space = AddressSpace::new_amd64(&mem, 0x1000);
         assert_eq!(read(&space, va), Some(0x9999_aaaa_bbbb_cccc));
 
         let (mut mem, va) = viewed_space(0, 0);
         let pde = 0x3000 + 8 * va.pd_index();
         mem.inner.data[pde..pde + 8].fill(0);
-        let space = AddressSpace::new(&mem, 0x1000);
+        let space = AddressSpace::new_amd64(&mem, 0x1000);
         assert_eq!(read(&space, va), Some(0x1122_3344_5566_7788));
         // No view maps the pages below it.
         assert_eq!(read(&space, VirtAddr(va.0 - 0x10000)), None);
@@ -1327,10 +1183,18 @@ mod tests {
     #[test]
     fn private_and_paged_out_pages_are_not_read_from_a_section() {
         let (mem, va) = viewed_space(0, 1 << 21);
-        assert!(AddressSpace::new(&mem, 0x1000).read::<u64>(va).is_err());
+        assert!(
+            AddressSpace::new_amd64(&mem, 0x1000)
+                .read::<u64>(va)
+                .is_err()
+        );
 
         let (mem, va) = viewed_space(0x5000, 0);
-        assert!(AddressSpace::new(&mem, 0x1000).read::<u64>(va).is_err());
+        assert!(
+            AddressSpace::new_amd64(&mem, 0x1000)
+                .read::<u64>(va)
+                .is_err()
+        );
     }
 
     #[test]

@@ -1,22 +1,27 @@
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use owo_colors::OwoColorize;
 
 use crate::backend::dbg_backend::{
     BugcheckInfo, ContinueDisposition, ModuleEvent, processor_index_from_backend_thread_id,
+    thread_kind, thread_label,
 };
 use crate::base::diagnostics::print_notice;
 use crate::base::error::{Error, Result};
+use crate::base::output::neutralize_controls;
 use crate::base::types::VirtAddr;
 use crate::hosts::repl::commands::display;
+use crate::hosts::repl::commands::frames::registers_from_trap_frame;
+use crate::hosts::repl::terminal;
 use crate::hosts::ui;
+use crate::nt::bugchecks::bugcheck_trap_frame_on_stack;
 use crate::nt::guest::ModuleInfo;
 use crate::nt::target::{HYPERVISOR_CONTEXT, Target, ThreadInfo, kthread_state_name};
 use crate::nt::unwind::{
     StackTrace, ThreadTraceContext, UNKNOWN_CONTEXT, build_stacktrace_with_register_values,
-    format_symbol, resolve_thread_trace_context_at, saved_vtls,
+    build_thread_stacktrace, format_symbol, resolve_thread_trace_context_at, saved_vtls,
 };
 use crate::session::stops::module_event_line;
 use crate::session::{
@@ -30,29 +35,26 @@ pub const STATUS_BREAKPOINT: u32 = 0x8000_0003;
 
 pub use crate::session::context::refresh_windows_thread_context_for_backend_thread;
 
-/// One-line summary: `thread Idle  state Running  ethread <addr>  pid 0  tid 0`.
-/// The leading `thread` label distinguishes it from the break line above,
-/// which names the process context (via CR3), not the thread's owner.
+/// One-line summary in `!thread`'s words: `thread <addr>  TID 0  PID 0
+/// process Idle  state Running`. The leading `thread` label distinguishes it
+/// from the break line above, which names the process context (via CR3),
+/// not the thread's owner.
 fn format_windows_thread(thread: &ThreadInfo) -> String {
     let process = thread.process_name.as_deref().unwrap_or("unknown");
-    let mut line = format!("{} {}", ui::muted("thread"), process);
+    let mut line = format!("{} {}", ui::muted("thread"), ui::addr(thread.ethread.0));
+    if let Some(tid) = thread.tid {
+        line.push_str(&format!("  {} {tid}", ui::muted("TID")));
+    }
+    if let Some(pid) = thread.pid {
+        line.push_str(&format!("  {} {pid}", ui::muted("PID")));
+    }
+    line.push_str(&format!("  {} {process}", ui::muted("process")));
     if let Some(state) = thread.state {
         line.push_str(&format!(
             "  {} {}",
             ui::muted("state"),
             kthread_state_name(state)
         ));
-    }
-    line.push_str(&format!(
-        "  {} {}",
-        ui::muted("ethread"),
-        ui::addr(thread.ethread.0)
-    ));
-    if let Some(pid) = thread.pid {
-        line.push_str(&format!("  {} {pid}", ui::muted("pid")));
-    }
-    if let Some(tid) = thread.tid {
-        line.push_str(&format!("  {} {tid}", ui::muted("tid")));
     }
     line
 }
@@ -224,12 +226,6 @@ pub fn print_target_reload(
             .symbols
             .format_closest_symbol_for_address(debugger.kernel_dtb(), VirtAddr(pc))
     });
-    #[cfg(feature = "cli")]
-    native::render(
-        || native::stop::reboot_card(current_thread, pc, symbol.as_deref(), coherent),
-        || print_target_reload_text(current_thread, pc, symbol.as_deref(), coherent),
-    );
-    #[cfg(not(feature = "cli"))]
     print_target_reload_text(current_thread, pc, symbol.as_deref(), coherent);
 }
 
@@ -249,7 +245,7 @@ fn print_target_reload_text(
         ui::badge("BREAK"),
         ui::plate(&format!(
             " {} kernel at {} ",
-            ui::thread_id(current_thread),
+            ui::thread(current_thread),
             location
         ))
     );
@@ -277,11 +273,15 @@ pub fn print_break_context_for_bugcheck(session: &mut Session, info: Option<&Bug
 /// Windows hypervisor: its registers (the general-purpose ones only when
 /// they were recovered), the NT code it left off at, and its stack.
 fn print_saved_vtl0_context(session: &Session, saved: &HashMap<String, u64>) {
-    print_section("registers (saved VTL0)");
-    print_sparse_registers(saved, None, 2);
+    print_known_registers(saved, session.target.arch(), "registers (saved VTL0)");
     let (trace, rip, stack) = saved_vtl0_code(session, saved);
-    print_disasm_context(session, &trace, rip);
-    print_stacktrace_data(&stack, BREAK_STACKTRACE_DISPLAY_LIMIT, true);
+    print_disasm_context(session, &trace, rip, NextStep::default());
+    print_stacktrace_data(
+        session.target.arch(),
+        &stack,
+        BREAK_STACKTRACE_DISPLAY_LIMIT,
+        true,
+    );
 }
 
 /// Where the saved VTL0 state left off: its trace context, its `rip` and
@@ -307,7 +307,7 @@ fn saved_vtl0_code(
 }
 
 /// What a stop shows, gathered once for either renderer.
-struct StopContext {
+pub struct StopContext {
     thread: String,
     context: String,
     symbol: String,
@@ -318,9 +318,6 @@ struct StopContext {
     windows_thread: Option<ThreadInfo>,
     /// The hypervisor's saved state and notes, styled.
     notes: Vec<String>,
-    /// The stop card names a bugcheck in its chip.
-    #[cfg(feature = "cli")]
-    bugcheck: bool,
     regs: Vec<u8>,
     /// The register file of the previous stop on the same thread, when the
     /// display marks what changed since.
@@ -332,14 +329,14 @@ struct StopContext {
     saved: Option<HashMap<String, u64>>,
     trace: ThreadTraceContext,
     rip: u64,
-    /// How much of it the text renderer draws.
+    /// How much of it is drawn.
     detail: StopDetail,
 }
 
 /// How much of a stop a compact host draws (see [`Session::compact_stops`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StopDetail {
-    /// The whole card: banner, registers, code and stack.
+    /// The whole stop: banner, registers, code and stack.
     Full,
     /// After a stop on the same thread, such as a step: the banner, the
     /// registers that changed, the next few instructions, and the stack
@@ -361,7 +358,7 @@ fn function_of(symbol: &str) -> &str {
 }
 
 impl StopContext {
-    /// The lines under the banner, as the text renderer lists them.
+    /// The lines under the banner.
     fn children(&self) -> Vec<String> {
         let mut children = Vec::new();
         children.extend(self.cause.clone());
@@ -377,13 +374,29 @@ fn print_stop_text(session: &Session, stop: &StopContext) {
         "{}{}",
         ui::badge("BREAK"),
         ui::plate(&format!(
-            " {} {} at {} ",
-            ui::thread_id(&stop.thread),
+            " {}  {} at {} ",
+            ui::thread(&stop.thread),
             stop.context,
             ui::symbol(&stop.symbol)
         ))
     );
     print_event_children(" ", &stop.children());
+    let map = &session.register_map;
+    let read = |name: &str| map.read_u64(name, &stop.regs).ok();
+    // A bugcheck's banner names the fault site, which is not where the
+    // registers are: its jumps are not predicted from them.
+    let live = read(session.target.arch().pc_register()) == Some(stop.rip);
+    let next = |stack: Option<&'_ StackTrace>| {
+        if !live {
+            return (None, None);
+        }
+        // The caller a return goes back to: the first physical frame past
+        // the stopped one.
+        let returns_to = stack
+            .and_then(|stack| stack.frames.iter().skip(1).find(|frame| !frame.inline))
+            .map(|frame| frame.symbol.clone());
+        (Some(&read as &dyn Fn(&str) -> Option<u64>), returns_to)
+    };
     match stop.detail {
         StopDetail::Full => {}
         StopDetail::Banner => {
@@ -391,12 +404,28 @@ fn print_stop_text(session: &Session, stop: &StopContext) {
             return;
         }
         StopDetail::Changes { stack } => {
-            print_changed_registers(&session.register_map, &stop.regs, stop.before.as_deref());
-            print_disasm_lines(session, &stop.trace, stop.rip, COMPACT_DISASM_INSTRUCTIONS);
+            print_changed_registers(
+                map,
+                session.target.arch(),
+                &stop.regs,
+                stop.before.as_deref(),
+            );
+            let (read, _) = next(None);
+            print_disasm_lines(
+                session,
+                &stop.trace,
+                stop.rip,
+                COMPACT_DISASM_INSTRUCTIONS,
+                0,
+                NextStep {
+                    read,
+                    returns_to: None,
+                },
+            );
             if stack {
                 print_stacktrace(
                     &session.target,
-                    &session.register_map,
+                    map,
                     &stop.regs,
                     BREAK_STACKTRACE_PROBE_LIMIT,
                     BREAK_STACKTRACE_DISPLAY_LIMIT,
@@ -414,23 +443,110 @@ fn print_stop_text(session: &Session, stop: &StopContext) {
         outln!();
         return;
     }
-    print_registers(
-        &session.register_map,
-        &stop.regs,
-        stop.before.as_deref(),
-        true,
-    );
-    print_disasm_context(session, &stop.trace, stop.rip);
-    print_stacktrace(
+    let recovered = build_thread_stacktrace(
         &session.target,
-        &session.register_map,
+        map,
         &stop.regs,
+        session.target.windows_thread_selection.as_ref(),
         BREAK_STACKTRACE_PROBE_LIMIT,
+    );
+    let stack = StackTrace {
+        frames: recovered
+            .frames
+            .iter()
+            .map(|frame| frame.frame.clone())
+            .collect(),
+        truncated: recovered.truncated,
+    };
+    // At a bugcheck the frame that faulted is the one at the fault site:
+    // the stack starts from it, and the registers are the ones it ran with,
+    // when they can be found; else they are where the target stopped, and
+    // the heading says so.
+    let fault_index = (!live)
+        .then(|| {
+            recovered
+                .frames
+                .iter()
+                .position(|frame| frame.frame.ip == stop.rip)
+        })
+        .flatten();
+    let fault = (!live)
+        .then(|| {
+            fault_registers(
+                session,
+                &stack,
+                fault_index.map(|index| &recovered.frames[index].registers),
+                stop.rip,
+            )
+        })
+        .flatten();
+    match &fault {
+        Some((values, heading)) => print_known_registers(values, session.target.arch(), heading),
+        None => print_registers(
+            map,
+            session.target.arch(),
+            &stop.regs,
+            stop.before.as_deref(),
+            Some(if live {
+                "registers"
+            } else {
+                "registers (at stop)"
+            }),
+        ),
+    }
+    let (read_next, returns_to) = next(Some(&stack));
+    print_disasm_context(
+        session,
+        &stop.trace,
+        stop.rip,
+        NextStep {
+            read: read_next,
+            returns_to: returns_to.as_deref(),
+        },
+    );
+    print_stop_stack(
+        session.target.arch(),
+        &stack,
+        fault_index.unwrap_or(0),
         BREAK_STACKTRACE_DISPLAY_LIMIT,
-        true,
     );
     print_displays(&stop.displays);
     outln!();
+}
+
+/// The registers the faulting instruction a bugcheck stop shows ran with,
+/// and the heading saying where they came from: the trap frame at `fault`
+/// (the one the bugcheck's parameters name, or else the innermost trap on
+/// the stack, which a bugcheck such as 0xD1 is raised from), its gaps
+/// filled with what the unwinder recovered for the frame that faulted
+/// (`unwound`: the nonvolatile registers a trap frame does not hold); or
+/// those recovered alone.
+fn fault_registers(
+    session: &Session,
+    stack: &StackTrace,
+    unwound: Option<&HashMap<String, u64>>,
+    fault: u64,
+) -> Option<(HashMap<String, u64>, &'static str)> {
+    let mut values = unwound.cloned().unwrap_or_default();
+    let named = session
+        .bugcheck()
+        .map(|analysis| analysis.trap_frames)
+        .unwrap_or_default();
+    let trap = named
+        .into_iter()
+        .chain(bugcheck_trap_frame_on_stack(&session.target, stack))
+        .find_map(|trap_frame| {
+            let frame = trap_frame.frame?;
+            (frame.instruction_pointer() == fault).then(|| registers_from_trap_frame(&frame))
+        });
+    match trap {
+        Some(saved) => {
+            values.extend(saved);
+            Some((values, "registers (trap frame)"))
+        }
+        None if !values.is_empty() => Some((values, "registers (unwound)")),
+        None => None,
+    }
 }
 
 /// The `display` expressions under a stop, in a section of their own.
@@ -440,73 +556,6 @@ fn print_displays(shown: &[display::Shown]) {
     }
     print_section("display");
     display::print(shown);
-}
-
-#[cfg(feature = "cli")]
-fn stop_view(session: &Session, stop: &StopContext, tone: tern_sdk::ui::Tone) -> tern_sdk::View {
-    let ran = native::take_run();
-    let lines: Vec<String> = stop.stopped_at.iter().chain(&stop.notes).cloned().collect();
-    let (registers, rows, current, stack) = match &stop.saved {
-        Some(saved) => {
-            let (trace, rip, stack) = saved_vtl0_code(session, saved);
-            let grid = native::styled(|| print_sparse_registers(saved, None, 0));
-            (
-                (
-                    vec![native::span("registers (saved VTL0)", "")],
-                    native::block(&grid).into(),
-                ),
-                disasm_context_rows(session, &trace, rip),
-                rip,
-                stack,
-            )
-        }
-        None => {
-            let map = &session.register_map;
-            let read = |name: &str| map.read_u64(name, &stop.regs).ok();
-            let changed = |name: &str| {
-                read(name).is_some_and(|value| changed(map, name, value, stop.before.as_deref()))
-            };
-            let grid = native::frames::register_grid(&read, &changed);
-            // Folded by default, the section's head names what changed.
-            let names = native::frames::changed_registers(&read, &changed);
-            let mut head = vec![native::span("registers", "")];
-            if !names.is_empty() {
-                head.push(native::span(
-                    format!("  {} changed", names.join(" ")),
-                    native::MUTED,
-                ));
-            }
-            let stack = thread_stacktrace(
-                &session.target,
-                &session.register_map,
-                &stop.regs,
-                BREAK_STACKTRACE_PROBE_LIMIT,
-            );
-            (
-                (head, grid.into()),
-                disasm_context_rows(session, &stop.trace, stop.rip),
-                stop.rip,
-                stack,
-            )
-        }
-    };
-    native::stop::stop_card(native::stop::Stop {
-        thread: &stop.thread,
-        context: &stop.context,
-        symbol: &stop.symbol,
-        tone,
-        cause: stop.cause.as_deref(),
-        bugcheck: stop.bugcheck,
-        windows_thread: stop.windows_thread.as_ref(),
-        lines: &lines,
-        registers,
-        code: rows.as_deref().map_err(|note| note.trim().to_owned()),
-        current,
-        stack: &stack,
-        stack_limit: BREAK_STACKTRACE_DISPLAY_LIMIT,
-        ran,
-        displays: (!stop.displays.is_empty()).then(|| native::frames::displays(&stop.displays)),
-    })
 }
 
 /// `cause` is an optional pre-styled tree child naming why execution stopped
@@ -531,7 +580,7 @@ pub fn print_break_context_at(
                 ui::badge("BREAK"),
                 ui::plate(&format!(
                     " {} (register context unavailable: {}) ",
-                    ui::thread_id(&thread_id),
+                    ui::thread(&thread_id),
                     e
                 ))
             );
@@ -545,7 +594,9 @@ pub fn print_break_context_at(
     let cr3 = register_map
         .read_u64(debugger.arch().dtb_register(), &regs)
         .unwrap_or(0);
-    let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
+    let rip = register_map
+        .read_u64(debugger.arch().pc_register(), &regs)
+        .unwrap_or(0);
     let windows_thread = refresh_windows_thread_context_for_backend_thread(debugger, &thread_id);
     let trace = resolve_thread_trace_context_at(debugger, cr3, rip);
     let context_rip = display_rip.unwrap_or(rip);
@@ -556,12 +607,6 @@ pub fn print_break_context_at(
         .flatten()
         .and_then(|number| debugger.guest_vp_label(number))
         .unwrap_or_else(|| trace.description.clone());
-    #[cfg(feature = "cli")]
-    let tone = native::stop::tone(
-        cause.as_deref(),
-        display_rip.is_some(),
-        trace.description == HYPERVISOR_CONTEXT,
-    );
 
     // Bugcheck stops park at the break inside KeBugCheck, not at the fault
     // site the banner names.
@@ -639,13 +684,15 @@ pub fn print_break_context_at(
                 .map(|frame| frame.registers.clone())
         })
         .flatten();
-    // The previous stop's registers count only on the same vCPU and the
-    // same Windows thread: a stop elsewhere would mark nearly everything.
+    // The previous stop's registers count only on the same Windows thread
+    // (a thread a step moved to another vCPU is still the same), or on the
+    // same vCPU where no Windows thread is known: a stop elsewhere would
+    // mark nearly everything.
     let ethread = windows_thread.as_ref().map_or(0, |thread| thread.ethread.0);
     let previous = session
         .shown_stop
         .take()
-        .filter(|shown| shown.thread == thread_id && shown.ethread == ethread);
+        .filter(|shown| shown.ethread == ethread && (ethread != 0 || shown.thread == thread_id));
     let detail = if !session.compact_stops {
         StopDetail::Full
     } else if session.brief_stops {
@@ -673,8 +720,6 @@ pub fn print_break_context_at(
         stopped_at,
         windows_thread,
         notes: children,
-        #[cfg(feature = "cli")]
-        bugcheck: display_rip.is_some(),
         regs,
         before,
         displays,
@@ -683,17 +728,33 @@ pub fn print_break_context_at(
         rip: context_rip,
         detail,
     };
-    #[cfg(feature = "cli")]
-    native::render(
-        || stop_view(session, &stop, tone),
-        || print_stop_text(session, &stop),
-    );
-    #[cfg(not(feature = "cli"))]
     print_stop_text(session, &stop);
 }
 
 /// How long `g` on a running target waits for a stop it already reported.
 const PENDING_STOP_POLL: Duration = Duration::from_millis(100);
+
+/// How long a run takes before its stop is worth a desktop notification:
+/// long enough that the user may have turned to something else.
+const NOTIFY_AFTER: Duration = Duration::from_secs(10);
+
+/// What a desktop notification says a stop was, or `None` for one the user
+/// caused at the prompt (Ctrl+C, `break`).
+fn stop_notice(kind: &StopKind) -> Option<String> {
+    Some(match kind {
+        StopKind::Interrupt => return None,
+        StopKind::Breakpoint { breakpoint } => format!("breakpoint #{} hit", breakpoint.id),
+        StopKind::Exception { exception } => format!("exception {:#010x}", exception.code),
+        StopKind::Bugcheck {
+            bugcheck: Some(info),
+        } => format!("bugcheck {:#x}", info.code),
+        StopKind::Bugcheck { bugcheck: None } => "bugcheck".to_string(),
+        StopKind::ModuleLoad { module } => format!("{} loaded", module.name),
+        StopKind::ModuleUnload { module } => format!("{} unloaded", module.name),
+        StopKind::Reload { .. } => "the target restarted".to_string(),
+        StopKind::Step | StopKind::Entry => "the target stopped".to_string(),
+    })
+}
 
 /// The cancellation of a run a dispatch drives within its stop `budget`: a
 /// remote client's budget hands the target back running when it is spent;
@@ -821,6 +882,7 @@ impl ReplState<'_> {
         let announced = Cell::new(false);
         let printed = Cell::new(self.printed_debug_seq);
         let interactive = self.context == DispatchContext::Interactive;
+        let title = self.window_title(true);
         let tick = |session: &mut Session| {
             if announce && !announced.get() && session.backend.is_running() {
                 announced.set(true);
@@ -834,12 +896,14 @@ impl ReplState<'_> {
                 native::running(print);
                 #[cfg(not(feature = "cli"))]
                 print();
+                terminal::set_running(true);
+                terminal::set_title(&title);
             }
             if interactive && !session.backend_streams_debug_output() {
                 let page = session.read_debug_output(printed.get());
                 printed.set(page.next_seq);
                 for line in page.lines {
-                    eprintln!("{}", line.text);
+                    eprintln!("{}", neutralize_controls(&line.text));
                 }
             }
             for notice in session.take_notices() {
@@ -848,9 +912,12 @@ impl ReplState<'_> {
         };
         self.clear_selected_frame();
         let cancel = budget_cancel(self.stop_wait.as_ref(), Some(&tick));
+        let started = Instant::now();
         let outcome = self.ctx.run(motion, &cancel);
+        self.last_run = Some(started.elapsed());
         self.printed_debug_seq = printed.get();
         if announced.get() {
+            terminal::set_running(false);
             // A wait that ended without a stop (an error, a spent budget)
             // still stops the indicator.
             #[cfg(feature = "cli")]
@@ -869,8 +936,17 @@ impl ReplState<'_> {
     /// budget handed the target back still running. `failure` names what
     /// failed for an error.
     fn report_run(&mut self, outcome: Result<RunOutcome>, failure: &str) {
+        let ran = self.last_run.take();
         match outcome {
-            Ok(RunOutcome::Stopped(stop)) => stop.render(self, ()),
+            Ok(RunOutcome::Stopped(stop)) => {
+                let notice = ran
+                    .filter(|ran| *ran >= NOTIFY_AFTER)
+                    .and_then(|_| stop_notice(&stop.kind));
+                stop.render(self, ());
+                if let Some(notice) = notice {
+                    self.notify_stop(&notice);
+                }
+            }
             Ok(RunOutcome::Running) => self.print_still_running(),
             Err(error) => {
                 error!("{failure}: {error}");
@@ -882,6 +958,25 @@ impl ReplState<'_> {
                 }
             }
         }
+    }
+
+    /// Ask the terminal for a desktop notification of the stop just
+    /// rendered, `what` it was: at the interactive prompt only, where a long
+    /// run may have been left to itself.
+    fn notify_stop(&self, what: &str) {
+        if self.context != DispatchContext::Interactive {
+            return;
+        }
+        let mut text = format!("ntoseye: {what}");
+        if let Some(shown) = &self.ctx.shown_stop {
+            text.push_str(&format!(
+                " at {} on {} {}",
+                shown.symbol,
+                thread_kind(&shown.thread),
+                thread_label(&shown.thread)
+            ));
+        }
+        terminal::notify(&text);
     }
 
     /// Say that a remote client's stop budget ran out with the target still
@@ -1024,5 +1119,51 @@ impl ReplState<'_> {
         self.stop_wait
             .as_ref()
             .is_some_and(|budget| budget.deadline.is_some())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    use super::print_break_context_at;
+    use crate::base::output::capture;
+    use crate::base::types::VirtAddr;
+    use crate::session::Session;
+    use crate::session::tests::{MockBackend, session_with_mock};
+
+    /// The stop `session` draws on vCPU `thread`, captured.
+    fn stop_on(session: &mut Session, thread: &str) -> String {
+        session.current_thread = thread.into();
+        capture(|| print_break_context_at(session, None, None)).1
+    }
+
+    /// A step that finishes on another vCPU, as one often does on a busy
+    /// guest, is still a step of the same Windows thread: the stop shows
+    /// the registers it changed, not the whole register file again.
+    #[test]
+    fn a_step_that_moves_vcpus_shows_what_it_changed() {
+        let mut session = session_with_mock(MockBackend::default().one_vcpu());
+        let thread = VirtAddr(0xffff_8000_1234_0000);
+        session.target.test_current_threads = Some(Arc::new(Mutex::new(HashMap::from([
+            (0, thread),
+            (3, thread),
+        ]))));
+        session.compact_stops = true;
+        stop_on(&mut session, "p01.01");
+
+        let mut registers = session.backend.read_registers().unwrap();
+        session
+            .register_map
+            .write_u64("rip", &mut registers, 0x1003)
+            .unwrap();
+        session.backend.write_registers(&registers).unwrap();
+        let stop = stop_on(&mut session, "p01.04");
+
+        assert!(stop.contains("changed rip="), "{stop}");
+        assert!(!stop.contains("\nregisters\n"), "{stop}");
     }
 }

@@ -2,13 +2,13 @@ use std::collections::HashMap;
 
 use owo_colors::OwoColorize;
 
-use crate::backend::dbg_backend::{RegisterMap, repeats_another_register};
+use crate::arch::{Arch, RegisterMap};
 use crate::base::error::Error;
 use crate::base::memory::MemoryOps;
 use crate::base::types::{CodeMachine, VirtAddr};
-#[cfg(feature = "cli")]
-use crate::hosts::repl::native;
+use crate::hosts::repl::listing::{self, Listing};
 use crate::hosts::ui;
+use crate::nt::bugchecks::looks_like_kernel_pointer;
 use crate::nt::symbols::{LocalSourceState, SourceLocation};
 use crate::nt::target::Target;
 use crate::nt::unwind::{
@@ -21,12 +21,8 @@ pub fn print_section(title: &str) {
     outln!("\n{}", ui::label(title));
 }
 
-/// Begin a stop block: a blank line. A native stop card brings its own
-/// spacing.
+/// Begin a stop block: a blank line.
 pub fn print_stop_separator() {
-    #[cfg(feature = "cli")]
-    native::omit(|| outln!());
-    #[cfg(not(feature = "cli"))]
     outln!();
 }
 
@@ -181,127 +177,132 @@ fn format_cpsr(flags: u64) -> String {
     line.into_iter().collect()
 }
 
-/// Print the general-purpose register grid. `embedded` is true inside the
-/// break/status dump (`registers` section header, 2-space indent); standalone
-/// `registers` passes false so it reads flush-left with no header, matching
-/// `disasm`. The row layout follows the register map's architecture.
-/// Print a recovered (partial) register set sorted by name, one row per
-/// register at `indent` columns, under an optional heading line.
-pub fn print_sparse_registers(
-    registers: &HashMap<String, u64>,
-    heading: Option<&str>,
-    indent: usize,
-) {
-    let mut names: Vec<_> = registers
-        .keys()
-        .filter(|name| !repeats_another_register(name, registers))
-        .collect();
-    names.sort();
-    if let Some(heading) = heading {
-        outln!("{heading}");
-    }
-    for name in names {
-        outln!("{:indent$}{:<8} {}", "", name, ui::addr(registers[name]));
-    }
-}
-
-/// The general-purpose registers in `regs`, as a grid. With `before`, the
-/// register file of the previous stop on the same thread, the values that
-/// changed since stand out.
+/// The general-purpose registers in `regs`, as a grid, under `heading` as
+/// a section when given (indented, as the stop shows it), flush left
+/// without (as `r` does). With `before`, the register file of the previous
+/// stop on the same thread, the values that changed since stand out.
 pub fn print_registers(
     register_map: &RegisterMap,
+    arch: Arch,
     regs: &[u8],
     before: Option<&[u8]>,
-    embedded: bool,
+    heading: Option<&str>,
 ) {
-    let read_reg_value = |name: &str| register_map.read_u64(name, regs);
-    let styled_value = |name: &str| -> String {
-        match read_reg_value(name) {
-            Ok(value) if changed(register_map, name, value, before) => {
-                ui::changed(&ui::addr(value))
-            }
-            Ok(value) => ui::addr(value),
-            Err(_) => ui::muted(&format!("{:<16}", "N/A")),
+    print_register_grid(arch, heading, |name| {
+        match register_map.read_u64(name, regs) {
+            Ok(value) if changed(register_map, name, value, before) => RegisterCell::Changed(value),
+            Ok(value) => RegisterCell::Value(value),
+            Err(_) => RegisterCell::Unavailable,
+        }
+    });
+}
+
+/// Registers known by name, such as those a trap frame saved or the
+/// unwinder recovered for a frame, as [`print_registers`] lays them out
+/// under `heading`; one not known shows as `-`.
+pub fn print_known_registers(values: &HashMap<String, u64>, arch: Arch, heading: &str) {
+    print_register_grid(arch, Some(heading), |name| {
+        values
+            .get(name)
+            .copied()
+            .map_or(RegisterCell::Unsaved, RegisterCell::Value)
+    });
+}
+
+/// A register's value as the grid shows it.
+enum RegisterCell {
+    Value(u64),
+    /// Changed since the previous stop.
+    Changed(u64),
+    /// Not saved where the registers came from.
+    Unsaved,
+    /// Not in the register file.
+    Unavailable,
+}
+
+/// `arch`'s register grid, each register as `read` gives it, the flags
+/// named beside or under them.
+fn print_register_grid(arch: Arch, heading: Option<&str>, read: impl Fn(&str) -> RegisterCell) {
+    // A value's cell is as wide as an address, so the columns line up,
+    // unless it `ends` its line.
+    let styled_value = |name: &str, ends: bool| -> String {
+        match read(name) {
+            RegisterCell::Changed(value) => ui::changed(&ui::addr(value)),
+            RegisterCell::Value(value) => ui::addr(value),
+            RegisterCell::Unsaved | RegisterCell::Unavailable if ends => ui::muted("-"),
+            RegisterCell::Unsaved | RegisterCell::Unavailable => ui::muted(&format!("{:<16}", "-")),
         }
     };
-    let cell = |name: &str| {
+    let cell = |name: &str, ends: bool| {
         format!(
             "{} {}",
             ui::muted(&format!("{name:<3}")),
-            styled_value(name)
+            styled_value(name, ends)
         )
     };
 
-    let indent = if embedded { "  " } else { "" };
-    if embedded {
-        print_section("registers");
+    let indent = if heading.is_some() { "  " } else { "" };
+    if let Some(heading) = heading {
+        print_section(heading);
     }
 
-    // ARM64 register map: x0-x30 grid plus fp/lr/sp/pc and cpsr flags.
-    if read_reg_value("pc").is_ok() {
-        for row in [
-            ["x0", "x1", "x2", "x3"],
-            ["x4", "x5", "x6", "x7"],
-            ["x8", "x9", "x10", "x11"],
-            ["x12", "x13", "x14", "x15"],
-            ["x16", "x17", "x18", "x19"],
-            ["x20", "x21", "x22", "x23"],
-            ["x24", "x25", "x26", "x27"],
-        ] {
+    let row_line = |row: &[&str], ends: bool| {
+        row.iter()
+            .enumerate()
+            .map(|(index, name)| cell(name, ends && index + 1 == row.len()))
+            .collect::<Vec<_>>()
+            .join("   ")
+    };
+    let [names @ .., flags] = arch.general_registers() else {
+        return;
+    };
+    let flags_value = match read(flags) {
+        RegisterCell::Value(value) | RegisterCell::Changed(value) => value,
+        RegisterCell::Unsaved | RegisterCell::Unavailable => 0,
+    };
+    match arch {
+        // Rows of 3, the flags (as `rfl`, decoded) closing the last one.
+        Arch::Amd64 => {
+            let rows: Vec<&[&str]> = names.chunks(3).collect();
+            let Some((last, rows)) = rows.split_last() else {
+                return;
+            };
+            for row in rows {
+                outln!("{indent}{}", row_line(row, true));
+            }
+            let decoded = format_rflags(flags_value);
             outln!(
-                "{indent}{}   {}   {}   {}",
-                cell(row[0]),
-                cell(row[1]),
-                cell(row[2]),
-                cell(row[3])
+                "{indent}{}   {} {}{decoded}",
+                row_line(last, false),
+                ui::muted("rfl"),
+                styled_value(flags, decoded.is_empty())
             );
         }
-        outln!(
-            "{indent}{}   {}   {}   {}",
-            cell("x28"),
-            cell("fp"),
-            cell("lr"),
-            cell("sp")
-        );
-        let cpsr = read_reg_value("cpsr").unwrap_or(0);
-        outln!(
-            "{indent}{}   {} {}",
-            cell("pc"),
-            ui::muted("cpsr"),
-            styled_value("cpsr")
-        );
-        let flags = format_cpsr(cpsr);
-        if !flags.is_empty() {
-            // Align under the cpsr hex value: cell("pc") (4 + 16 chars) +
-            // the "   cpsr " label, i.e. 28 columns.
-            outln!("{indent}                            {flags}");
+        // Rows of 4 through sp, then pc and the flags, decoded below them.
+        Arch::Arm64 => {
+            let [grid @ .., pc] = names else {
+                return;
+            };
+            for row in grid.chunks(4) {
+                outln!("{indent}{}", row_line(row, true));
+            }
+            outln!(
+                "{indent}{}   {} {}",
+                cell(pc, false),
+                ui::muted(flags),
+                styled_value(flags, true)
+            );
+            let decoded = format_cpsr(flags_value);
+            if !decoded.is_empty() {
+                // Align under the cpsr hex value: cell("pc") (4 + 16 chars) +
+                // the "   cpsr " label, i.e. 28 columns.
+                outln!(
+                    "{}",
+                    format!("{indent}                            {decoded}").trim_end()
+                );
+            }
         }
-        return;
     }
-
-    let rflags = read_reg_value("eflags").unwrap_or(0);
-    for row in [
-        ["rax", "rbx", "rcx"],
-        ["rdx", "rsi", "rdi"],
-        ["rsp", "rbp", "rip"],
-        ["r8", "r9", "r10"],
-        ["r11", "r12", "r13"],
-    ] {
-        outln!(
-            "{indent}{}   {}   {}",
-            cell(row[0]),
-            cell(row[1]),
-            cell(row[2])
-        );
-    }
-    outln!(
-        "{indent}{}   {}   {} {}{}",
-        cell("r14"),
-        cell("r15"),
-        ui::muted("rfl"),
-        styled_value("eflags"),
-        format_rflags(rflags)
-    );
 }
 
 /// Whether register `name`, now `value`, held something else in `before`.
@@ -311,27 +312,18 @@ pub fn changed(register_map: &RegisterMap, name: &str, value: u64, before: Optio
         .is_some_and(|was| was != value)
 }
 
-/// The general-purpose registers, in the order the grid shows them.
-const AMD64_REGISTERS: [&str; 18] = [
-    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rsp", "rbp", "rip", "r8", "r9", "r10", "r11", "r12",
-    "r13", "r14", "r15", "eflags",
-];
-const ARM64_EXTRA_REGISTERS: [&str; 5] = ["fp", "lr", "sp", "pc", "cpsr"];
-
 /// The general-purpose registers that changed since `before`, on one line
 /// as `name=value` pairs: what a compact stop shows after a step.
-pub fn print_changed_registers(register_map: &RegisterMap, regs: &[u8], before: Option<&[u8]>) {
-    let arm64 = register_map.read_u64("pc", regs).is_ok();
-    let arm64_names = (0..=28)
-        .map(|index| format!("x{index}"))
-        .chain(ARM64_EXTRA_REGISTERS.map(String::from));
-    let names: Vec<String> = if arm64 {
-        arm64_names.collect()
-    } else {
-        AMD64_REGISTERS.map(String::from).to_vec()
-    };
-    let pairs: Vec<String> = names
+pub fn print_changed_registers(
+    register_map: &RegisterMap,
+    arch: Arch,
+    regs: &[u8],
+    before: Option<&[u8]>,
+) {
+    let pairs: Vec<String> = arch
+        .general_registers()
         .iter()
+        .copied()
         .filter_map(|name| {
             let value = register_map.read_u64(name, regs).ok()?;
             changed(register_map, name, value, before)
@@ -347,10 +339,7 @@ pub fn print_changed_registers(register_map: &RegisterMap, regs: &[u8], before: 
 
 // Decoding lives in core; the REPL owns the *rendering*
 // (`format_disasm_line`/`render_rows` below).
-pub use crate::base::disasm::{
-    AsmToken, DisasmRow, decode_code, decode_preceding, decode_rows, decode_rows_arm64,
-    disasm_formatter,
-};
+pub use crate::base::disasm::{AsmToken, DisasmRow, decode_code, decode_preceding};
 
 /// Width of the byte column for a listing: the longest hex string among the
 /// rows about to be printed, so the asm column always aligns and never gets
@@ -450,16 +439,70 @@ fn decode_disasm_context(
     )
 }
 
-pub fn print_disasm_context(session: &Session, trace: &ThreadTraceContext, rip: u64) {
-    print_disasm_lines(session, trace, rip, DISASM_CONTEXT_INSTRUCTIONS);
+/// Instructions a stop shows around the instruction pointer.
+const STOP_INSTRUCTIONS: usize = 9;
+/// Of them, how many come before it, where the function has them.
+const STOP_LEAD: usize = 3;
+/// Jumps a stop's code draws side by side in its gutter.
+const STOP_LANES: usize = 4;
+
+/// Reads a stopped thread's register by name.
+pub type RegisterRead<'a> = &'a dyn Fn(&str) -> Option<u64>;
+
+/// What a stop knows about the instruction it is at, for its listing: the
+/// registers to tell whether its jump goes, and where a return there goes
+/// back to. Neither when the code shown is not where the registers are (a
+/// bugcheck's fault site, a saved VTL state).
+#[derive(Default)]
+pub struct NextStep<'a> {
+    pub read: Option<RegisterRead<'a>>,
+    pub returns_to: Option<&'a str>,
 }
 
-/// [`print_disasm_context`] with at most `count` instructions.
-pub fn print_disasm_lines(session: &Session, trace: &ThreadTraceContext, rip: u64, count: usize) {
+/// The code at a stop: the instructions around `rip` in its function (see
+/// [`listing::code_window`]), with the jumps among them drawn and, from
+/// `next`, whether the one at `rip` is taken and where a return goes.
+pub fn print_disasm_context(
+    session: &Session,
+    trace: &ThreadTraceContext,
+    rip: u64,
+    next: NextStep<'_>,
+) {
+    print_disasm_lines(session, trace, rip, STOP_INSTRUCTIONS, STOP_LEAD, next);
+}
+
+/// [`print_disasm_context`] with `count` instructions, `lead` of them
+/// before `rip`.
+pub fn print_disasm_lines(
+    session: &Session,
+    trace: &ThreadTraceContext,
+    rip: u64,
+    count: usize,
+    lead: usize,
+    next: NextStep<'_>,
+) {
     print_section("disasm");
-    match disasm_context_rows(session, trace, rip) {
-        Ok(rows) => render_rows(&rows[..rows.len().min(count)], |ip| Some(ip == rip)),
-        Err(note) => outln!("{}", ui::muted(&note)),
+    let window = match listing::code_window(session, trace, rip, count, lead) {
+        Ok(window) => window,
+        Err(note) => {
+            outln!("{}", ui::muted(&note));
+            return;
+        }
+    };
+    let taken = next
+        .read
+        .and_then(|read| window.rows.get(window.current)?.jump_taken(read));
+    let listing = Listing {
+        rows: &window.rows,
+        current: Some(window.current),
+        taken,
+        returns_to: next.returns_to,
+        bytes: false,
+        lanes: STOP_LANES,
+        named: false,
+    };
+    for line in listing::listing_lines(session, trace, &listing) {
+        outln!("{line}");
     }
 }
 
@@ -510,7 +553,7 @@ pub fn print_stacktrace(
     embedded: bool,
 ) {
     let stacktrace = thread_stacktrace(debugger, register_map, regs, build_limit);
-    print_stacktrace_data(&stacktrace, display_limit, embedded);
+    print_stacktrace_data(debugger.arch(), &stacktrace, display_limit, embedded);
 }
 
 /// The stack of the selected thread from `regs`, walked `build_limit`
@@ -532,11 +575,23 @@ pub fn thread_stacktrace(
 }
 
 /// Render an already-collected stack trace in the same layout as [`print_stacktrace`].
-pub fn print_stacktrace_data(stacktrace: &StackTrace, display_limit: usize, embedded: bool) {
-    print_stacktrace_data_with(stacktrace, display_limit, embedded, StackColumns::default());
+pub fn print_stacktrace_data(
+    arch: Arch,
+    stacktrace: &StackTrace,
+    display_limit: usize,
+    embedded: bool,
+) {
+    print_stacktrace_data_with(
+        arch,
+        stacktrace,
+        display_limit,
+        embedded,
+        StackColumns::default(),
+    );
 }
 
 pub fn print_stacktrace_data_with_provenance(
+    arch: Arch,
     stacktrace: &StackTrace,
     display_limit: usize,
     embedded: bool,
@@ -545,7 +600,7 @@ pub fn print_stacktrace_data_with_provenance(
         provenance: true,
         ..StackColumns::default()
     };
-    print_stacktrace_data_with(stacktrace, display_limit, embedded, columns);
+    print_stacktrace_data_with(arch, stacktrace, display_limit, embedded, columns);
 }
 
 /// The optional columns of the `k` family: `kv`'s provenance and `kf`'s
@@ -567,7 +622,10 @@ pub fn frame_size_cell(previous_sp: Option<u64>, sp: u64) -> String {
     }
 }
 
-fn format_source_location(location: &SourceLocation) -> String {
+/// A frame's source line, `[local /checkout/driver.c:42:7]`: the local copy
+/// when `.srcpath` maps one, else the path the PDB records. A local copy
+/// that matches is a link that opens it.
+pub fn format_source_location(location: &SourceLocation) -> String {
     let (label, path) = match &location.local {
         Some(local) => (
             match local.state {
@@ -579,27 +637,145 @@ fn format_source_location(location: &SourceLocation) -> String {
         ),
         None => ("recorded", location.file.clone()),
     };
-    match location.column {
+    let text = match location.column {
         Some(column) => format!("[{label} {path}:{}:{column}]", location.line),
         None => format!("[{label} {path}:{}]", location.line),
+    };
+    match &location.local {
+        Some(local) if local.state == LocalSourceState::Found => ui::file_link(&local.path, &text),
+        _ => text,
     }
 }
 
+/// What a stack walk on `arch` crossed between a frame and its caller:
+/// `user mode` where the kernel was entered from user code, `trap` where a
+/// trap or interrupt stopped the caller within the same mode.
+pub fn crossing(arch: Arch, callee: &StackFrame, caller: &StackFrame) -> Option<&'static str> {
+    let kernel = |frame: &StackFrame| looks_like_kernel_pointer(arch, frame.ip);
+    if kernel(callee) && !kernel(caller) {
+        Some("user mode")
+    } else if caller.machine_frame.is_some() {
+        Some("trap")
+    } else {
+        None
+    }
+}
+
+/// A muted `┄┄ label ┄┄┄` line between two frames, `indent` columns in.
+pub fn crossing_line(label: &str, indent: usize) -> String {
+    const LENGTH: usize = 40;
+    let head = format!("┄┄ {label} ");
+    let rest = LENGTH.saturating_sub(head.chars().count());
+    ui::muted(&format!("{:indent$}{head}{}", "", "┄".repeat(rest)))
+}
+
 pub fn print_stacktrace_data_with(
+    arch: Arch,
     stacktrace: &StackTrace,
     display_limit: usize,
     embedded: bool,
     columns: StackColumns,
 ) {
-    let indent = if embedded { "  " } else { "" };
-    if embedded {
-        print_section("stack");
+    let placement = if embedded {
+        StackPlacement::Section
+    } else {
+        StackPlacement::Standalone
+    };
+    print_stack_frames(arch, stacktrace, 0, display_limit, placement, columns);
+}
+
+/// A stop's stack from frame `from`, the frames above it folded into one
+/// line: at a bugcheck, the bugcheck's own frames above the frame that
+/// faulted. Every frame keeps its number, as `.frame` takes it.
+pub fn print_stop_stack(arch: Arch, stacktrace: &StackTrace, from: usize, display_limit: usize) {
+    print_stack_frames(
+        arch,
+        stacktrace,
+        from,
+        display_limit,
+        StackPlacement::Section,
+        StackColumns::default(),
+    );
+}
+
+/// A stack under the line of a report naming its thread, `indent` in, with
+/// no heading of its own: one of several in `!analyze -hang` or the 0x9F
+/// report.
+pub fn print_indented_stack(
+    arch: Arch,
+    stacktrace: &StackTrace,
+    display_limit: usize,
+    indent: &str,
+) {
+    print_stack_frames(
+        arch,
+        stacktrace,
+        0,
+        display_limit,
+        StackPlacement::Indented(indent),
+        StackColumns::default(),
+    );
+}
+
+/// Where a stack sits in the output.
+enum StackPlacement<'a> {
+    /// `k`'s own listing: flush left, with the child-SP column.
+    Standalone,
+    /// A section of a longer display, as the stop's: a `stack` heading,
+    /// then the frames indented under it.
+    Section,
+    /// Under a report's line naming its thread, this far in, with no
+    /// heading.
+    Indented(&'a str),
+}
+
+fn print_stack_frames(
+    arch: Arch,
+    stacktrace: &StackTrace,
+    from: usize,
+    display_limit: usize,
+    placement: StackPlacement<'_>,
+    columns: StackColumns,
+) {
+    let indent = match placement {
+        StackPlacement::Standalone => "",
+        StackPlacement::Section => {
+            print_section("stack");
+            "  "
+        }
+        StackPlacement::Indented(indent) => indent,
+    };
+    // `k`'s own listing has the child-SP column; a stack inside another
+    // display leaves it out: the return address is what to act on there.
+    let with_sp = matches!(placement, StackPlacement::Standalone);
+    if with_sp && !stacktrace.frames.is_empty() {
+        print_stack_header(columns);
     }
 
-    let shown = stacktrace.frames.len().min(display_limit);
+    let from = from.min(stacktrace.frames.len());
+    let end = stacktrace.frames.len().min(from + display_limit);
+    if from > 0 {
+        let folded = &stacktrace.frames[..from];
+        let range = match from {
+            1 => "00".to_string(),
+            _ => format!("00\u{2013}{:02}", from - 1),
+        };
+        let name = |frame: &StackFrame| frame.symbol.clone();
+        let ends = match folded {
+            [only] => name(only),
+            [first, .., last] => format!("{} \u{2026} {}", name(first), name(last)),
+            [] => String::new(),
+        };
+        outln!("{indent}{}", ui::muted(&format!("{range}  {ends}")));
+    }
 
     let mut previous_sp = None;
-    for (num, frame) in stacktrace.frames.iter().take(shown).enumerate() {
+    for (num, frame) in stacktrace.frames.iter().enumerate().take(end).skip(from) {
+        if num > 0
+            && let Some(label) = crossing(arch, &stacktrace.frames[num - 1], frame)
+        {
+            outln!("{}", crossing_line(label, indent.len() + 4));
+        }
         if columns.frame_size {
             let size = if frame.inline {
                 frame_size_cell(None, frame.sp)
@@ -607,20 +783,20 @@ pub fn print_stacktrace_data_with(
                 frame_size_cell(previous_sp.replace(frame.sp), frame.sp)
             };
             outln!(
-                "{indent}{} {} {}",
-                ui::muted(&format!("#{num:<2}")),
+                "{indent}{}{} {}",
+                frame_number(num, with_sp),
                 size,
-                format_stack_frame(None, frame, !embedded, columns.provenance)
+                format_stack_frame(None, frame, with_sp, columns.provenance)
             );
         } else {
             outln!(
                 "{indent}{}",
-                format_stack_frame(Some(num), frame, !embedded, columns.provenance)
+                format_stack_frame(Some(num), frame, with_sp, columns.provenance)
             );
         }
     }
 
-    let hidden = stacktrace.frames.len().saturating_sub(display_limit) + stacktrace.truncated;
+    let hidden = stacktrace.frames.len().saturating_sub(end) + stacktrace.truncated;
     if hidden > 0 {
         outln!("{indent}{}", more_frames(hidden));
     }
@@ -630,6 +806,35 @@ pub fn print_stacktrace_data_with(
 /// family and `.frame`.
 pub fn inline_tag() -> String {
     "[inline]".bright_black().to_string()
+}
+
+/// The `k` layout's column header, as WinDbg prints one: the frame number,
+/// `kf`'s frame size, the child SP, the frame's instruction address, and the
+/// call site.
+pub fn print_stack_header(columns: StackColumns) {
+    let memory = if columns.frame_size {
+        format!("{:>8} ", "Memory")
+    } else {
+        String::new()
+    };
+    outln!(
+        " {:>2} {memory}{:<16}  {:<16}  Call Site",
+        "#",
+        "Child-SP",
+        "IP"
+    );
+}
+
+/// A frame's call site as the `k` layout shows it: its symbol, or its raw
+/// address `0x…` when it has none, as WinDbg's Call Site does.
+pub fn call_site(frame: &StackFrame) -> String {
+    if frame.symbol.is_empty() {
+        format!("{:#x}", frame.ip)
+    } else if frame.symbol.starts_with("0x") {
+        frame.symbol.clone()
+    } else {
+        ui::symbol(&frame.symbol)
+    }
 }
 
 /// One frame line in `k`'s layout: the frame `number` when given, the child
@@ -645,18 +850,14 @@ pub fn format_stack_frame(
 ) -> String {
     let mut line = String::new();
     if let Some(number) = number {
-        line.push_str(&ui::muted(&format!("#{number:<2}")));
-        line.push(' ');
+        line.push_str(&frame_number(number, with_sp));
     }
     if with_sp {
         line.push_str(&ui::addr(frame.sp));
         line.push_str("  ");
     }
     line.push_str(&ui::addr(frame.ip));
-    let mut annotations = Vec::new();
-    if !frame.symbol.starts_with("0x") {
-        annotations.push(ui::symbol(&frame.symbol));
-    }
+    let mut annotations = vec![call_site(frame)];
     if frame.inline {
         annotations.push(inline_tag());
     }
@@ -671,16 +872,27 @@ pub fn format_stack_frame(
     if let Some(location) = frame.source_location.as_ref() {
         annotations.push(format_source_location(location).bright_black().to_string());
     }
-    if !annotations.is_empty() {
-        line.push_str("  ");
-        line.push_str(&annotations.join(" "));
-    }
+    // Two spaces between the call site and each tag, as `k` spaces them.
+    line.push_str("  ");
+    line.push_str(&annotations.join("  "));
     line
+}
+
+/// A frame's number as `k` writes it (`00`), with the space after it: in
+/// `k`'s layout (`with_sp`) behind the column `k` marks the selected frame
+/// in, else muted, as the stop's stack shows it.
+fn frame_number(number: usize, with_sp: bool) -> String {
+    if with_sp {
+        format!(" {number:02} ")
+    } else {
+        format!("{}  ", ui::muted(&format!("{number:02}")))
+    }
 }
 
 /// The note under a stack for the frames not shown or not walked.
 pub fn more_frames(hidden: usize) -> String {
-    format!("... {hidden} more frames")
+    let noun = if hidden == 1 { "frame" } else { "frames" };
+    format!("... {hidden} more {noun}")
         .bright_black()
         .to_string()
 }
@@ -688,16 +900,8 @@ pub fn more_frames(hidden: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base::output::strip_ansi;
     use crate::nt::symbols::LocalSource;
-
-    #[test]
-    fn stop_disassembly_starts_at_rip_and_only_looks_forward() {
-        let rip = 0xffff_f807_c0e1_3ae0;
-        let rows = decode_disasm_context(&[0x90; 8], rip, CodeMachine::Amd64, |_| String::new());
-        let ips = rows.iter().map(|row| row.ip).collect::<Vec<_>>();
-
-        assert_eq!(ips, (rip..rip + 7).collect::<Vec<_>>());
-    }
 
     #[test]
     fn cpsr_flags_align_under_hex_digits() {
@@ -727,7 +931,7 @@ mod tests {
             ..recorded
         };
         assert_eq!(
-            format_source_location(&local),
+            strip_ansi(&format_source_location(&local)),
             "[local /checkout/driver.c:42:7]"
         );
     }

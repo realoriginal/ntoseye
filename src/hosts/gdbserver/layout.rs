@@ -9,9 +9,8 @@
 
 use std::fmt::Write as _;
 
-use crate::backend::dbg_backend::RegisterMap;
+use crate::arch::{Arch, RegisterMap};
 use crate::base::error::{Error, Result};
-use crate::base::types::Arch;
 
 struct WireRegister {
     name: String,
@@ -31,12 +30,12 @@ pub struct Layout {
 impl Layout {
     /// The layout for `arch` over a transport whose registers `map` names.
     pub fn new(arch: Arch, map: &RegisterMap) -> Self {
-        let (architecture, mut registers) = match arch {
-            Arch::Amd64 => ("i386:x86-64", amd64()),
-            Arch::Arm64 => ("aarch64", arm64()),
+        let mut registers = match arch {
+            Arch::Amd64 => amd64(),
+            Arch::Arm64 => arm64(),
         };
         registers.retain(|register| !register.optional || map.info(&register.name).is_some());
-        let target_xml = target_xml(architecture, &registers);
+        let target_xml = target_xml(arch.gdb_architecture(), &registers);
         Self {
             registers,
             target_xml,
@@ -328,8 +327,7 @@ fn arm64() -> Vec<WireRegister> {
 #[cfg(test)]
 mod tests {
     use super::Layout;
-    use crate::backend::cpu_context::amd64::{REGISTER_BUFFER_SIZE, build_register_map};
-    use crate::base::types::Arch;
+    use crate::arch::{Arch, amd64::REGISTER_BUFFER_SIZE};
 
     /// Byte offset of a register on the wire: its position in the AMD64
     /// description (rax..r15, rip, eflags, six segments, eight x87 stack
@@ -377,7 +375,7 @@ mod tests {
     /// into every register after the first mismatch.
     #[test]
     fn kd_register_file_encodes_at_gdb_offsets() {
-        let map = build_register_map();
+        let map = Arch::Amd64.register_map();
         let mut file = vec![0u8; REGISTER_BUFFER_SIZE];
         map.write_u64("rip", &mut file, 0xffff_f800_1234_5678)
             .unwrap();
@@ -385,8 +383,8 @@ mod tests {
         map.write_u64("xmm0l", &mut file, 0x1122_3344_5566_7788)
             .unwrap();
 
-        let layout = Layout::new(Arch::Amd64, &map);
-        let wire = layout.encode(&map, &file);
+        let layout = Layout::new(Arch::Amd64, map);
+        let wire = layout.encode(map, &file);
 
         let rip = wire_offset("rip");
         let rip_bytes: Vec<u8> = wire[rip..rip + 8].iter().map(|b| b.unwrap()).collect();
@@ -413,24 +411,24 @@ mod tests {
     /// offsets and widths, skipping what the transport lacks.
     #[test]
     fn register_payload_round_trips_through_the_kd_file() {
-        let map = build_register_map();
+        let map = Arch::Amd64.register_map();
         let mut file = vec![0u8; REGISTER_BUFFER_SIZE];
         map.write_u64("rsp", &mut file, 0xffff_8000_0000_1000)
             .unwrap();
-        let layout = Layout::new(Arch::Amd64, &map);
+        let layout = Layout::new(Arch::Amd64, map);
 
         let mut wire: Vec<u8> = layout
-            .encode(&map, &file)
+            .encode(map, &file)
             .into_iter()
             .map(|byte| byte.unwrap_or(0xAA))
             .collect();
         let rip = wire_offset("rip");
         wire[rip..rip + 8].copy_from_slice(&0xffff_f800_0000_4000u64.to_le_bytes());
-        layout.decode(&map, &mut file, &wire).unwrap();
+        layout.decode(map, &mut file, &wire).unwrap();
 
         assert_eq!(map.read_u64("rip", &file).unwrap(), 0xffff_f800_0000_4000);
         assert_eq!(map.read_u64("rsp", &file).unwrap(), 0xffff_8000_0000_1000);
-        assert!(layout.decode(&map, &mut file, &wire[1..]).is_err());
+        assert!(layout.decode(map, &mut file, &wire[1..]).is_err());
     }
 
     /// gdb files the segment bases and system registers under `general`, which
@@ -440,8 +438,8 @@ mod tests {
     /// stays and reads as unavailable.
     #[test]
     fn optional_registers_the_transport_lacks_are_not_described() {
-        let map = build_register_map();
-        let xml = Layout::new(Arch::Amd64, &map).target_xml().to_string();
+        let map = Arch::Amd64.register_map();
+        let xml = Layout::new(Arch::Amd64, map).target_xml().to_string();
         for absent in ["\"fs_base\"", "\"gs_base\"", "\"k_gs_base\""] {
             assert!(!xml.contains(absent), "{absent} described");
         }

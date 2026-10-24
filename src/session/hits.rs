@@ -2,13 +2,12 @@
 //! that thread, processor, hypercall-caller, pass-count, or condition
 //! filters reject.
 
+use crate::arch::{Arch, Family, HardwareWatch, HwBreakpointAccess, RegisterMap};
 use crate::backend::dbg_backend::{
-    ContinueDisposition, DebugBackend, HW_BREAKPOINT_SLOTS, HwBreakpointAccess, RegisterMap,
-    StopEvent, debug_registers, processor_index_from_backend_thread_id,
+    ContinueDisposition, DebugBackend, StopEvent, processor_index_from_backend_thread_id,
 };
 use crate::base::error::{Error, Result};
 use crate::base::notice::Notice;
-use crate::base::types::Arch;
 use crate::nt::breakpoints::{
     BreakpointHitDisposition, BreakpointHitResult, BreakpointInfo, BreakpointManager, ThreadScope,
 };
@@ -131,7 +130,7 @@ impl Session {
         self.backend
             .read_registers()
             .ok()
-            .and_then(|registers| stack_pointer(&self.register_map, &registers))
+            .and_then(|registers| stack_pointer(self.target.arch(), &self.register_map, &registers))
             .is_none_or(|sp| sp >= min)
     }
 
@@ -166,7 +165,9 @@ impl Session {
             return Ok(false);
         }
         let regs = self.backend.read_registers()?;
-        let rsp = self.register_map.read_u64("rsp", &regs)?;
+        let rsp = self
+            .register_map
+            .read_u64(self.target.arch().sp_register(), &regs)?;
         Ok(self.breakpoints.take_interrupted_hit(rip, rsp))
     }
 }
@@ -275,12 +276,9 @@ pub fn evaluate_hit_condition(
     held
 }
 
-/// The stack pointer in `registers` (`rsp`, or AArch64's `sp`).
-pub fn stack_pointer(register_map: &RegisterMap, registers: &[u8]) -> Option<u64> {
-    register_map
-        .read_u64("rsp", registers)
-        .or_else(|_| register_map.read_u64("sp", registers))
-        .ok()
+/// The stack pointer in `registers`, `arch`'s [`Arch::sp_register`].
+pub fn stack_pointer(arch: Arch, register_map: &RegisterMap, registers: &[u8]) -> Option<u64> {
+    register_map.read_u64(arch.sp_register(), registers).ok()
 }
 
 /// If `event` is a hardware-debug stop, return the breakpoint that fired.
@@ -309,6 +307,7 @@ pub fn hardware_breakpoint_hit(
     register_map: &RegisterMap,
     breakpoints: &BreakpointManager,
     event: &StopEvent,
+    arch: Arch,
 ) -> Result<Option<BreakpointInfo>> {
     if event.is_bugcheck || !breakpoints.has_enabled_hardware_breakpoints() {
         return Ok(None);
@@ -326,53 +325,49 @@ pub fn hardware_breakpoint_hit(
 
     // Debug-register evidence only means anything on the debug exception, and
     // checking that here is what keeps an ordinary stop from fetching
-    // registers. A transport that exposes no debug registers reports no
-    // exception code either, so it has no such gate to pass.
-    let debug_registers = register_map.contains("dr6") || register_map.contains("bcr0");
-    if debug_registers && event.exception_code != Some(STATUS_SINGLE_STEP) {
+    // registers. A transport that exposes no debug registers (a GDB stub owns
+    // them) reports no exception code either, so it has no such gate to pass.
+    let debug_registers = arch.debug_registers();
+    let exposed = debug_registers.exposed_in(register_map);
+    if exposed && event.exception_code != Some(STATUS_SINGLE_STEP) {
         return Ok(None);
     }
 
     let mut regs = backend.read_registers()?;
-    let Ok(dr6) = register_map.read_u64("dr6", &regs) else {
-        if !debug_registers {
-            return execute_breakpoint_at_pc(
-                backend,
-                register_map,
-                breakpoints,
-                slots,
-                event,
-                &mut regs,
-            );
-        }
-        return arm64_hardware_breakpoint_hit(register_map, breakpoints, event, &regs);
-    };
-
-    let hit = (0..HW_BREAKPOINT_SLOTS)
-        .filter(|slot| dr6 & (1u64 << slot) != 0)
-        .find_map(|slot| breakpoints.hardware_breakpoint_for_slot(usize::from(slot)));
-
-    let mut dirty = false;
-    // Clear the B0-B3 status bits so the next single-step is unambiguous; the
-    // CPU never clears them itself, but leave the rest of DR6 intact.
-    let cleared = dr6 & !0b1111u64;
-    if cleared != dr6 {
-        register_map.write_u64("dr6", &mut regs, cleared)?;
-        dirty = true;
+    if !exposed {
+        return execute_breakpoint_at_pc(
+            backend,
+            register_map,
+            breakpoints,
+            slots,
+            event,
+            &mut regs,
+            arch,
+        );
     }
+    let pc = register_map
+        .read_u64(arch.pc_register(), &regs)
+        .unwrap_or_else(|_| event.program_counter.unwrap_or(0));
+    let armed = |slot| {
+        let bp = breakpoints.hardware_breakpoint_for_slot(slot)?;
+        bp.hardware.map(|hw| HardwareWatch {
+            address: bp.address.0,
+            access: hw.access,
+            len: hw.len,
+        })
+    };
+    let hit = debug_registers
+        .fired_slot(register_map, &regs, pc, &armed)
+        .and_then(|slot| breakpoints.hardware_breakpoint_for_slot(slot));
+
+    let mut dirty = debug_registers.clear_status(register_map, &mut regs);
     if hit
         .as_ref()
         .and_then(|bp| bp.hardware)
         .is_some_and(|hw| hw.access == HwBreakpointAccess::Execute)
     {
-        let eflags = register_map.read_u64("eflags", &regs)?;
-        const RF: u64 = 1 << 16;
-        if eflags & RF == 0 {
-            register_map.write_u64("eflags", &mut regs, eflags | RF)?;
-            dirty = true;
-        }
+        dirty |= debug_registers.resume_past_execute(register_map, &mut regs);
     }
-
     if dirty {
         backend.write_registers(&regs)?;
     }
@@ -444,10 +439,10 @@ fn execute_breakpoint_at_pc(
     slots: usize,
     event: &StopEvent,
     regs: &mut [u8],
+    arch: Arch,
 ) -> Result<Option<BreakpointInfo>> {
     let Some(pc) = register_map
-        .read_u64("rip", regs)
-        .or_else(|_| register_map.read_u64("pc", regs))
+        .read_u64(arch.pc_register(), regs)
         .ok()
         .or(event.program_counter)
     else {
@@ -463,87 +458,11 @@ fn execute_breakpoint_at_pc(
         });
 
     if hit.is_some()
-        && let Ok(eflags) = register_map.read_u64("eflags", regs)
+        && arch
+            .debug_registers()
+            .resume_past_execute(register_map, regs)
     {
-        const RF: u64 = 1 << 16;
-        if eflags & RF == 0 {
-            register_map.write_u64("eflags", regs, eflags | RF)?;
-            backend.write_registers(regs)?;
-        }
-    }
-
-    Ok(hit)
-}
-
-fn arm64_hardware_breakpoint_hit(
-    register_map: &RegisterMap,
-    breakpoints: &BreakpointManager,
-    event: &StopEvent,
-    regs: &[u8],
-) -> Result<Option<BreakpointInfo>> {
-    let pc = register_map
-        .read_u64("pc", regs)
-        .or_else(|_| register_map.read_u64("rip", regs))
-        .unwrap_or_else(|_| event.program_counter.unwrap_or(0));
-    let far = register_map.read_u64("far", regs).unwrap_or(0);
-    let mut hit = None;
-
-    // ARM64 WVR values are granule-aligned and WCR.BAS identifies the bytes
-    // that caused the data watchpoint. Require FAR as evidence: without it a
-    // plain single-step must not be mistaken for a data breakpoint.
-    if far != 0 {
-        for slot in debug_registers::ARM64_WATCHPOINT_SLOTS {
-            let Some(bp) = breakpoints.hardware_breakpoint_for_slot(usize::from(slot)) else {
-                continue;
-            };
-            let Some(hw) = bp.hardware else { continue };
-            if hw.access == HwBreakpointAccess::Execute {
-                continue;
-            }
-            let control = register_map
-                .read_u64(format!("wcr{slot}"), regs)
-                .unwrap_or(0);
-            let value = register_map
-                .read_u64(format!("wvr{slot}"), regs)
-                .unwrap_or(0);
-            if control & 1 == 0 || value != far & !7 {
-                continue;
-            }
-            let bas = ((control >> 5) & 0xff) as u8;
-            let far_bit = 1u8 << (far & 7);
-            let in_requested_range = bp
-                .address
-                .0
-                .checked_add(hw.len as u64)
-                .is_some_and(|end| far >= bp.address.0 && far < end);
-            if bas & far_bit != 0 && in_requested_range {
-                hit = Some(bp);
-                break;
-            }
-        }
-    }
-
-    if hit.is_none() {
-        for slot in debug_registers::ARM64_BREAKPOINT_SLOTS {
-            let Some(bp) = breakpoints.hardware_breakpoint_for_slot(usize::from(slot)) else {
-                continue;
-            };
-            let Some(hw) = bp.hardware else { continue };
-            if hw.access != HwBreakpointAccess::Execute {
-                continue;
-            }
-            let index = slot - debug_registers::ARM64_BREAKPOINT_SLOTS.start;
-            let control = register_map
-                .read_u64(format!("bcr{index}"), regs)
-                .unwrap_or(0);
-            let value = register_map
-                .read_u64(format!("bvr{index}"), regs)
-                .unwrap_or(0);
-            if control & 1 != 0 && value == pc & !3 && bp.address.0 == pc {
-                hit = Some(bp);
-                break;
-            }
-        }
+        backend.write_registers(regs)?;
     }
 
     Ok(hit)
@@ -563,13 +482,15 @@ pub fn resolve_watchpoint_stop(
     current_thread: &mut String,
     event: &StopEvent,
 ) -> Result<WatchpointStopAction> {
-    let Some(breakpoint) = hardware_breakpoint_hit(backend, register_map, breakpoints, event)?
+    let arch = target.arch();
+    let Some(breakpoint) =
+        hardware_breakpoint_hit(backend, register_map, breakpoints, event, arch)?
     else {
         if step_trace_enabled() && breakpoints.has_enabled_hardware_breakpoints() {
             let pc = backend
                 .read_registers()
                 .ok()
-                .and_then(|registers| register_map.read_u64("rip", &registers).ok());
+                .and_then(|registers| register_map.read_u64(arch.pc_register(), &registers).ok());
             // What the match was made against: an armed site at `pc` should
             // have been found, so a stop here with one names the gap.
             let armed = breakpoints
@@ -598,10 +519,12 @@ pub fn resolve_watchpoint_stop(
     set_current_thread_from_stop(backend, event, current_thread);
     let registers = backend.read_registers()?;
     let scope_dtb = register_map
-        .read_u64(target.arch().dtb_register(), &registers)
+        .read_u64(arch.dtb_register(), &registers)
         .unwrap_or(0);
-    let rip = register_map.read_u64("rip", &registers).unwrap_or(0);
-    let sp = stack_pointer(register_map, &registers);
+    let rip = register_map
+        .read_u64(arch.pc_register(), &registers)
+        .unwrap_or(0);
+    let sp = stack_pointer(arch, register_map, &registers);
     step_trace!(
         "hardware breakpoint #{} at {:#x} hit on {current_thread} at {rip:#x}",
         breakpoint.id,
@@ -609,7 +532,7 @@ pub fn resolve_watchpoint_stop(
     );
     let declined = |reason: &str| step_trace!("#{} declined: {reason}", breakpoint.id);
     update_target_context_from_registers(target, register_map, Ok(registers));
-    if !breakpoint.scope.matches_dtb(scope_dtb, target.arch()) {
+    if !breakpoint.scope.matches_dtb(scope_dtb, arch) {
         declined("another address space");
         return Ok(WatchpointStopAction::Declined);
     }
@@ -724,13 +647,17 @@ pub fn rewind_thread_off_breakpoint(
     breakpoints: &BreakpointManager,
     arch: Arch,
 ) {
-    if arch == Arch::Arm64 {
-        return;
+    // Only x86's `int3` leaves the program counter past the breakpoint.
+    match arch.family() {
+        Family::X86 => {}
+        Family::Arm => return,
     }
     let Ok(regs) = backend.read_registers() else {
         return;
     };
-    let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
+    let rip = register_map
+        .read_u64(arch.pc_register(), &regs)
+        .unwrap_or(0);
     let cr3 = register_map
         .read_u64(arch.dtb_register(), &regs)
         .unwrap_or(0);
@@ -744,7 +671,10 @@ pub fn rewind_thread_off_breakpoint(
         return;
     }
     let mut adjusted = regs.clone();
-    if register_map.write_u64("rip", &mut adjusted, prev).is_err() {
+    if register_map
+        .write_u64(arch.pc_register(), &mut adjusted, prev)
+        .is_err()
+    {
         return;
     }
     let _ = backend.write_registers(&adjusted);

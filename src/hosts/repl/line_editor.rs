@@ -10,18 +10,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use owo_colors::OwoColorize;
 use std::borrow::Cow;
 
-use crate::hosts::ui;
+use crate::backend::dbg_backend::thread_label;
+use crate::base::output;
+use crate::hosts::repl::*;
 use crate::nt::expr::Expr;
 use crate::nt::layout::ParsedType;
-
-use crate::hosts::repl::*;
 
 /// The most symbols or types one completion search returns: past it the
 /// completer stops looking, so a list this long may leave matches out.
 pub const SEARCH_LIMIT: usize = 1024;
 
-/// The REPL prompt, e.g. `kd:p1.1>`: transport muted, thread in the cyan
-/// identity accent. Rebuilt each read_line so it tracks thread switches.
+/// The REPL prompt, WinDbg's `3: kd>`: the processor (or a user-mode dump's
+/// thread) in the cyan identity accent, the backend muted. Rebuilt each
+/// read_line so it tracks switches.
 #[derive(Clone)]
 pub struct CustomPrompt {
     pub left: String,
@@ -29,16 +30,23 @@ pub struct CustomPrompt {
 const DEFAULT_MULTILINE_INDICATOR: &str = "     ::: ";
 
 impl CustomPrompt {
+    /// The prompt for `thread`, as [`ReplState::prompt_thread`] names it,
+    /// on `backend`.
     pub fn new(backend: &str, thread: &str) -> Self {
         let left = if thread.is_empty() {
             "ntoseye>".bright_black().to_string()
         } else {
+            // WinDbg's `3: kd>`: the processor, then the backend.
             format!(
-                "{}{}{}",
-                format!("{backend}:").bright_black(),
-                ui::thread_id(thread),
-                ">".bright_black()
+                "{}{}",
+                thread.cyan(),
+                format!(": {backend}>").bright_black()
             )
+        };
+        let left = if output::stdout_styled() {
+            left
+        } else {
+            output::strip_ansi(&left)
         };
         CustomPrompt { left }
     }
@@ -375,10 +383,11 @@ impl MyCompleter {
                 let vcpus = self.caches.vcpus.read().unwrap();
                 vcpus
                     .iter()
-                    .filter(|tid| tid.starts_with(input.prefix))
-                    .map(|tid| Suggestion {
-                        value: tid.clone(),
-                        description: Some("vCPU".to_string()),
+                    .map(|tid| thread_label(tid))
+                    .filter(|label| label.starts_with(input.prefix))
+                    .map(|label| Suggestion {
+                        value: label,
+                        description: Some("processor".to_string()),
                         style: None,
                         extra: None,
                         match_indices: None,

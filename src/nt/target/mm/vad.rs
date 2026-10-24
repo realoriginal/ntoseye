@@ -22,7 +22,7 @@ impl Target {
     /// `address` command, the MCP tool, and the SDK.
     pub fn describe_address(&self, address: VirtAddr) -> Result<AddressDescription> {
         let dtb = self.current_dtb();
-        let is_kernel = address.0 >= 0xffff_0000_0000_0000;
+        let is_kernel = self.arch().paging().is_kernel_address(address);
 
         // 1. Loaded module containment (kernel list for kernel VAs, else the
         // current scope's user modules).
@@ -116,7 +116,11 @@ impl Target {
     /// it adapts per build. `MiVisibleState` is a pointer to `_MI_VISIBLE_STATE`.
     fn kernel_va_region(&self, address: VirtAddr) -> Option<String> {
         let ntos = &self.guest.as_ref()?.ntoskrnl;
-        let range_start: VirtAddr = ntos.symbol("MmSystemRangeStart").ok()?.read().ok()?;
+        let range_start = ntos
+            .symbol("MmSystemRangeStart")
+            .ok()?
+            .read_pointer()
+            .ok()?;
         if address.0 < range_start.0 {
             return None;
         }
@@ -130,7 +134,7 @@ impl Target {
             return None;
         }
 
-        let vs: VirtAddr = ntos.symbol("MiVisibleState").ok()?.read().ok()?;
+        let vs = ntos.symbol("MiVisibleState").ok()?.read_pointer().ok()?;
         let type_off = ntos
             .types()
             .layout("_MI_VISIBLE_STATE")
@@ -179,8 +183,8 @@ impl Target {
                 continue;
             }
 
-            let left = vad_tree_link(memory.read(node + offsets.left)?);
-            let right = vad_tree_link(memory.read(node + offsets.right)?);
+            let left = vad_tree_link(memory.read_pointer(node + offsets.left)?.0);
+            let right = vad_tree_link(memory.read_pointer(node + offsets.right)?.0);
             if !right.is_zero() {
                 stack.push((right, level.saturating_add(1)));
             }
@@ -213,9 +217,11 @@ impl Target {
         if let Ok(tree_layout) = types.layout("_RTL_AVL_TREE")
             && let Ok(root_offset) = tree_layout.field_offset("Root")
         {
-            return Ok(vad_tree_link(memory.read(vad_root_base + root_offset)?));
+            return Ok(vad_tree_link(
+                memory.read_pointer(vad_root_base + root_offset)?.0,
+            ));
         }
-        Ok(vad_tree_link(memory.read(vad_root_base)?))
+        Ok(vad_tree_link(memory.read_pointer(vad_root_base)?.0))
     }
 
     fn read_integer_field(

@@ -2,6 +2,7 @@
 //! header and section reads, the export directory, version resources, and
 //! mapping an on-disk image file to its in-memory layout.
 
+use crate::arch::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386};
 use crate::base::{
     bytes::{get_u16, get_u32, read_u16, read_u32},
     error::{Error, Result},
@@ -306,9 +307,6 @@ pub fn image_base(view: &PeView<'_>) -> u64 {
     }
 }
 
-const IMAGE_FILE_MACHINE_I386: u16 = 0x14c;
-const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
-const IMAGE_FILE_MACHINE_ARM64: u16 = 0xaa64;
 /// `CHPEMetadataPointer` in `IMAGE_LOAD_CONFIG_DIRECTORY64`: a virtual
 /// address, relocated like the image.
 const LOAD_CONFIG_CHPE_METADATA: usize = 0xc8;
@@ -955,7 +953,7 @@ mod tests {
     fn open_image(memory: &Arc<ImageMemory>) -> PeImage {
         let memory = Arc::clone(memory);
         read_pe_image(VirtAddr(memory.base), move |address, buf| {
-            AddressSpace::new(&memory, DTB_IDENTITY).read_bytes(address, buf)
+            AddressSpace::new_amd64(&memory, DTB_IDENTITY).read_bytes(address, buf)
         })
         .unwrap()
     }
@@ -1200,14 +1198,14 @@ mod tests {
     fn read_pe_header_page_extends_past_probe_only_when_needed() {
         let base = 0x10_0000u64;
         let memory = ImageMemory::new(base, synthetic_image());
-        let space = AddressSpace::new(&memory, DTB_IDENTITY);
+        let space = AddressSpace::new_amd64(&memory, DTB_IDENTITY);
         let header = read_pe_header_page(VirtAddr(base), &space).unwrap();
         assert_eq!(memory.bytes_read(), PE_HEADER_PROBE);
         assert_eq!(&header[..PE_HEADER_PROBE], &memory.bytes[..PE_HEADER_PROBE]);
 
         let late_pe = PE_HEADER_PROBE - 0x40;
         let memory = ImageMemory::new(base, synthetic_image_with_pe_at(late_pe));
-        let space = AddressSpace::new(&memory, DTB_IDENTITY);
+        let space = AddressSpace::new_amd64(&memory, DTB_IDENTITY);
         let header = read_pe_header_page(VirtAddr(base), &space).unwrap();
         let table_end = late_pe + 24 + 240 + 2 * 40;
         assert_eq!(memory.bytes_read(), table_end);

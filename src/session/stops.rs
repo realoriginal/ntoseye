@@ -9,8 +9,8 @@ use crate::backend::dbg_backend::{
 };
 use crate::base::error::Result;
 use crate::base::memory::MemoryOps;
-use crate::base::types::{Arch, VirtAddr};
-use crate::nt::breakpoints::{BreakpointInfo, BreakpointManager, breakpoint_opcode};
+use crate::base::types::VirtAddr;
+use crate::nt::breakpoints::{BreakpointInfo, BreakpointManager};
 use crate::nt::guest::{ModuleInfo, ProcessInfo};
 use crate::nt::target::{BreakpointStop, HYPERVISOR_CONTEXT, ThreadInfo};
 use crate::nt::unwind::{UNKNOWN_CONTEXT, thread_root, try_format_symbol_at};
@@ -234,9 +234,11 @@ impl Session {
             } else {
                 let _ = self.backend.set_current_thread(&self.current_thread);
                 let registers = self.backend.read_registers().ok();
-                let rip = registers
-                    .as_ref()
-                    .and_then(|regs| self.register_map.read_u64("rip", regs).ok());
+                let rip = registers.as_ref().and_then(|regs| {
+                    self.register_map
+                        .read_u64(self.target.arch().pc_register(), regs)
+                        .ok()
+                });
                 let cr3 = registers.as_ref().and_then(|regs| {
                     self.register_map
                         .read_u64(self.target.arch().dtb_register(), regs)
@@ -310,7 +312,7 @@ impl Session {
             .target
             .registers
             .as_ref()
-            .and_then(|registers| registers.get("rip").copied())
+            .and_then(|registers| registers.get(self.target.arch().pc_register()).copied())
             .unwrap_or(0);
         let resolution = StopResolution::Breakpoint {
             breakpoint: Box::new(breakpoint),
@@ -336,11 +338,11 @@ impl Session {
         let mut event = self.backend.wait_for_stop()?;
         set_current_thread_from_stop(self.backend.as_mut(), &event, &mut self.current_thread);
         if event.program_counter.is_none() {
-            event.program_counter = self
-                .backend
-                .read_registers()
-                .ok()
-                .and_then(|regs| self.register_map.read_u64("rip", &regs).ok());
+            event.program_counter = self.backend.read_registers().ok().and_then(|regs| {
+                self.register_map
+                    .read_u64(self.target.arch().pc_register(), &regs)
+                    .ok()
+            });
         }
         self.record_stop_event(&event);
         match resolve_watchpoint_stop(
@@ -394,11 +396,11 @@ impl Session {
         // reboot heuristic cannot tell a stop in a relocated kernel from an
         // ordinary one, so read it from the thread the stop selected.
         if event.program_counter.is_none() {
-            event.program_counter = self
-                .backend
-                .read_registers()
-                .ok()
-                .and_then(|regs| self.register_map.read_u64("rip", &regs).ok());
+            event.program_counter = self.backend.read_registers().ok().and_then(|regs| {
+                self.register_map
+                    .read_u64(self.target.arch().pc_register(), &regs)
+                    .ok()
+            });
         }
         self.record_stop_event(&event);
 
@@ -433,7 +435,10 @@ impl Session {
                     .map(|module| (kind, module))
             }) {
                 let registers = self.backend.read_registers()?;
-                let rip = self.register_map.read_u64("rip", &registers).unwrap_or(0);
+                let rip = self
+                    .register_map
+                    .read_u64(self.target.arch().pc_register(), &registers)
+                    .unwrap_or(0);
                 update_target_context_from_registers(
                     &mut self.target,
                     &self.register_map,
@@ -480,7 +485,11 @@ impl Session {
         }
 
         if stop_is_stray_single_step(&event, &self.breakpoints) {
-            let _ = clear_trap_flag(self.backend.as_mut(), &self.register_map);
+            let _ = clear_trap_flag(
+                self.target.arch(),
+                self.backend.as_mut(),
+                &self.register_map,
+            );
             self.continue_backend(ContinueDisposition::Handled)?;
             return Ok(StopResolution::Resumed);
         }
@@ -497,7 +506,10 @@ impl Session {
         }
 
         let registers = self.backend.read_registers()?;
-        let rip = self.register_map.read_u64("rip", &registers).unwrap_or(0);
+        let rip = self
+            .register_map
+            .read_u64(self.target.arch().pc_register(), &registers)
+            .unwrap_or(0);
         let cr3 = self
             .register_map
             .read_u64(self.target.arch().dtb_register(), &registers)
@@ -565,7 +577,7 @@ impl Session {
         {
             return false;
         }
-        let opcode = breakpoint_opcode(self.target.arch());
+        let opcode = self.target.arch().breakpoint_instruction();
         let mut bytes = [0u8; 4];
         let bytes = &mut bytes[..opcode.len()];
         self.target
@@ -608,22 +620,14 @@ impl Session {
         rip: u64,
         cr3: u64,
     ) -> Result<StopResolution> {
-        let stack = self
-            .target
-            .register_value("rsp")
-            .or_else(|| self.target.register_value("sp"));
+        let stack = self.target.register_value(self.target.arch().sp_register());
         let repeated = self
             .module_trap_interrupted
             .take_if(|(event, interrupted)| *event == kind && Some(*interrupted) == stack)
             .is_some();
         self.unreported_module_change = self.refresh_modules_on_stop();
-        let argument = match self.target.arch() {
-            Arch::Amd64 => "rdx",
-            Arch::Arm64 => "x1",
-        };
         let module = self
-            .target
-            .register_value(argument)
+            .argument_on_entry(1, |name| self.target.register_value(name))
             .filter(|_| !repeated)
             .and_then(|base| self.module_event_to_surface(kind, VirtAddr(base)));
         if let Some(module) = module {

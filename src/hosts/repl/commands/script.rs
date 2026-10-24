@@ -13,12 +13,11 @@ use ntoseye_macros::command;
 
 use crate::base::diagnostics::print_warning;
 use crate::base::error::Result;
+use crate::hosts::repl::commands::foreach::{substitute, take_delimited};
+use crate::hosts::repl::*;
 use crate::hosts::ui;
 use crate::nt::expr::{Expr, NumberRadix};
 use crate::nt::target::{Target, UserVar};
-
-use crate::hosts::repl::commands::foreach::{substitute, take_delimited};
-use crate::hosts::repl::*;
 
 /// How often `.sleep` looks for Ctrl+C.
 const SLEEP_POLL: Duration = Duration::from_millis(50);
@@ -49,7 +48,7 @@ fn if_statement(
     #[arg(invoked)] name: &str,
 ) -> Result<Flow> {
     if tail.is_empty() {
-        outln!("{}\n", command_help(name));
+        outln!("{}", command_help(name));
         return Ok(Flow::Continue);
     }
     let statement = match parse_if(&tail) {
@@ -236,7 +235,7 @@ fn block(
     #[arg(invoked)] name: &str,
 ) -> Result<Flow> {
     if tail.is_empty() {
-        outln!("{}\n", command_help(name));
+        outln!("{}", command_help(name));
         return Ok(Flow::Continue);
     }
     let (body, rest) = match take_delimited(&tail, '{', '}') {
@@ -273,7 +272,7 @@ fn j(
     #[arg(invoked)] name: &str,
 ) -> Result<Flow> {
     if tail.is_empty() {
-        outln!("{}\n", command_help(name));
+        outln!("{}", command_help(name));
         return Ok(Flow::Continue);
     }
     // `*` in an expression multiplies; a comment is never Command1.
@@ -703,7 +702,7 @@ impl ReplState<'_> {
         parse: fn(&str) -> std::result::Result<LoopStatement<'_>, String>,
     ) -> Result<Flow> {
         if tail.is_empty() {
-            outln!("{}\n", command_help(name));
+            outln!("{}", command_help(name));
             return Ok(Flow::Continue);
         }
         let statement = match parse(tail) {
@@ -765,7 +764,7 @@ impl ReplState<'_> {
 
     fn loop_jump(&mut self, name: &str, tail: &str, jump: Jump) -> Result<Flow> {
         if !tail.is_empty() {
-            outln!("{}\n", command_help(name));
+            outln!("{}", command_help(name));
             return Ok(Flow::Continue);
         }
         if !self.breakable_loop {
@@ -794,7 +793,7 @@ impl ReplState<'_> {
             (unquote_whole(operand), Vec::new())
         };
         if path.is_empty() {
-            outln!("{}\n", command_help("$<"));
+            outln!("{}", command_help("$<"));
             return Ok(Flow::Continue);
         }
         let text = match std::fs::read_to_string(path.as_ref()) {
@@ -857,7 +856,7 @@ impl ReplState<'_> {
             return;
         };
         if expression.is_empty() {
-            outln!("{}\n", command_help("r"));
+            outln!("{}", command_help("r"));
             return;
         }
         let Some(value) = self.eval_or_report(expression) else {

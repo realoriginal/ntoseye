@@ -3,15 +3,13 @@ use std::path::{Path, PathBuf};
 
 use tabled::builder::Builder;
 
-use owo_colors::OwoColorize;
-
 use ntoseye_macros::{command, grammar};
 
 use crate::base::error::{Error, Result};
 use crate::base::types::VirtAddr;
 use crate::hosts::repl::args::{ArgCursor, ArgCx, ArgError, words};
+use crate::hosts::repl::*;
 use crate::hosts::ui;
-use crate::nt::breakpoints::BreakpointManager;
 use crate::nt::expr::{Expr, ExprValue};
 use crate::nt::guest::{ModuleInfo, ModuleSymbolLoadReport};
 use crate::nt::layout::{FieldInfo, nested_layout_name};
@@ -22,8 +20,6 @@ use crate::nt::symbols::{
 use crate::nt::target::{ReloadScope, Target, UserVar};
 use crate::session::Session;
 use crate::session::typeview::TypeView;
-
-use crate::hosts::repl::*;
 
 /// The first word; `x` ignores the words after it, as it always did.
 #[grammar(usage = "[module!]<query>", complete = Symbol)]
@@ -88,39 +84,28 @@ fn x(state: &mut ReplState<'_>, #[arg(parse = first_word)] query: String) -> Res
         }
     }
     if matches.is_empty() {
-        outln!("no symbols match '{}'", query);
-        outln!();
+        outln!("{}", ui::muted(&format!("no symbols matching '{query}'")));
         state.ctx.target.set_results(Vec::new(), state.line.clone());
         return Ok(());
     }
-    let print_text = || {
-        for (address, label) in &matches {
-            outln!("{}  {}", ui::addr(*address), ui::symbol(label));
-        }
-        outln!(
-            "\n{} {}{} (in $0..${})",
-            matches.len(),
-            if matches.len() == 1 {
-                "symbol"
-            } else {
-                "symbols"
-            },
-            if truncated {
-                ", truncated; refine query"
-            } else {
-                ""
-            },
-            matches.len() - 1
-        );
-        outln!();
-    };
-    #[cfg(feature = "cli")]
-    native::render(
-        || native::lists::symbol_matches(&matches, truncated),
-        print_text,
+    for (address, label) in &matches {
+        outln!("{}  {}", ui::addr(*address), ui::symbol(label));
+    }
+    outln!(
+        "\n{} {}{} (in $0..${})",
+        matches.len(),
+        if matches.len() == 1 {
+            "symbol"
+        } else {
+            "symbols"
+        },
+        if truncated {
+            ", truncated; refine query"
+        } else {
+            ""
+        },
+        matches.len() - 1
     );
-    #[cfg(not(feature = "cli"))]
-    print_text();
     let hits = matches.iter().map(|(address, _)| *address).collect();
     state.ctx.target.set_results(hits, state.line.clone());
 
@@ -160,7 +145,7 @@ impl Render<VirtAddr> for Option<Symbol> {
     fn render(&self, repl: &mut ReplState<'_>, address: VirtAddr) {
         match self {
             Some(symbol) => {
-                outln!("{}  {}\n", ui::addr(address.0), ui::symbol(&symbol.label()));
+                outln!("{}  {}", ui::addr(address.0), ui::symbol(&symbol.label()));
                 // $0 = the symbol's base address (the resolved target)
                 repl.ctx
                     .target
@@ -171,13 +156,13 @@ impl Render<VirtAddr> for Option<Symbol> {
                 match repl.ctx.target.format_code_address(dtb, address) {
                     Some(label) => {
                         outln!(
-                            "{}  {}  {}\n",
+                            "{}  {}  {}",
                             ui::addr(address.0),
                             ui::symbol(&label),
                             ui::muted("(no symbols loaded for this module)")
                         );
                     }
-                    None => outln!("no symbol found for {}\n", ui::addr(address.0)),
+                    None => outln!("no symbol found for {:#x}", address.0),
                 }
             }
         }
@@ -201,7 +186,7 @@ fn ev(
     #[arg(raw, usage = "<expression>", complete = Expression)] expression: String,
 ) -> Result<()> {
     if expression.is_empty() {
-        outln!("{}\n", command_help("ev"));
+        outln!("{}", command_help("ev"));
         return Ok(());
     }
 
@@ -308,11 +293,10 @@ fn symfix(session: &Session) -> Result<SymbolPath> {
 
 impl Render for SymbolPath {
     fn render(&self, _: &mut ReplState<'_>, (): ()) {
-        outln!("symbol sources:");
+        outln!("symbol sources");
         for (index, source) in self.sources.iter().enumerate() {
-            outln!("  {:>2}: {}", index, source);
+            outln!("  {:>2}  {}", index, source);
         }
-        outln!();
     }
 }
 
@@ -371,14 +355,16 @@ fn srcpath_append(
 impl Render for SourcePath {
     fn render(&self, _: &mut ReplState<'_>, (): ()) {
         if self.mappings.is_empty() {
-            outln!("source paths: <empty>\n");
+            outln!(
+                "{}",
+                ui::muted("no source paths; `.srcpath <local-root>` sets one")
+            );
             return;
         }
-        outln!("source paths:");
+        outln!("source paths");
         for (index, path) in self.mappings.iter().enumerate() {
-            outln!("  {:>2}: {}", index, path);
+            outln!("  {:>2}  {}", index, path);
         }
-        outln!();
     }
 }
 
@@ -517,11 +503,11 @@ fn dv(state: &mut ReplState<'_>, address: Option<VirtAddr>) -> Result<()> {
     };
 
     let Some(locals) = target.frame_locals(frame)? else {
-        outln!("no procedure locals found at {}\n", ui::addr(address.0));
+        outln!("no procedure locals found at {:#x}", address.0);
         return Ok(());
     };
     if locals.is_empty() {
-        outln!("no locals in scope at {}\n", ui::addr(address.0));
+        outln!("no locals in scope at {:#x}", address.0);
         return Ok(());
     }
 
@@ -546,7 +532,6 @@ fn dv(state: &mut ReplState<'_>, address: Option<VirtAddr>) -> Result<()> {
             ),
         }
     }
-    outln!();
     Ok(())
 }
 
@@ -737,10 +722,13 @@ fn import_image(session: &Session, path: String) -> Result<String> {
 
 /// `lm`'s words that choose what the text shows: `v` (the details) and `t`
 /// (time stamps).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ModuleDisplay {
     verbose: bool,
     timestamp: bool,
+    /// The name or pattern the modules were filtered by, which an empty
+    /// listing names.
+    pattern: Option<String>,
 }
 
 /// `lm`'s words that choose the modules.
@@ -810,7 +798,11 @@ fn module_display(
     cursor: &mut ArgCursor<'_>,
 ) -> std::result::Result<ModuleDisplay, ArgError> {
     let line: Vec<&str> = cursor.words().collect();
-    Ok(module_words(&line).display)
+    let words = module_words(&line);
+    Ok(ModuleDisplay {
+        pattern: words.pattern.map(str::to_string),
+        ..words.display
+    })
 }
 
 /// `lmv`'s display words: always the details.
@@ -894,7 +886,7 @@ fn list_modules(target: &Target, filter: &ModuleFilter) -> Result<Vec<ModuleList
     if let Some(address) = filter.containing
         && !filter.user
     {
-        kernel |= BreakpointManager::is_kernel_space(target.arch(), address);
+        kernel |= target.arch().paging().is_kernel_address(address);
     }
     let dtb = if kernel {
         target.kernel_dtb()
@@ -948,24 +940,20 @@ fn list_modules(target: &Target, filter: &ModuleFilter) -> Result<Vec<ModuleList
 /// `lm`: the table, or with `v` each module's details.
 impl Render<ModuleDisplay> for Vec<ModuleListing> {
     fn render(&self, _: &mut ReplState<'_>, display: ModuleDisplay) {
-        let ModuleDisplay { verbose, timestamp } = display;
+        let ModuleDisplay {
+            verbose,
+            timestamp,
+            pattern,
+        } = display;
         if self.is_empty() {
-            outln!("{}\n", "no matching modules".bright_black());
+            let message = match pattern {
+                Some(pattern) => format!("no modules matching '{pattern}'"),
+                None => "no modules".to_string(),
+            };
+            outln!("{}", ui::muted(&message));
         } else if verbose {
-            #[cfg(feature = "cli")]
-            native::render(
-                || native::lists::module_details(self, timestamp),
-                || print_module_details(self, timestamp),
-            );
-            #[cfg(not(feature = "cli"))]
             print_module_details(self, timestamp);
         } else {
-            #[cfg(feature = "cli")]
-            native::render(
-                || native::lists::modules(self, timestamp),
-                || print_modules(self, timestamp),
-            );
-            #[cfg(not(feature = "cli"))]
             print_modules(self, timestamp);
         }
     }
@@ -977,7 +965,7 @@ fn scope_ip(target: &Target) -> Option<VirtAddr> {
         .selected_frame
         .as_ref()
         .map(|frame| frame.ip)
-        .or_else(|| target.register_value(target.instruction_pointer_register()))
+        .or_else(|| target.register_value(target.arch().pc_register()))
         .map(VirtAddr)
 }
 
@@ -989,23 +977,19 @@ fn source_file_at(
 ) -> std::result::Result<(PathBuf, SourceLocation), String> {
     let address = frame.address;
     let Some(location) = target.frame_source_location(frame) else {
-        return Err(format!(
-            "no source line information for {}",
-            ui::addr(address.0)
-        ));
+        return Err(format!("no source line information for {:#x}", address.0));
     };
     match &location.local {
         Some(local) if local.state == LocalSourceState::Found => Ok((local.path.clone(), location)),
         Some(local) if local.state == LocalSourceState::Differs => Err(format!(
-            "{} is not the source compiled for {} (its checksum differs from the one {} records)",
+            "{} is not the source compiled for {:#x} (its checksum differs from the one {} records)",
             local.path.display(),
-            ui::addr(address.0),
+            address.0,
             location.file
         )),
         _ => Err(format!(
-            "source file for {} is not available locally (recorded as {}); map it with .srcpath",
-            ui::addr(address.0),
-            location.file
+            "source file for {:#x} is not available locally (recorded as {}); map it with `.srcpath`",
+            address.0, location.file
         )),
     }
 }
@@ -1022,7 +1006,7 @@ fn set(
     #[arg(rest, usage = "<$name> <expression>", complete = [None, Expression])] rest: String,
 ) -> Result<()> {
     let Some((lhs, rhs)) = rest.split_once(char::is_whitespace) else {
-        outln!("{}\n", command_help("set"));
+        outln!("{}", command_help("set"));
         return Ok(());
     };
     let name = lhs.trim().strip_prefix('$').unwrap_or(lhs.trim()).trim();
@@ -1049,7 +1033,7 @@ fn set(
                 .target
                 .user_vars
                 .insert(name.to_string(), UserVar { value: v.0, source });
-            outln!("${} = {}\n", name, ui::addr(v.0));
+            outln!("${} = {}", name, ui::addr(v.0));
         }
         Err(e) => error!("{}", e),
     }
@@ -1070,7 +1054,7 @@ fn vars(state: &mut ReplState<'_>) -> Result<()> {
         && state.ctx.target.results.is_empty()
         && builtins.is_empty()
     {
-        outln!("no variables defined\n");
+        outln!("{}", ui::muted("no variables defined"));
         return Ok(());
     }
     let mut names: Vec<&String> = state.ctx.target.user_vars.keys().collect();
@@ -1081,54 +1065,53 @@ fn vars(state: &mut ReplState<'_>) -> Result<()> {
         .collect();
     let results = state.ctx.target.results.len();
     let origin = state.ctx.target.results_origin.as_deref();
-    let print_text = || {
-        if !user.is_empty() {
-            outln!("{}", ui::label("user"));
-            for (name, var) in &user {
-                outln!(
-                    "  ${:<16} {}   {}",
-                    name,
-                    ui::addr(var.value),
-                    ui::muted(&var.source)
-                );
-            }
-        }
-        if results != 0 {
-            if !user.is_empty() {
-                outln!();
-            }
-            let origin = origin
-                .map(|cmd| format!("from: {}", cmd))
-                .unwrap_or_default();
+    // One name column for every block, wide enough for the longest name,
+    // so the values line up however long a builtin's name is.
+    let width = user
+        .iter()
+        .map(|(name, _)| name.len())
+        .chain(builtins.iter().map(|var| var.name.len()))
+        .max()
+        .unwrap_or(0);
+    if !user.is_empty() {
+        outln!("{}", ui::label("user"));
+        for (name, var) in &user {
             outln!(
-                "  {}   {}",
-                ui::muted(&format!("$0..${}", results - 1)),
-                ui::muted(&origin)
+                "  ${:<width$}  {}  {}",
+                name,
+                ui::addr(var.value),
+                ui::muted(&var.source)
             );
         }
-        if !builtins.is_empty() {
-            if !user.is_empty() || results != 0 {
-                outln!();
-            }
-            outln!("{}", ui::label("builtins"));
-            for var in &builtins {
-                outln!(
-                    "  ${:<16} {}   {}",
-                    var.name,
-                    ui::addr(var.value),
-                    ui::muted(var.source)
-                );
-            }
+    }
+    if results != 0 {
+        if !user.is_empty() {
+            outln!();
         }
-        outln!();
-    };
-    #[cfg(feature = "cli")]
-    native::render(
-        || native::inspect::vars(&user, results, origin, &builtins),
-        print_text,
-    );
-    #[cfg(not(feature = "cli"))]
-    print_text();
+        let origin = origin
+            .map(|cmd| format!("from {}", cmd))
+            .unwrap_or_default();
+        outln!("{}", ui::label("results"));
+        outln!(
+            "  {}  {}",
+            ui::muted(&format!("$0..${}", results - 1)),
+            ui::muted(&origin)
+        );
+    }
+    if !builtins.is_empty() {
+        if !user.is_empty() || results != 0 {
+            outln!();
+        }
+        outln!("{}", ui::label("builtins"));
+        for var in &builtins {
+            outln!(
+                "  ${:<width$}  {}  {}",
+                var.name,
+                ui::addr(var.value),
+                ui::muted(var.source)
+            );
+        }
+    }
 
     Ok(())
 }
@@ -1143,7 +1126,7 @@ fn vars(state: &mut ReplState<'_>) -> Result<()> {
 fn unset(state: &mut ReplState<'_>, #[arg(name = "$name")] variable: String) -> Result<()> {
     let name = variable.strip_prefix('$').unwrap_or(&variable);
     if state.ctx.target.user_vars.remove(name).is_some() {
-        outln!("unset ${}\n", name);
+        outln!("removed ${}", name);
     } else {
         error!("no such variable: ${}", name);
     }
@@ -1226,7 +1209,7 @@ impl ReplState<'_> {
         let first = first.max(1);
         if first as usize > lines.len() {
             outln!(
-                "{}: line {first} is past the end ({} lines)\n",
+                "{}: line {first} is past the end ({} lines)",
                 path.display(),
                 lines.len()
             );
@@ -1234,25 +1217,15 @@ impl ReplState<'_> {
         }
         let last = (first as usize + count as usize - 1).min(lines.len());
         let shown = &lines[first as usize - 1..last];
-        let print_text = || {
-            outln!("{}:", path.display());
-            for (number, line) in (first as usize..).zip(shown) {
-                let mark = if Some(number as u32) == current {
-                    '>'
-                } else {
-                    ' '
-                };
-                outln!("{mark}{number:>6}: {line}");
-            }
-            outln!();
-        };
-        #[cfg(feature = "cli")]
-        native::render(
-            || native::source::view(path, shown, first, current),
-            print_text,
-        );
-        #[cfg(not(feature = "cli"))]
-        print_text();
+        outln!("{}:", ui::file_link(path, &path.display().to_string()));
+        for (number, line) in (first as usize..).zip(shown) {
+            let mark = if Some(number as u32) == current {
+                '>'
+            } else {
+                ' '
+            };
+            outln!("{mark}{number:>6}: {line}");
+        }
         let next = last as u32 + 1;
         self.source_cursor = Some((path.to_path_buf(), next));
         next
@@ -1287,8 +1260,8 @@ fn print_modules(listings: &[ModuleListing], timestamp: bool) {
                 .symbols
                 .status
                 .as_ref()
-                .map(|status| status.label().to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
+                .map_or("-", ModuleSymbolStatus::label)
+                .to_string(),
             listing
                 .symbols
                 .source
@@ -1314,23 +1287,39 @@ fn print_modules(listings: &[ModuleListing], timestamp: bool) {
 fn print_module_details(listings: &[ModuleListing], timestamp: bool) {
     for listing in listings {
         let module = &listing.module;
-        outln!("{} ({})", module.name, module.short_name);
+        outln!("{}", module.short_name);
         outln!(
-            "  range   : {} - {}",
+            "  range      {} - {}",
             ui::addr(module.base_address.0),
             ui::addr(module.end_address().0)
         );
+        outln!("  image      {}", module.name);
+        if let Some(path) = &module.path {
+            outln!("  path       {path}");
+        }
         outln!(
-            "  symbols : {}",
+            "  version    {}",
+            module.file_version.as_deref().unwrap_or("-")
+        );
+        if timestamp {
+            outln!(
+                "  timestamp  {}",
+                module
+                    .time_date_stamp
+                    .map(|stamp| format!("{stamp:#x}"))
+                    .unwrap_or_else(|| "-".to_string())
+            );
+        }
+        outln!(
+            "  symbols    {}",
             listing
                 .symbols
                 .status
                 .as_ref()
-                .map(|status| status.label().to_string())
-                .unwrap_or_else(|| "unknown".to_string())
+                .map_or("-", ModuleSymbolStatus::label)
         );
         outln!(
-            "  source  : {}",
+            "  source     {}",
             listing
                 .symbols
                 .source
@@ -1340,22 +1329,13 @@ fn print_module_details(listings: &[ModuleListing], timestamp: bool) {
         );
         match listing.symbols.pdb {
             Some(identity) => {
-                outln!("  pdb guid: {:032X}", identity.guid);
-                outln!("  pdb age : {}", identity.age);
+                outln!("  pdb guid   {:032X}", identity.guid);
+                outln!("  pdb age    {}", identity.age);
             }
-            None => outln!("  pdb     : -"),
+            None => outln!("  pdb        -"),
         }
         if let Some(ModuleSymbolStatus::Failed(reason)) = &listing.symbols.status {
-            outln!("  error   : {}", reason);
-        }
-        if timestamp {
-            outln!(
-                "  timestamp: {}",
-                module
-                    .time_date_stamp
-                    .map(|stamp| format!("{stamp:#x}"))
-                    .unwrap_or_else(|| "-".to_string())
-            );
+            outln!("  error      {}", reason);
         }
         outln!();
     }

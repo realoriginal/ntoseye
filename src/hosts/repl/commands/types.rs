@@ -222,7 +222,7 @@ fn list(
     let type_info = match state.lookup_type(type_name) {
         Some(type_info) => type_info,
         None => {
-            error!("!list: type `{}` not found", type_name);
+            error!("!list: type '{}' not found", type_name);
             return Ok(Flow::Continue);
         }
     };
@@ -305,7 +305,7 @@ fn parse_depth_option(arg: &str, prefix: &str, bare: usize) -> std::result::Resu
     }
     let value = suffix
         .parse::<usize>()
-        .map_err(|_| format!("invalid {} depth `{}`", prefix, suffix))?;
+        .map_err(|_| format!("invalid {} depth '{}'", prefix, suffix))?;
     Ok(value.min(MAX_RECURSION_DEPTH))
 }
 
@@ -316,7 +316,7 @@ fn parse_array_option(arg: &str) -> std::result::Result<usize, String> {
     }
     let value = suffix
         .parse::<usize>()
-        .map_err(|_| format!("invalid -a count `{}`", suffix))?;
+        .map_err(|_| format!("invalid -a count '{}'", suffix))?;
     Ok(value.min(MAX_ARRAY_ELEMENTS))
 }
 
@@ -491,7 +491,7 @@ impl DtField {
 
 fn print_dt(dump: &DtDump) {
     outln!(
-        "{} ({} bytes){}",
+        "{} ({:#x} bytes){}",
         dump.type_name,
         dump.size,
         dump.address
@@ -501,7 +501,6 @@ fn print_dt(dump: &DtDump) {
     match &dump.body {
         DtBody::Fields(entries) => {
             print_dt_entries(entries, 2);
-            outln!();
         }
         DtBody::List { records, stop } => {
             for (record, entries) in records {
@@ -534,10 +533,15 @@ fn print_dt_entries(entries: &[DtEntry], indent: usize) {
 
 fn print_enum(name: &str, variants: &[(String, i64)]) {
     outln!("enum {} ({} values)", name, variants.len());
+    // The values in one right-aligned column, as `dt` lists an enum's.
+    let width = variants
+        .iter()
+        .map(|(_, value)| format!("{value:#x}").len())
+        .max()
+        .unwrap_or(0);
     for (name, value) in variants {
-        outln!("  {:#x}  {}", value, name);
+        outln!("  {:>width$}  {}", format!("{value:#x}"), name);
     }
-    outln!();
 }
 
 impl ReplState<'_> {
@@ -591,10 +595,9 @@ impl ReplState<'_> {
                             depth.saturating_sub(1),
                         );
                     } else {
-                        entry.children.push(DtEntry::Note(format!(
-                            "<unavailable: type {} not found>",
-                            type_name
-                        )));
+                        entry
+                            .children
+                            .push(DtEntry::Note(format!("type '{}' not found", type_name)));
                     }
                 }
             }
@@ -711,7 +714,7 @@ impl ReplState<'_> {
                 find_field(current_type.as_deref().unwrap_or(root), requested_name)
                     .map(|(name, info)| (name.to_string(), info.clone()))
             else {
-                return Err(format!("field `{requested_name}` not found"));
+                return Err(format!("field '{requested_name}' not found"));
             };
             let next_type_name = nested_layout_name(&info.type_data);
             components.push(PathComponent { name, info });
@@ -725,7 +728,7 @@ impl ReplState<'_> {
                     .lookup_type(&next_type_name)
                     .or_else(|| abi_layout(&next_type_name).map(Arc::new));
                 let Some(next_type) = next_type else {
-                    return Err(format!("nested type `{next_type_name}` not found"));
+                    return Err(format!("nested type '{next_type_name}' not found"));
                 };
                 current_type = Some(next_type);
             }
@@ -759,7 +762,7 @@ impl ReplState<'_> {
                     self.type_view().field_size(&component.info),
                 )?;
                 if pointer == 0 {
-                    return Err(format!("field `{}` points to null", component.name));
+                    return Err(format!("field '{}' points to null", component.name));
                 }
                 current = VirtAddr(pointer);
                 offset = 0;
@@ -813,7 +816,9 @@ impl ReplState<'_> {
         }
         if named_type(&last.info.type_data, "_LIST_ENTRY") {
             let entry_offset = link_offset.saturating_add(last.info.offset as u64);
-            return Ok((entry_offset, entry_offset, 8));
+            // `_LIST_ENTRY` is Flink then Blink, so each link is half its size.
+            let pointer_size = (self.type_view().field_size(&last.info) / 2).clamp(1, 8);
+            return Ok((entry_offset, entry_offset, pointer_size));
         }
         let next_offset = link_offset.saturating_add(last.info.offset as u64);
         let pointer_size = self.type_view().field_size(&last.info).clamp(1, 8);
@@ -863,18 +868,9 @@ impl ReplState<'_> {
             None => {
                 if let Some(variants) = self.lookup_enum(&parsed.type_name) {
                     let name = unqualified_type_name(&parsed.type_name);
-                    #[cfg(feature = "cli")]
-                    native::render(
-                        || native::types::enum_view(name, &variants),
-                        || print_enum(name, &variants),
-                    );
-                    #[cfg(not(feature = "cli"))]
                     print_enum(name, &variants);
                 } else {
-                    error!(
-                        "failed to get type information: type `{}` not found",
-                        parsed.type_name
-                    );
+                    error!("type '{}' not found", parsed.type_name);
                 }
                 return Ok(());
             }
@@ -950,9 +946,6 @@ impl ReplState<'_> {
             address: base.map(|address| address.0),
             body,
         };
-        #[cfg(feature = "cli")]
-        native::render(|| native::types::view(&dump), || print_dt(&dump));
-        #[cfg(not(feature = "cli"))]
         print_dt(&dump);
         Ok(())
     }
@@ -1032,19 +1025,24 @@ impl ReplState<'_> {
             None => 2,
         };
         let mut cursor = ListCursor::from_first(address, limit);
+        let arch = self.ctx.target.arch();
+        let pointer = arch.pointer_size() as usize;
         let mut bytes = [0u8; MAX_DL_WORDS * 8];
         while let Some(current) = cursor.take_current() {
             let read_words = display_words.max(2);
-            let width = read_words * 8;
+            let width = read_words * pointer;
             if let Err(error) = self.ctx.read_masked(current, &mut bytes[..width]) {
                 outln!("{}: <unavailable: {}>", ui::addr(current.0), error);
                 cursor.advance(Err(error.to_string()));
                 continue;
             }
-            let first = le_uint(&bytes[..8]);
-            let second = le_uint(&bytes[8..16]);
+            let first = arch.decode_pointer(&bytes).0;
+            let second = arch.decode_pointer(&bytes[pointer..]).0;
             let words = (0..display_words)
-                .map(|index| format!("{:#x}", le_uint(&bytes[index * 8..index * 8 + 8])))
+                .map(|index| {
+                    let word = &bytes[index * pointer..(index + 1) * pointer];
+                    format!("{:#x}", le_uint(word))
+                })
                 .collect::<Vec<_>>();
             outln!("{}  {}", ui::addr(current.0), words.join(" "));
             let next = if backward { second } else { first };

@@ -1,54 +1,32 @@
 //! Register files as byte buffers: the layout every transport describes its
-//! `read_registers` buffer with, and the ARM64 aliases shared code reads.
+//! `read_registers` buffer with, and the second names an architecture's
+//! registers answer to ([`Architecture::register_synonyms`]).
+//!
+//! [`Architecture::register_synonyms`]: super::Architecture::register_synonyms
 
 use std::collections::HashMap;
 use std::result;
 
+use super::Arch;
 use crate::base::error::{Error, Result};
 
-/// ARM64 names the rest of the debugger reads, each paired with the
-/// architectural register it aliases. Shared code spells the program
-/// counter and stack pointer the x64 way; `fp`, `lr` and `pstate` are the
-/// ABI names users type.
-const ARM64_ALIASES: [(&str, &str); 5] = [
-    ("rip", "pc"),
-    ("rsp", "sp"),
-    ("fp", "x29"),
-    ("lr", "x30"),
-    ("pstate", "cpsr"),
-];
-
-/// A name in a recovered register set that repeats another register, which
-/// a listing shows once under the name `r` uses: `rip`/`rsp` repeat `pc`/`sp`,
-/// and `x29`, `x30`, `pstate` are shown as `fp`, `lr`, `cpsr`.
-pub fn repeats_another_register(name: &str, registers: &HashMap<String, u64>) -> bool {
-    const SHOWN_AS: [(&str, &str); 5] = [
-        ("rip", "pc"),
-        ("rsp", "sp"),
-        ("x29", "fp"),
-        ("x30", "lr"),
-        ("pstate", "cpsr"),
-    ];
-    SHOWN_AS.iter().any(|(repeat, shown)| {
-        *repeat == name
-            && registers
-                .get(*shown)
-                .is_some_and(|value| registers.get(name) == Some(value))
-    })
-}
-
-/// Append every ARM64 alias to `registers`, each reading the same bytes as
-/// the register it names. Fails with the architectural name `registers`
-/// does not carry.
-pub fn push_arm64_aliases(registers: &mut Vec<RegisterInfo>) -> result::Result<(), &'static str> {
-    for (alias, canonical) in ARM64_ALIASES {
-        let register = registers
-            .iter()
-            .find(|reg| reg.name == canonical)
-            .ok_or(canonical)?
-            .clone();
+/// Give every pair of `synonyms` both its names in `registers`: the name it
+/// lacks reads the same bytes as the one it carries. Fails with the shown
+/// name of a pair it carries neither name of.
+pub fn push_synonyms(
+    registers: &mut Vec<RegisterInfo>,
+    synonyms: &[(&'static str, &'static str)],
+) -> result::Result<(), &'static str> {
+    for &(shown, other) in synonyms {
+        let carried = |name: &str| registers.iter().find(|reg| reg.name == name).cloned();
+        let (register, missing) = match (carried(shown), carried(other)) {
+            (Some(_), Some(_)) => continue,
+            (Some(register), None) => (register, other),
+            (None, Some(register)) => (register, shown),
+            (None, None) => return Err(shown),
+        };
         registers.push(RegisterInfo {
-            name: alias.to_string(),
+            name: missing.to_string(),
             ..register
         });
     }
@@ -86,6 +64,51 @@ impl RegisterMap {
         }
         map.add_vector_halves();
         map
+    }
+
+    /// A map of `(name, offset, size)` fields, numbered in order: a
+    /// structure's layout.
+    pub fn from_layout<N: Into<String>>(
+        fields: impl IntoIterator<Item = (N, usize, usize)>,
+    ) -> Self {
+        Self::from_registers(
+            fields
+                .into_iter()
+                .enumerate()
+                .map(|(regnum, (name, offset, size))| RegisterInfo {
+                    name: name.into(),
+                    offset,
+                    size,
+                    regnum,
+                })
+                .collect(),
+        )
+    }
+
+    /// Bytes from the layout's start to the end of its last register.
+    pub fn extent(&self) -> usize {
+        self.ordered
+            .iter()
+            .map(|register| register.offset + register.size)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Copy into `data`, laid out as this map, the registers `source_data`,
+    /// laid out as `source`, holds, matching them by name. A register past
+    /// the end of `data`, or missing from `source` or past the end of
+    /// `source_data`, keeps its bytes; a narrower source value is
+    /// zero-extended.
+    pub fn copy_from(&self, data: &mut [u8], source: &RegisterMap, source_data: &[u8]) {
+        for register in &self.ordered {
+            let end = register.offset + register.size;
+            if end > data.len() {
+                continue;
+            }
+            if let Ok(value) = source.read_u128(&register.name, source_data) {
+                data[register.offset..end].copy_from_slice(&value.to_le_bytes()[..register.size]);
+            }
+        }
     }
 
     /// Name each 128-bit register's 64-bit halves `{name}l` / `{name}h`
@@ -215,7 +238,7 @@ impl RegisterMap {
 
     /// A sparse register context (`.cxr`, `.trap`, a saved VTL state) named
     /// the way [`Self::to_hashmap`] names it, so an alias also yields the
-    /// register it aliases (ARM64 `rip` gives `pc`). Only registers whose
+    /// register it aliases (ARM64 `fp` gives `x29`). Only registers whose
     /// every byte `values` supplies are kept: a register the context lacks
     /// stays unknown instead of reading zero. Names the map does not carry
     /// are dropped.
@@ -270,6 +293,68 @@ impl RegisterMap {
     pub fn info(&self, name: &str) -> Option<&RegisterInfo> {
         self.by_name.get(name)
     }
+}
+
+/// One processor's registers: its architecture's register buffer, the
+/// `CONTEXT` record then the synthetic slots behind it.
+#[derive(Debug, Clone)]
+pub struct RegisterFile {
+    arch: Arch,
+    bytes: Vec<u8>,
+}
+
+impl RegisterFile {
+    /// The registers a raw `CONTEXT` record holds.
+    pub fn from_context(arch: Arch, record: &[u8]) -> Self {
+        Self {
+            arch,
+            bytes: arch.register_buffer(record),
+        }
+    }
+
+    /// A processor with no registers recorded: every one reads zero.
+    pub fn empty(arch: Arch) -> Self {
+        Self::from_context(arch, &[])
+    }
+
+    pub fn arch(&self) -> Arch {
+        self.arch
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The register `name`, when the architecture has one.
+    pub fn read(&self, name: &str) -> Option<u64> {
+        self.arch.register_map().read_u64(name, &self.bytes).ok()
+    }
+
+    pub fn instruction_pointer(&self) -> u64 {
+        self.read(self.arch.pc_register()).unwrap_or(0)
+    }
+
+    pub fn stack_pointer(&self) -> u64 {
+        self.read(self.arch.sp_register()).unwrap_or(0)
+    }
+
+    /// The buffer with the kernel page-table root set to `dtb`, as a
+    /// backend serves it.
+    pub fn with_kernel_dtb(&self, dtb: u64) -> Vec<u8> {
+        let mut bytes = self.bytes.clone();
+        self.arch
+            .register_map()
+            .write_u64(self.arch.kernel_dtb_register(), &mut bytes, dtb)
+            .expect("every register buffer has a kernel page-table root slot");
+        bytes
+    }
+}
+
+/// Whether `name` is `prefix` followed by a number: `xmm3` for `xmm`.
+pub fn numbered(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|ch| ch.is_ascii_digit())
 }
 
 #[cfg(test)]

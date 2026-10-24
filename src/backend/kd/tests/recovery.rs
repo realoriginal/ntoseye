@@ -307,7 +307,8 @@ fn regression_session_run_status_returns_promptly_for_a_queued_serial_eof() {
             let deadline = Instant::now() + FIXTURE_TIMEOUT;
             let mut remote_id = INITIAL_PACKET_ID ^ 1;
             let mut context = vec![0u8; amd64::CONTEXT_SIZE];
-            amd64::build_register_map()
+            Arch::Amd64
+                .register_map()
                 .write_u64("rip", &mut context, PC)
                 .unwrap();
             loop {

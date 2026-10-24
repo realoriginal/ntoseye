@@ -7,20 +7,16 @@ use super::stepping::{
     RELEASE_BUDGET, RunPast, site_successors, stack_floor, step_over_current_breakpoint,
 };
 use super::*;
-use crate::backend::cpu_context::amd64::{REGISTER_BUFFER_SIZE, build_register_map};
-use crate::backend::cpu_context::arm64;
-use crate::backend::dbg_backend::{
-    ContinueDisposition, HW_BREAKPOINT_SLOTS, HwBreakpointAccess, RegisterInfo, TrapState,
-    clear_trap_flag,
-};
+use crate::arch::{Arch, HwBreakpointAccess, RegisterInfo, amd64::REGISTER_BUFFER_SIZE, arm64};
+use crate::backend::dbg_backend::{ContinueDisposition, TrapState, clear_trap_flag};
 use crate::backend::partition_backend::PartitionVp;
 use crate::base::memory::PAGE_SIZE;
-use crate::base::types::{Arch, VirtAddr};
+use crate::base::types::VirtAddr;
 use crate::nt::breakpoints::{
     BreakpointConfig, BreakpointInfo, HardwareBreakpoint, HypercallFilter, PartitionFilter,
     StepFrame, ThreadScope,
 };
-use crate::nt::dmp::{IMAGE_FILE_MACHINE_ARM64, structs::Header64};
+use crate::nt::dmp::structs::Header64;
 use crate::nt::guest::ModuleInfo;
 use crate::nt::target::SelectedFrame;
 use crate::session::exception_policy::{ExceptionPolicyFinalAction, ExceptionPolicyMode};
@@ -160,7 +156,7 @@ struct Landing {
 impl Default for MockBackend {
     fn default() -> Self {
         Self {
-            register_map: build_register_map(),
+            register_map: Arch::Amd64.register_map().clone(),
             regs: vec![0u8; REGISTER_BUFFER_SIZE],
             writes: 0,
             fail_writes: false,
@@ -391,7 +387,7 @@ impl DebugBackend for MockBackend {
     }
     fn hardware_breakpoint_slots(&self) -> usize {
         self.hardware_limit
-            .map_or(usize::from(HW_BREAKPOINT_SLOTS), |limit| limit + 4)
+            .map_or(Arch::Amd64.debug_registers().slots(), |limit| limit + 4)
     }
     fn set_hardware_breakpoint(
         &mut self,
@@ -700,7 +696,7 @@ fn module_change_event() -> StopEvent {
 pub fn session_with_mock(backend: MockBackend) -> Session {
     let mut session = session_over_memory(0x1000, &[0; 0x100]);
     session.backend = Box::new(backend);
-    session.register_map = build_register_map();
+    session.register_map = Arch::Amd64.register_map().clone();
     session
 }
 
@@ -739,13 +735,17 @@ fn bugcheck_exception_record_uses_bugcheck_code() {
 #[test]
 fn a_sparse_context_walks_with_its_missing_registers_unknown() {
     let mut session = session_over_memory(0x1000, &[0; 0x100]);
-    session.register_map = build_register_map();
+    session.register_map = Arch::Amd64.register_map().clone();
     let supplied = HashMap::from([
         ("rip".to_string(), 0x1010),
         ("rsp".to_string(), 0x1080),
         ("cs".to_string(), 0x10),
     ]);
-    session.select_frame(SelectedFrame::from_registers(0, supplied));
+    session.select_frame(SelectedFrame::from_registers(
+        session.target.arch(),
+        0,
+        supplied,
+    ));
 
     let (trace, _, live) = session.recovered_backtrace(4).unwrap();
 
@@ -777,6 +777,7 @@ fn a_status_snapshot_keeps_the_selected_thread_and_frame() {
     session.target.set_parked_windows_thread(thread.clone());
     session.parked_windows_thread = Some(thread.ethread);
     session.select_frame(SelectedFrame::from_registers(
+        session.target.arch(),
         2,
         HashMap::from([("rip".to_string(), 0x1010), ("rsp".to_string(), 0x1080)]),
     ));
@@ -807,7 +808,7 @@ fn session_over_arm64_memory(base: u64, memory: &[u8]) -> Session {
     let mut dump = make_triage_dump(&[block], &[(base, memory)]);
     let machine_offset = std::mem::offset_of!(Header64, machine_image_type);
     dump[machine_offset..machine_offset + 4]
-        .copy_from_slice(&IMAGE_FILE_MACHINE_ARM64.to_le_bytes());
+        .copy_from_slice(&u32::from(Arch::Arm64.machine_type()).to_le_bytes());
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -819,16 +820,16 @@ fn session_over_arm64_memory(base: u64, memory: &[u8]) -> Session {
 }
 
 #[test]
-fn page_in_result_reads_arm64_pc_alias_and_first_argument() {
+fn page_in_result_reads_arm64_pc_and_first_argument() {
     let mut session = session_over_arm64_memory(0x1000, &[0; 0x100]);
     assert_eq!(session.target.arch(), Arch::Arm64);
 
     let mut backend = MockBackend {
-        register_map: arm64::build_register_map(),
+        register_map: Arch::Arm64.register_map().clone(),
         regs: vec![0; arm64::REGISTER_BUFFER_SIZE],
         ..MockBackend::default()
     };
-    backend.set("rip", 0x2000);
+    backend.set("pc", 0x2000);
     backend.set("x0", DBG_STATUS_WORKER);
     session.register_map = backend.register_map.clone();
     session.backend = Box::new(backend);
@@ -836,6 +837,39 @@ fn page_in_result_reads_arm64_pc_alias_and_first_argument() {
     let report = session.page_in_result(VirtAddr(0x1000), VirtAddr(0x2000));
 
     assert!(report.from_worker);
+}
+
+/// Stopped on `KeBugCheckEx`'s first instruction, the code and first three
+/// parameters are in registers and the fourth, its fifth argument, on the
+/// stack past the return address and the four registers' shadow space.
+#[test]
+fn a_bugcheck_trap_reads_its_last_parameter_past_the_shadow_space() {
+    let mut memory = [0u8; 0x100];
+    for (slot, value) in memory[0x80..0xb0]
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .zip(0x10u64..)
+    {
+        slot.copy_from_slice(&value.to_le_bytes());
+    }
+    let mut session = session_over_memory(0x1000, &memory);
+    let mut backend = MockBackend::default();
+    backend.set("rcx", 0x139);
+    backend.set("rdx", 3);
+    backend.set("r8", 0xffff_8000_1000_0000);
+    backend.set("r9", 0xffff_8000_2000_0000);
+    backend.set("rsp", 0x1080);
+    session.register_map = backend.register_map.clone();
+    session.backend = Box::new(backend);
+
+    let info = session.bugcheck_from_trap().unwrap();
+
+    assert_eq!(info.code, 0x139);
+    assert_eq!(
+        info.parameters,
+        [3, 0xffff_8000_1000_0000, 0xffff_8000_2000_0000, 0x15]
+    );
 }
 
 /// With nothing attached, the bytes `db` and `s` show are the halted
@@ -1460,7 +1494,7 @@ fn successors_follow_privilege_and_far_transfers() {
 fn stepping_session(code: &[u8], backend: MockBackend) -> Session {
     let mut session = session_over_memory(0x1000, code);
     session.backend = Box::new(backend);
-    session.register_map = build_register_map();
+    session.register_map = Arch::Amd64.register_map().clone();
     session
 }
 
@@ -3447,10 +3481,16 @@ fn hardware_breakpoint_hit_claims_matching_dr6_bit_and_clears_status() {
     backend.set("dr6", (1 << 2) | DR6_BS);
     backend.set("eflags", EFLAGS_BASE);
 
-    let map = build_register_map();
-    let hit = hardware_breakpoint_hit(&mut backend, &map, &manager, &single_step_event())
-        .expect("register update must succeed")
-        .expect("slot 2 #DB must be claimed by the registered watch");
+    let map = Arch::Amd64.register_map();
+    let hit = hardware_breakpoint_hit(
+        &mut backend,
+        map,
+        &manager,
+        &single_step_event(),
+        Arch::Amd64,
+    )
+    .expect("register update must succeed")
+    .expect("slot 2 #DB must be claimed by the registered watch");
     assert_eq!(hit.id, 7);
     assert_eq!(hit.hardware.expect("hw params").slot, 2);
 
@@ -3471,9 +3511,15 @@ fn hardware_breakpoint_hit_sets_resume_flag_only_for_execute_watches() {
         backend.set("dr6", 1);
         backend.set("eflags", EFLAGS_BASE);
 
-        let map = build_register_map();
-        let hit =
-            hardware_breakpoint_hit(&mut backend, &map, &manager, &single_step_event()).unwrap();
+        let map = Arch::Amd64.register_map();
+        let hit = hardware_breakpoint_hit(
+            &mut backend,
+            map,
+            &manager,
+            &single_step_event(),
+            Arch::Amd64,
+        )
+        .unwrap();
         assert!(hit.is_some(), "{access:?} hit must be claimed");
 
         let eflags = backend.get("eflags");
@@ -3491,8 +3537,17 @@ fn hardware_breakpoint_hit_propagates_required_register_write_failure() {
     backend.set("eflags", EFLAGS_BASE);
     backend.fail_writes = true;
 
-    let map = build_register_map();
-    assert!(hardware_breakpoint_hit(&mut backend, &map, &manager, &single_step_event()).is_err());
+    let map = Arch::Amd64.register_map();
+    assert!(
+        hardware_breakpoint_hit(
+            &mut backend,
+            map,
+            &manager,
+            &single_step_event(),
+            Arch::Amd64
+        )
+        .is_err()
+    );
     assert_eq!(backend.get("dr6"), 1);
     assert_eq!(backend.get("eflags"), EFLAGS_BASE);
     assert_eq!(backend.writes, 1);
@@ -3504,19 +3559,19 @@ fn hardware_breakpoint_hit_ignores_non_single_step_stops() {
     let mut backend = MockBackend::default();
     backend.set("dr6", 1); // would match slot 0 if the gate were open
     let before = backend.regs.clone();
-    let map = build_register_map();
+    let map = Arch::Amd64.register_map();
 
     let mut event = single_step_event();
     event.exception_code = Some(0x8000_0003);
     assert!(
-        hardware_breakpoint_hit(&mut backend, &map, &manager, &event)
+        hardware_breakpoint_hit(&mut backend, map, &manager, &event, Arch::Amd64)
             .unwrap()
             .is_none()
     );
 
     event.exception_code = None;
     assert!(
-        hardware_breakpoint_hit(&mut backend, &map, &manager, &event)
+        hardware_breakpoint_hit(&mut backend, map, &manager, &event, Arch::Amd64)
             .unwrap()
             .is_none()
     );
@@ -3524,7 +3579,7 @@ fn hardware_breakpoint_hit_ignores_non_single_step_stops() {
     event.exception_code = Some(STATUS_SINGLE_STEP);
     event.is_bugcheck = true;
     assert!(
-        hardware_breakpoint_hit(&mut backend, &map, &manager, &event)
+        hardware_breakpoint_hit(&mut backend, map, &manager, &event, Arch::Amd64)
             .unwrap()
             .is_none()
     );
@@ -3551,9 +3606,15 @@ fn a_reported_watch_address_attributes_the_watchpoint_whose_range_covers_it() {
     let mut backend = MockBackend::default().without_debug_registers();
     let map = backend.register_map.clone();
 
-    let hit = hardware_breakpoint_hit(&mut backend, &map, &manager, &stub_watch_event(0x1002))
-        .unwrap()
-        .expect("a byte inside the watched range belongs to the watchpoint");
+    let hit = hardware_breakpoint_hit(
+        &mut backend,
+        &map,
+        &manager,
+        &stub_watch_event(0x1002),
+        Arch::Amd64,
+    )
+    .unwrap()
+    .expect("a byte inside the watched range belongs to the watchpoint");
 
     assert_eq!(hit.id, 7);
     // The address settled it, so nothing had to be fetched to decide.
@@ -3566,8 +3627,14 @@ fn a_reported_watch_address_past_the_watched_range_is_not_a_hit() {
     let mut backend = MockBackend::default().without_debug_registers();
     let map = backend.register_map.clone();
 
-    let hit =
-        hardware_breakpoint_hit(&mut backend, &map, &manager, &stub_watch_event(0x1004)).unwrap();
+    let hit = hardware_breakpoint_hit(
+        &mut backend,
+        &map,
+        &manager,
+        &stub_watch_event(0x1004),
+        Arch::Amd64,
+    )
+    .unwrap();
 
     assert!(hit.is_none());
 }
@@ -3588,6 +3655,7 @@ fn a_watch_address_no_watchpoint_covers_leaves_the_execute_breakpoint_at_the_pc_
         &map,
         &manager,
         &stub_watch_event(0xffff_cc0c_2cc6_7204),
+        Arch::Amd64,
     )
     .unwrap();
 
@@ -3668,7 +3736,7 @@ fn a_stub_with_no_debug_registers_attributes_an_execute_breakpoint_by_the_stoppe
     };
 
     backend.set("rip", 0x1000);
-    let hit = hardware_breakpoint_hit(&mut backend, &map, &manager, &event).unwrap();
+    let hit = hardware_breakpoint_hit(&mut backend, &map, &manager, &event, Arch::Amd64).unwrap();
     assert_eq!(hit.map(|bp| bp.id), Some(7));
     // Without RF the resume re-enters the same faulting instruction.
     assert_eq!(backend.get("eflags") & (1 << 16), 1 << 16);
@@ -3676,21 +3744,22 @@ fn a_stub_with_no_debug_registers_attributes_an_execute_breakpoint_by_the_stoppe
     // The breakpoint fires at its own address, so a stop elsewhere is not it.
     backend.set("rip", 0x2000);
     backend.set("eflags", 0);
-    let elsewhere = hardware_breakpoint_hit(&mut backend, &map, &manager, &event).unwrap();
+    let elsewhere =
+        hardware_breakpoint_hit(&mut backend, &map, &manager, &event, Arch::Amd64).unwrap();
     assert!(elsewhere.is_none());
     assert_eq!(backend.get("eflags"), 0);
 }
 
 #[test]
 fn hardware_breakpoint_hit_requires_an_enabled_hardware_breakpoint() {
-    let map = build_register_map();
+    let map = Arch::Amd64.register_map();
     let mut backend = MockBackend::default();
     backend.set("dr6", 1);
     let before = backend.regs.clone();
 
     let empty = BreakpointManager::new();
     assert!(
-        hardware_breakpoint_hit(&mut backend, &map, &empty, &single_step_event())
+        hardware_breakpoint_hit(&mut backend, map, &empty, &single_step_event(), Arch::Amd64)
             .unwrap()
             .is_none()
     );
@@ -3699,9 +3768,15 @@ fn hardware_breakpoint_hit_requires_an_enabled_hardware_breakpoint() {
 
     let manager = manager_with_hw(0, HwBreakpointAccess::Write, false);
     assert!(
-        hardware_breakpoint_hit(&mut backend, &map, &manager, &single_step_event())
-            .unwrap()
-            .is_none()
+        hardware_breakpoint_hit(
+            &mut backend,
+            map,
+            &manager,
+            &single_step_event(),
+            Arch::Amd64
+        )
+        .unwrap()
+        .is_none()
     );
     assert_eq!(backend.writes, 0);
     assert_eq!(backend.regs, before);
@@ -3713,11 +3788,17 @@ fn hardware_breakpoint_hit_clears_stale_dr6_bits_for_unregistered_slots() {
     let mut backend = MockBackend::default();
     backend.set("dr6", (1 << 3) | DR6_BS);
 
-    let map = build_register_map();
+    let map = Arch::Amd64.register_map();
     assert!(
-        hardware_breakpoint_hit(&mut backend, &map, &manager, &single_step_event())
-            .unwrap()
-            .is_none()
+        hardware_breakpoint_hit(
+            &mut backend,
+            map,
+            &manager,
+            &single_step_event(),
+            Arch::Amd64
+        )
+        .unwrap()
+        .is_none()
     );
     assert_eq!(backend.get("dr6"), DR6_BS);
     assert_eq!(backend.writes, 1);
@@ -3729,8 +3810,8 @@ fn clear_trap_flag_clears_tf_and_dr6_status_in_one_write() {
     backend.set("eflags", TF | EFLAGS_BASE);
     backend.set("dr6", 0b1011 | DR6_BS);
 
-    let map = build_register_map();
-    clear_trap_flag(&mut backend, &map).unwrap();
+    let map = Arch::Amd64.register_map();
+    clear_trap_flag(Arch::Amd64, &mut backend, map).unwrap();
 
     assert_eq!(backend.get("eflags"), EFLAGS_BASE);
     assert_eq!(backend.get("dr6"), DR6_BS);
@@ -3742,9 +3823,9 @@ fn clear_trap_flag_trusts_a_stop_that_reports_no_residue() {
     let mut backend = MockBackend::default().reporting_trap_state(EFLAGS_BASE, DR6_BS);
     backend.set("eflags", TF | EFLAGS_BASE);
     backend.set("dr6", 0b1011 | DR6_BS);
-    let map = build_register_map();
+    let map = Arch::Amd64.register_map();
 
-    clear_trap_flag(&mut backend, &map).unwrap();
+    clear_trap_flag(Arch::Amd64, &mut backend, map).unwrap();
 
     // The registers still hold residue, so a fetch would have rewritten
     // them: proving none happened proves the report was believed.
@@ -3757,9 +3838,9 @@ fn clear_trap_flag_still_writes_when_the_stop_reports_residue() {
     let mut backend = MockBackend::default().reporting_trap_state(TF | EFLAGS_BASE, DR6_BS);
     backend.set("eflags", TF | EFLAGS_BASE);
     backend.set("dr6", 0b1011 | DR6_BS);
-    let map = build_register_map();
+    let map = Arch::Amd64.register_map();
 
-    clear_trap_flag(&mut backend, &map).unwrap();
+    clear_trap_flag(Arch::Amd64, &mut backend, map).unwrap();
 
     assert_eq!(backend.get("eflags"), EFLAGS_BASE);
     assert_eq!(backend.get("dr6"), DR6_BS);
@@ -3772,8 +3853,8 @@ fn clear_trap_flag_skips_the_write_when_nothing_is_set() {
     backend.set("dr6", DR6_BS);
     let before = backend.regs.clone();
 
-    let map = build_register_map();
-    clear_trap_flag(&mut backend, &map).unwrap();
+    let map = Arch::Amd64.register_map();
+    clear_trap_flag(Arch::Amd64, &mut backend, map).unwrap();
 
     assert_eq!(backend.writes, 0);
     assert_eq!(backend.regs, before);

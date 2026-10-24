@@ -6,15 +6,13 @@ use std::io::ErrorKind;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::backend::dbg_backend::{ContinueDisposition, ModuleEvent, RegisterMap, StopEvent};
-use crate::base::bytes;
+use crate::arch::{Arch, Family, RegisterMap};
+use crate::backend::dbg_backend::{ContinueDisposition, ModuleEvent, StopEvent};
 use crate::base::error::{Error, Result};
-use crate::base::types::Arch;
 
 use super::breakpoints::{
     breakpoint_instruction_at, reclaimed_breakpoints_notice, restore_unowned_breakpoint_handles,
 };
-use super::registers::KSPECIAL_REGISTERS_DR7_OFFSET;
 use super::{
     AwaitStateOptions, ContinueDrain, ControlReport, DBG_KD_EXCEPTION_STATE_CHANGE,
     DBG_KD_LOAD_SYMBOLS_STATE_CHANGE, KD_REQUEST_TIMEOUT, KdBackend, Link, PUMP_POLL,
@@ -245,7 +243,7 @@ impl KdBackend {
         register_map: &RegisterMap,
     ) -> Result<u64> {
         if let Some(context) = self.registers.context(processor)
-            && let Ok(pc) = register_map.read_u64("rip", context)
+            && let Ok(pc) = register_map.read_u64(self.arch.pc_register(), context)
         {
             return Ok(pc);
         }
@@ -281,7 +279,7 @@ impl KdBackend {
                 let dr7 = match self.registers.special(processor) {
                     // A `ba` installed during this halt wrote the cache; it
                     // is newer than the report.
-                    Some(special) => bytes::read_u64(special, KSPECIAL_REGISTERS_DR7_OFFSET),
+                    Some(special) => self.arch.special_register_map().read_u64("dr7", special)?,
                     None => reported_dr7.expect("read the registers when no report offered DR7"),
                 };
                 with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
@@ -370,7 +368,7 @@ impl KdBackend {
         // inside nt!KiFreezeTargetExecution, with debug exceptions masked
         // (PSTATE.D), not as the code the freeze interrupted, so the trace
         // flag is set in a state where no step can occur.
-        if processor != owner && self.arch == Arch::Arm64 {
+        if processor != owner && self.arch.family() == Family::Arm {
             return Err(Error::Kd(format!(
                 "{} stopped the target, and on ARM64 only that processor can step; select it \
                  with ~{owner}s, or resume with g",
@@ -432,12 +430,15 @@ impl KdBackend {
         if processor == owner {
             return request(self);
         }
-        if self.arch == Arch::Arm64 {
-            return Err(Error::Kd(format!(
-                "{} stopped the target, and on ARM64 the target reads registers only on that \
-                 processor",
-                thread_id_for(owner)
-            )));
+        match self.arch.family() {
+            Family::X86 => {}
+            Family::Arm => {
+                return Err(Error::Kd(format!(
+                    "{} stopped the target, and on ARM64 the target reads registers only on that \
+                     processor",
+                    thread_id_for(owner)
+                )));
+            }
         }
         kd_trace!(
             "kd: switching from p{} to p{} for a register read",

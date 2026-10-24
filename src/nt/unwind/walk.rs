@@ -7,8 +7,9 @@ use super::{
     FrameSource, MAX_UNWIND_FRAMES, RecoveredFrame, RecoveredStackTrace, RegisterContext,
     StackTracer, ThreadTraceContext, Unwound, expand_frame,
 };
+use crate::arch::Arch;
 use crate::{
-    base::types::{Arch, Dtb, VirtAddr},
+    base::types::{Dtb, VirtAddr},
     nt::{
         guest::{Guest, ModuleInfo},
         target::Target,
@@ -26,7 +27,7 @@ pub(super) fn build_recovered_stacktrace_seeded(
     let limit = limit.max(1);
     let mut raw: Vec<(RegisterContext, FrameSource, Option<u64>)> = Vec::new();
     let mut tracer = StackTracer::new(debugger, trace);
-    let mut seen = HashSet::from([context.rip]);
+    let mut seen = HashSet::from([context.pc]);
     raw.push((
         context.clone(),
         initial_source,
@@ -47,8 +48,8 @@ pub(super) fn build_recovered_stacktrace_seeded(
             reached_end = true;
             break;
         }
-        let previous_rip = context.rip;
-        let previous_rsp = context.rsp;
+        let previous_rip = context.pc;
+        let previous_rsp = context.sp;
 
         let (stack_switch, source) = match tracer.unwind_once(&mut context) {
             Unwound::Stop => break,
@@ -58,7 +59,7 @@ pub(super) fn build_recovered_stacktrace_seeded(
 
         // A zero return address is the thread's initial frame: nothing above
         // it belongs to the thread, so there is nothing to scan either.
-        if context.rip == 0 {
+        if context.pc == 0 {
             reached_end = true;
             break;
         }
@@ -68,14 +69,14 @@ pub(super) fn build_recovered_stacktrace_seeded(
         if trace
             .foreign_image
             .as_ref()
-            .is_some_and(|image| !image.contains_address(VirtAddr(context.rip)))
+            .is_some_and(|image| !image.contains_address(VirtAddr(context.pc)))
         {
             reached_end = true;
             break;
         }
         // A frame that returns to its own address is a recursive call when
         // the stack moved, and a walk going nowhere when it did not.
-        if context.rip == previous_rip && context.rsp == previous_rsp {
+        if context.pc == previous_rip && context.sp == previous_rsp {
             unwind_trace!("unwind: frame returns to itself without moving -> scan");
             break;
         }
@@ -83,24 +84,25 @@ pub(super) fn build_recovered_stacktrace_seeded(
         // address, so a value there is no return address: the unwind went
         // wrong (a context short of registers, a stale slot), and the stack is
         // scanned from here instead of listing it as a frame.
-        if !could_be_return_address(context.rip, debugger.arch()) {
-            unwind_trace!("unwind: {:#x} is no return address -> scan", context.rip);
+        if !could_be_return_address(context.pc, debugger.arch()) {
+            unwind_trace!("unwind: {:#x} is no return address -> scan", context.pc);
             break;
         }
-        // An x64 return pops its address, so sp always climbs; an ARM64 leaf
-        // returns through lr and leaves sp where it was.
-        let stack_regressed = match debugger.arch() {
-            Arch::Amd64 => context.rsp <= previous_rsp,
-            Arch::Arm64 => context.rsp < previous_rsp,
+        // A return that pops its address always climbs the stack; a leaf
+        // returning through a link register leaves sp where it was.
+        let stack_regressed = if debugger.arch().return_pops_address() {
+            context.sp <= previous_rsp
+        } else {
+            context.sp < previous_rsp
         };
         if !stack_switch && stack_regressed {
             unwind_trace!(
                 "unwind: sp went from {previous_rsp:#x} back to {:#x} -> scan",
-                context.rsp
+                context.sp
             );
             break;
         }
-        seen.insert(context.rip);
+        seen.insert(context.pc);
         raw.push((context.clone(), source, tracer.frame_base_for(&context)));
     }
 
@@ -109,8 +111,8 @@ pub(super) fn build_recovered_stacktrace_seeded(
     } else {
         limit.saturating_sub(raw.len())
     };
-    for (sp, ip) in tracer.scan_stack(context.rsp, &seen, remaining) {
-        let mut scan_context = RegisterContext::new(ip, sp);
+    for (sp, ip) in tracer.scan_stack(context.sp, &seen, remaining) {
+        let mut scan_context = RegisterContext::new(debugger.arch(), ip, sp);
         // A scan only accepts slots holding return addresses.
         scan_context.after_call = true;
         raw.push((
@@ -123,7 +125,7 @@ pub(super) fn build_recovered_stacktrace_seeded(
     ensure_module_symbols(
         debugger,
         trace,
-        raw.iter().map(|(context, _, _)| context.rip),
+        raw.iter().map(|(context, _, _)| context.pc),
     );
 
     let mut stacktrace = RecoveredStackTrace::new(trace);
@@ -138,15 +140,15 @@ pub(super) fn build_recovered_stacktrace_seeded(
                 registers.insert(name.to_string(), *dtb);
             }
         }
-        for (name, value) in context.named_values(debugger.arch()) {
+        for (name, value) in context.named_values() {
             registers.insert(name.to_string(), value);
         }
 
         let frames = expand_frame(
             debugger,
             trace,
-            context.rip,
-            context.rsp,
+            context.pc,
+            context.sp,
             source,
             context.machine_frame,
             context.after_call,
@@ -222,13 +224,9 @@ pub(super) fn ensure_module_symbols(
 }
 
 /// Whether `address` could hold code: above the first 64 KiB, which Windows
-/// never maps, and, on AMD64, canonical.
+/// never maps, and a pointer by its upper bits.
 fn could_be_return_address(address: u64, arch: Arch) -> bool {
-    address >= 0x1_0000
-        && match arch {
-            Arch::Amd64 => matches!(address >> 47, 0 | 0x1_ffff),
-            Arch::Arm64 => true,
-        }
+    address >= 0x1_0000 && arch.paging().could_be_pointer(address)
 }
 
 pub(super) fn record_recovered_frame(

@@ -4,16 +4,14 @@ use std::io::{Cursor, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::thread::{JoinHandle, spawn};
 
-use crate::backend::cpu_context::{amd64, arm64};
+use crate::arch::{amd64, arm64};
 use crate::backend::kd::connect::MEMORY_OVER_KD_CHOSEN;
 use crate::backend::kd::framing::{
     HEADER_SIZE, Header, INITIAL_PACKET_ID, PACKET_TYPE_KD_ACKNOWLEDGE,
     PACKET_TYPE_KD_STATE_MANIPULATE, control_packet, data_packet,
 };
 use crate::backend::kd::memory::{KD_REMOTE_MEMORY_CHUNK, LineCache};
-use crate::backend::kd::registers::{
-    AMD64_DEBUG_CONTROL_SPACE_KSPECIAL, KSPECIAL_REGISTERS_MIN_SIZE,
-};
+use crate::backend::kd::registers::CONTROL_SPACE_KSPECIAL;
 
 mod breakpoints;
 mod connect;
@@ -178,7 +176,7 @@ fn kd_backend_with_pump(pump: PumpHandle, breakin_clone: UnixStream) -> KdBacken
         serial_reconnected: false,
         breakin_clone: breakin_clone.into(),
         backend_name: "kd",
-        register_map: amd64::build_register_map(),
+        register_map: Arch::Amd64.register_map().clone(),
         arch: Arch::Amd64,
         kernel_dtb_override: 0,
         teb_path: None,
@@ -231,7 +229,7 @@ fn kd_backend_with_framing(host: UnixStream) -> KdBackend {
         serial_reconnected: false,
         breakin_clone: breakin_clone.into(),
         backend_name: "kd",
-        register_map: amd64::build_register_map(),
+        register_map: Arch::Amd64.register_map().clone(),
         arch: Arch::Amd64,
         kernel_dtb_override: 0,
         teb_path: None,
@@ -322,14 +320,15 @@ fn serve_breakpoints(
 fn read_special_registers_reply_payload(processor: u16) -> Vec<u8> {
     const MANIPULATE_UNION_OFFSET: usize = 16;
 
-    let mut payload = vec![0u8; api::MANIPULATE_HEADER_SIZE + KSPECIAL_REGISTERS_MIN_SIZE];
+    let size = Arch::Amd64.special_register_map().extent();
+    let mut payload = vec![0u8; api::MANIPULATE_HEADER_SIZE + size];
     payload[0..4].copy_from_slice(&api::DBGKD_READ_CONTROL_SPACE.to_le_bytes());
     payload[6..8].copy_from_slice(&processor.to_le_bytes());
     payload[MANIPULATE_UNION_OFFSET..MANIPULATE_UNION_OFFSET + 8]
-        .copy_from_slice(&AMD64_DEBUG_CONTROL_SPACE_KSPECIAL.to_le_bytes());
+        .copy_from_slice(&CONTROL_SPACE_KSPECIAL.to_le_bytes());
     payload[MANIPULATE_UNION_OFFSET + 8..MANIPULATE_UNION_OFFSET + 12]
-        .copy_from_slice(&(KSPECIAL_REGISTERS_MIN_SIZE as u32).to_le_bytes());
+        .copy_from_slice(&(size as u32).to_le_bytes());
     payload[MANIPULATE_UNION_OFFSET + 12..MANIPULATE_UNION_OFFSET + 16]
-        .copy_from_slice(&(KSPECIAL_REGISTERS_MIN_SIZE as u32).to_le_bytes());
+        .copy_from_slice(&(size as u32).to_le_bytes());
     payload
 }

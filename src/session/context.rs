@@ -3,9 +3,8 @@
 
 use std::collections::HashMap;
 
-use crate::backend::dbg_backend::{
-    DebugCapability, RegisterMap, processor_index_from_backend_thread_id,
-};
+use crate::arch::{ArgumentLocation, RegisterFile, RegisterMap};
+use crate::backend::dbg_backend::{DebugCapability, processor_index_from_backend_thread_id};
 use crate::base::error::{Error, Result};
 use crate::base::memory::DTB_IDENTITY;
 use crate::base::types::VirtAddr;
@@ -15,7 +14,6 @@ use crate::nt::unwind::{
     UNKNOWN_CONTEXT, guest_vp_running, halted_in_windows_hypervisor, resolve_thread_trace_context,
     resolve_thread_trace_context_at, saved_vtls, try_format_symbol,
 };
-use crate::nt::userdump::register_buffer;
 use crate::session::{Selection, Session, ThreadContext, UserThreadSummary, VcpuInfo};
 
 pub(super) fn update_target_context_from_registers(
@@ -309,8 +307,10 @@ impl Session {
             .set_current_thread(&self.current_thread)
             .and_then(|()| self.backend.read_registers())?;
         let value = |name| self.register_map.read_u64(name, &registers).ok();
-        let (Some(cr3), Some(rip)) = (value(self.target.arch().dtb_register()), value("rip"))
-        else {
+        let (Some(cr3), Some(rip)) = (
+            value(self.target.arch().dtb_register()),
+            value(self.target.arch().pc_register()),
+        ) else {
             return Ok(false);
         };
         Ok(halted_in_windows_hypervisor(&self.target, cr3, rip))
@@ -328,8 +328,10 @@ impl Session {
             .set_current_thread(&self.current_thread)
             .and_then(|()| self.backend.read_registers())?;
         let value = |name| self.register_map.read_u64(name, &registers).ok();
-        let (Some(cr3), Some(rip)) = (value(self.target.arch().dtb_register()), value("rip"))
-        else {
+        let (Some(cr3), Some(rip)) = (
+            value(self.target.arch().dtb_register()),
+            value(self.target.arch().pc_register()),
+        ) else {
             return Ok(None);
         };
         let processor = processor_index_from_backend_thread_id(&self.current_thread);
@@ -406,11 +408,32 @@ impl Session {
             .ok()
             .and_then(|r| {
                 self.register_map
-                    .read_u64("rip", &r)
-                    .or_else(|_| self.register_map.read_u64("pc", &r))
+                    .read_u64(self.target.arch().pc_register(), &r)
                     .ok()
             })
             .unwrap_or(0)
+    }
+
+    /// Argument `index` of the function the current thread has just entered,
+    /// where the calling convention puts it: a register `register` reads, or
+    /// a stack slot above the stack pointer `register` reads.
+    pub fn argument_on_entry(
+        &self,
+        index: usize,
+        register: impl Fn(&str) -> Option<u64>,
+    ) -> Option<u64> {
+        let arch = self.target.arch();
+        match arch.argument(index) {
+            ArgumentLocation::Register(name) => register(name),
+            ArgumentLocation::Stack(offset) => {
+                let stack = register(arch.sp_register())?;
+                self.target
+                    .address_space(self.target.current_dtb())
+                    .read_pointer(VirtAddr(stack.wrapping_add(offset)))
+                    .ok()
+                    .map(|value| value.0)
+            }
+        }
     }
 
     /// Read the selected live vCPU register file. A parked Windows thread is a
@@ -508,7 +531,6 @@ impl Session {
     pub fn user_threads(&self) -> Option<Vec<UserThreadSummary>> {
         let info = self.target.user_dump_info()?;
         let exception_thread = info.exception.as_ref().map(|exception| exception.thread_id);
-        let ip = self.target.instruction_pointer_register();
         let trace = resolve_thread_trace_context(&self.target, 0);
         Some(
             info.threads
@@ -516,10 +538,8 @@ impl Session {
                 .enumerate()
                 .map(|(index, thread)| {
                     let id = info.backend_thread_id(thread.tid);
-                    let rip = thread.context.as_ref().ok().and_then(|raw| {
-                        self.register_map
-                            .read_u64(ip, &register_buffer(info.arch, raw))
-                            .ok()
+                    let rip = thread.context.as_ref().ok().map(|raw| {
+                        RegisterFile::from_context(info.arch, raw).instruction_pointer()
                     });
                     UserThreadSummary {
                         index,
@@ -605,7 +625,8 @@ impl Session {
     /// off.
     pub(super) fn describe_vcpu(&self, id: &str, regs: &[u8]) -> VcpuInfo {
         let (Ok(rip), Ok(dtb)) = (
-            self.register_map.read_u64("rip", regs),
+            self.register_map
+                .read_u64(self.target.arch().pc_register(), regs),
             self.register_map
                 .read_u64(self.target.arch().dtb_register(), regs),
         ) else {

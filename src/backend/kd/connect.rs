@@ -6,13 +6,13 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::arch::{Arch, machine_name};
 use crate::backend::dbg_backend::DebugLog;
 use crate::backend::debugger_data::{DebuggerDataCandidate, MetadataSource};
 use crate::backend::kd::framing::KdFraming;
-use crate::base::bytes;
 use crate::base::error::{Error, Result};
 use crate::base::memory::{AddressSpace, MemoryOps, TranslationCache};
-use crate::base::types::{Arch, Dtb, PhysAddr, VirtAddr};
+use crate::base::types::{Dtb, PhysAddr, VirtAddr};
 
 use super::breakpoints::{
     breakpoint_instruction_at, reclaimed_breakpoints_notice, restore_unowned_breakpoint_handles,
@@ -20,7 +20,7 @@ use super::breakpoints::{
 use super::halt::HaltRegisters;
 use super::kdnet::KdNetStream;
 use super::memory::{KD_REMOTE_MEMORY_CHUNK, LineCache};
-use super::registers::{ARM64_WINDBG_TTBR1_EL1, KSPECIAL_REGISTERS_CR3_OFFSET};
+use super::registers::ARM64_WINDBG_TTBR1_EL1;
 use super::transport::KdTransport;
 use super::{
     DBG_KD_EXCEPTION_STATE_CHANGE, DEBUG_LOG_CAPACITY, KD_REQUEST_TIMEOUT, KdBackend,
@@ -28,7 +28,6 @@ use super::{
     kd_initial_timeout, kd_socket_connect_error, poll_for_initial_break, probe_initial_request,
     with_framing_read_timeout,
 };
-use crate::backend::cpu_context::{amd64, arm64};
 
 /// [`KdBackend::running_reason`] when the operator picked `--memory-source kd`.
 pub(super) const MEMORY_OVER_KD_CHOSEN: &str = "Guest memory is read over KD on this session, and KD only \
@@ -38,18 +37,12 @@ const MEMORY_OVER_KD_FALLBACK: &str = "Guest memory is read over KD on this sess
      was unavailable at connect), and KD only answers while the target is halted.";
 
 pub(super) fn detect_arch(machine_type: u16) -> Result<Arch> {
-    match Arch::from_machine_type(machine_type) {
-        Some(arch) => Ok(arch),
-        None => {
-            let name = match machine_type {
-                0x014c => "I386",
-                _ => "unknown",
-            };
-            Err(Error::UnsupportedArchitecture(format!(
-                "{name} KD target (machine {machine_type:#06x})"
-            )))
-        }
-    }
+    Arch::from_machine_type(machine_type).ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!(
+            "{} KD target (machine {machine_type:#06x})",
+            machine_name(machine_type)
+        ))
+    })
 }
 
 pub(super) fn normalize_kernel_dtb(arch: Arch, register_value: u64) -> Dtb {
@@ -137,10 +130,7 @@ impl KdBackend {
             }
         };
         let arch = detect_arch(version.machine_type)?;
-        let register_map = match arch {
-            Arch::Amd64 => amd64::build_register_map(),
-            Arch::Arm64 => arm64::build_register_map(),
-        };
+        let register_map = arch.register_map().clone();
         // The first state-change often arrives with KD's SYNC bit set. That is
         // the baseline connection, not a target reload for the REPL to surface.
         framing.take_peer_reset_seen();
@@ -261,7 +251,7 @@ impl KdBackend {
         let register_value = match self.arch {
             Arch::Amd64 => {
                 let special = self.read_special_registers_uncached(processor)?;
-                bytes::read_u64(&special, KSPECIAL_REGISTERS_CR3_OFFSET)
+                self.arch.special_register_map().read_u64("cr3", &special)?
             }
             Arch::Arm64 => {
                 with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {

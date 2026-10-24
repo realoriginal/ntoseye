@@ -5,12 +5,13 @@ use super::{
     AttachReport, CODE_BITNESS_AMD64, CODE_BITNESS_X86, SelectedFrame, Target, TargetSelection,
     ThreadInfo, lookup_register, process_matches,
 };
+use crate::arch::Arch;
 use crate::{
     base::{
         bytes::c_string_lossy,
         error::{Error, Result},
         memory::{DTB_IDENTITY, MemoryOps},
-        types::{Arch, CodeMachine, Dtb, VirtAddr},
+        types::{CodeMachine, Dtb, VirtAddr},
     },
     nt::{
         bugchecks::looks_like_kernel_pointer,
@@ -23,6 +24,7 @@ const COMPATIBILITY_MODE_CS: u64 = 0x23;
 const WOW64_ADDRESS_LIMIT: u64 = 1 << 32;
 
 fn decide_bitness(
+    arch: Arch,
     effmach: Option<CodeMachine>,
     cs: Option<u64>,
     is_wow64: bool,
@@ -37,7 +39,7 @@ fn decide_bitness(
         };
     }
 
-    let is_user = !looks_like_kernel_pointer(address.0);
+    let is_user = !looks_like_kernel_pointer(arch, address.0);
     if is_user && cs == Some(COMPATIBILITY_MODE_CS) {
         return CODE_BITNESS_X86;
     }
@@ -270,7 +272,7 @@ impl Target {
         };
         if self
             .address_space(dtb)
-            .read::<u64>(process_list.address())
+            .read_pointer(process_list.address())
             .is_ok()
         {
             return dtb;
@@ -435,6 +437,8 @@ impl Target {
             .ok_or(Error::NtoskrnlNotFound)?;
 
         let dtb = self.kernel_dtb();
+        let arch = self.arch();
+        let pointer_size = arch.pointer_size() as usize;
         let eprocess_layout = self
             .symbols
             .find_type_across_modules(dtb, "_EPROCESS")
@@ -445,14 +449,8 @@ impl Target {
             .ok()
             .and_then(|off| {
                 let off = off as usize;
-                if off + 8 <= proc_snap.len() {
-                    proc_snap[off..off + 8]
-                        .try_into()
-                        .ok()
-                        .map(u64::from_le_bytes)
-                } else {
-                    None
-                }
+                (off + pointer_size <= proc_snap.len())
+                    .then(|| arch.decode_pointer(&proc_snap[off..]).0)
             })
             .unwrap_or(0);
 
@@ -526,15 +524,25 @@ impl Target {
             return machine;
         }
         match self.arch() {
-            Arch::Amd64 if self.code_bitness(address) == CODE_BITNESS_X86 => CodeMachine::X86,
-            Arch::Amd64 => CodeMachine::Amd64,
+            Arch::Amd64 => self.executing_machine(address),
             Arch::Arm64 => self.arm64_image_code_machine(address),
+        }
+    }
+
+    /// The instruction set the processor runs at `address`, for stepping
+    /// it: its compatibility mode's in a WOW64 process's 32-bit code, else
+    /// its own. Unlike [`Self::code_machine`], never an emulated image's.
+    pub fn executing_machine(&self, address: VirtAddr) -> CodeMachine {
+        let arch = self.arch();
+        match arch.compatibility_machine() {
+            Some(machine) if self.code_bitness(address) == CODE_BITNESS_X86 => machine,
+            _ => arch.code_machine(),
         }
     }
 
     fn arm64_image_code_machine(&self, address: VirtAddr) -> CodeMachine {
         // The kernel and its drivers are ARM64.
-        if looks_like_kernel_pointer(address.0) {
+        if looks_like_kernel_pointer(self.arch(), address.0) {
             return CodeMachine::Arm64;
         }
         let Some(module) = self
@@ -566,7 +574,7 @@ impl Target {
     /// can reuse the result for every instruction in its decode window.
     pub fn code_bitness(&self, address: VirtAddr) -> u32 {
         if self.effmach.is_some() {
-            return decide_bitness(self.effmach, None, false, &[], address);
+            return decide_bitness(self.arch(), self.effmach, None, false, &[], address);
         }
 
         let cs = if self
@@ -578,7 +586,7 @@ impl Target {
         } else {
             self.register_value("cs")
         };
-        if decide_bitness(None, cs, false, &[], address) == CODE_BITNESS_X86 {
+        if decide_bitness(self.arch(), None, cs, false, &[], address) == CODE_BITNESS_X86 {
             return CODE_BITNESS_X86;
         }
 
@@ -588,13 +596,14 @@ impl Target {
         }
 
         let modules = self.modules().unwrap_or_default();
-        decide_bitness(None, cs, true, &modules, address)
+        decide_bitness(self.arch(), None, cs, true, &modules, address)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{decide_bitness, select_thread_process_dtb, thread_owner_matches};
+    use crate::arch::Arch;
     use crate::base::memory::DTB_IDENTITY;
     use crate::base::types::CodeMachine;
     use crate::base::types::VirtAddr;
@@ -614,6 +623,7 @@ mod tests {
 
         assert_eq!(
             decide_bitness(
+                Arch::Amd64,
                 Some(CodeMachine::Amd64),
                 Some(0x23),
                 true,
@@ -623,19 +633,33 @@ mod tests {
             CODE_BITNESS_AMD64
         );
         assert_eq!(
-            decide_bitness(None, Some(0x23), false, &[], VirtAddr(0x7fff_0000),),
+            decide_bitness(
+                Arch::Amd64,
+                None,
+                Some(0x23),
+                false,
+                &[],
+                VirtAddr(0x7fff_0000),
+            ),
             CODE_BITNESS_X86
         );
         assert_eq!(
-            decide_bitness(None, None, true, &[x86], VirtAddr(0x400100)),
+            decide_bitness(Arch::Amd64, None, None, true, &[x86], VirtAddr(0x400100)),
             CODE_BITNESS_X86
         );
         assert_eq!(
-            decide_bitness(None, None, true, &[x64], VirtAddr(0x0000_7ff6_0000_0100)),
+            decide_bitness(
+                Arch::Amd64,
+                None,
+                None,
+                true,
+                &[x64],
+                VirtAddr(0x0000_7ff6_0000_0100)
+            ),
             CODE_BITNESS_AMD64
         );
         assert_eq!(
-            decide_bitness(None, None, false, &[], VirtAddr(0x7fff_0000)),
+            decide_bitness(Arch::Amd64, None, None, false, &[], VirtAddr(0x7fff_0000)),
             CODE_BITNESS_AMD64
         );
     }

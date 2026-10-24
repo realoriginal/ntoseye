@@ -4,8 +4,8 @@ use libc::{SIGHUP, SIGTERM, c_int, sigaction, sigemptyset, sighandler_t};
 use nu_ansi_term::{Color, Style};
 #[cfg(feature = "cli")]
 use reedline::{
-    DescriptionMode, Emacs, FileBackedHistory, IdeMenu, KeyCode, KeyModifiers, MenuBuilder,
-    ReedlineEvent, ReedlineMenu, default_emacs_keybindings,
+    DefaultHinter, DescriptionMode, Emacs, FileBackedHistory, IdeMenu, KeyCode, KeyModifiers,
+    MenuBuilder, Osc133Markers, ReedlineEvent, ReedlineMenu, default_emacs_keybindings,
 };
 #[cfg(feature = "cli")]
 use reedline::{Reedline, Signal};
@@ -28,15 +28,17 @@ use tabled::settings::Padding;
 
 use owo_colors::OwoColorize;
 
-#[cfg(feature = "cli")]
-use crate::backend::dbg_backend::DebugBackend;
 use crate::backend::dbg_backend::{BackendCapability, DebugCapability};
+#[cfg(feature = "cli")]
+use crate::backend::dbg_backend::{DebugBackend, thread_label};
 use crate::base::diagnostics;
 #[cfg(feature = "cli")]
 use crate::base::error::Error;
 use crate::base::error::Result;
 #[cfg(feature = "cli")]
-use crate::base::output::{log_input_line, prompting};
+use crate::base::output::{
+    self, drop_leading_blank_lines, log_input_line, prompting, separate_prompt,
+};
 #[cfg(feature = "cli")]
 use crate::base::time::filetime_to_iso;
 #[cfg(feature = "cli")]
@@ -85,6 +87,7 @@ mod completion;
 mod disasm;
 #[cfg(feature = "cli")]
 mod line_editor;
+pub mod listing;
 mod memory_view;
 #[cfg(feature = "cli")]
 pub mod native;
@@ -92,6 +95,7 @@ pub mod native;
 mod palette;
 mod remote;
 mod stop;
+mod terminal;
 #[cfg(feature = "cli")]
 mod tern_prompt;
 pub mod usage;
@@ -109,6 +113,7 @@ use line_editor::{CustomPrompt, MyCompleter, TrackingHighlighter};
 pub use memory_view::*;
 pub use remote::*;
 pub use stop::*;
+use terminal::PromptMark;
 
 pub fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
     let mut summary = format!("loaded {}/{}", report.loaded, report.total);
@@ -220,11 +225,21 @@ pub fn print_backend_capability_warning(capabilities: &[BackendCapability]) {
 }
 
 pub fn print_padded_table(builder: Builder) {
+    print_indented_table(builder, "");
+}
+
+/// [`print_padded_table`] `indent` in, under a heading that is.
+pub fn print_indented_table(builder: Builder, indent: &str) {
     let mut table = builder.build();
     table
         .with(tabled::settings::Style::empty())
         .with(Padding::new(0, 2, 0, 0));
-    outln!("{table}\n");
+    // tabled pads the last column too: its rows end without the spaces.
+    for line in table.to_string().lines() {
+        outln!("{indent}{}", line.trim_end());
+    }
+    // Apart from what follows; dropped when nothing does.
+    outln!();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,6 +314,10 @@ pub struct ReplState<'a> {
     /// buffer to print, for a backend without KD's stream, which prints
     /// its own: the interactive prompt prints them while a run waits.
     pub printed_debug_seq: u64,
+    /// How long the run last driven took, until its stop is rendered: after
+    /// a long one at the interactive prompt, the terminal is asked to notify
+    /// (see [`ReplState::notify_stop`]).
+    pub last_run: Option<Duration>,
     /// What `!virtio` and `!vring` last saw of each queue, to show what
     /// moved since.
     pub virtio_seen: commands::virtio::VirtioSeen,
@@ -518,6 +537,7 @@ impl<'a> ReplState<'a> {
             unseen_stop_rendered: false,
             line_depth: 0,
             printed_debug_seq: 0,
+            last_run: None,
             virtio_seen: store.virtio_seen,
         }
     }
@@ -537,14 +557,60 @@ impl<'a> ReplState<'a> {
         }
     }
 
-    /// The unstyled prompt, `ntoseye>` or `kd:p1.1>`, that the plain REPL
+    /// The unstyled prompt, `ntoseye>` or `0: kd>`, that the plain REPL
     /// prints and a script echoes its commands after.
     pub fn plain_prompt(&self) -> String {
-        let thread = &self.ctx.current_thread;
-        if thread.is_empty() {
+        if self.ctx.current_thread.is_empty() {
             "ntoseye>".to_string()
         } else {
-            format!("{}:{thread}>", self.ctx.backend.name())
+            format!("{}: {}>", self.prompt_thread(), self.prompt_backend())
+        }
+    }
+
+    /// What the prompt names the current thread by: the number `~` selects
+    /// it by, the processor's (`3`) or, in a user-mode dump, the thread's
+    /// place in the dump's list (`17`), as WinDbg's `0:017>` does.
+    pub fn prompt_thread(&self) -> String {
+        let thread = &self.ctx.current_thread;
+        self.ctx
+            .target
+            .user_dump_info()
+            .and_then(|info| info.thread_index(info.tid_for_backend_id(thread)?))
+            .map_or_else(|| thread_label(thread), |index| index.to_string())
+    }
+
+    /// The window title: the prompt's processor and backend, and where the
+    /// target stopped or that it runs (`ntoseye — 3: kd — nt!NtClose+0x5`).
+    pub fn window_title(&self, running: bool) -> String {
+        let thread = &self.ctx.current_thread;
+        let mut title = if thread.is_empty() {
+            "ntoseye".to_string()
+        } else {
+            format!(
+                "ntoseye — {}: {}",
+                self.prompt_thread(),
+                self.prompt_backend()
+            )
+        };
+        if running {
+            title.push_str(" — running");
+        } else if let Some(shown) = self
+            .ctx
+            .shown_stop
+            .as_ref()
+            .filter(|shown| shown.thread == *thread)
+        {
+            title.push_str(&format!(" — {}", shown.symbol));
+        }
+        title
+    }
+
+    /// What the prompt names after the processor: the backend (`kd`), or
+    /// the guest partition a view inspects (`partition 0x3`).
+    pub fn prompt_backend(&self) -> String {
+        match self.ctx.partition() {
+            Some(partition) => format!("partition {partition:#x}"),
+            None => self.ctx.backend.name().to_string(),
         }
     }
 
@@ -708,9 +774,36 @@ pub fn start_plain_repl(ctx: &mut Session) -> Result<()> {
     start_repl_with_mode(ctx, true)
 }
 
+/// What the session found of the target's kernel.
+#[cfg(feature = "cli")]
+struct KernelSummary {
+    /// `NtBuildNumber`, when the kernel was found.
+    build: Option<u16>,
+    base: Option<u64>,
+    /// `PsLoadedModuleList`; zero when unavailable.
+    modules: Option<u64>,
+}
+
+/// What a user-mode minidump captured, as the session opens with it.
+#[cfg(feature = "cli")]
+struct UserDumpSummary {
+    /// `charmap.exe (PID 1234)`.
+    process: String,
+    /// `Windows 10.0.26100 AMD64`, with the build string when recorded.
+    system: String,
+    /// When the dump was written (`MINIDUMP_HEADER.TimeDateStamp`).
+    written: Option<String>,
+    threads: usize,
+    modules: usize,
+    /// Captured memory: how many ranges, how many bytes.
+    memory: String,
+    /// The exception the dump was written for, described.
+    exception: Option<String>,
+}
+
 /// The session's opening summary of the target's kernel.
 #[cfg(feature = "cli")]
-fn print_target(target: &native::session::Target) {
+fn print_target(target: &KernelSummary) {
     outln!("\n{}", ui::label("target"));
     match (target.build, target.base) {
         (Some(build), Some(base)) => {
@@ -735,7 +828,7 @@ fn print_target(target: &native::session::Target) {
 /// What a user-mode minidump captured, for the session's opening summary;
 /// `None` for a kernel target.
 #[cfg(feature = "cli")]
-fn user_dump_summary(target: &Target) -> Option<native::session::UserDump> {
+fn user_dump_summary(target: &Target) -> Option<UserDumpSummary> {
     let dump = target.user_dump()?;
     let info = dump.info();
     let system = &info.system;
@@ -750,7 +843,7 @@ fn user_dump_summary(target: &Target) -> Option<native::session::UserDump> {
         version.push_str(&format!(" ({build})"));
     }
     let captured: u64 = dump.memory_ranges().iter().map(|range| range.length).sum();
-    Some(native::session::UserDump {
+    Some(UserDumpSummary {
         process: info.process_label(),
         system: version,
         written: filetime_to_iso((u64::from(info.time_date_stamp) + 11_644_473_600) * 10_000_000),
@@ -767,7 +860,7 @@ fn user_dump_summary(target: &Target) -> Option<native::session::UserDump> {
 
 /// The session's opening summary of a user-mode minidump.
 #[cfg(feature = "cli")]
-fn print_user_dump_target(dump: &native::session::UserDump) {
+fn print_user_dump_target(dump: &UserDumpSummary) {
     outln!("\n{}", ui::label("user-mode minidump"));
     outln!("  {} {}", ui::muted("process  "), dump.process);
     outln!("  {} {}", ui::muted("system   "), dump.system);
@@ -802,8 +895,6 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
     install_termination_handler();
     #[cfg(unix)]
     bridge_termination_to_interrupt(debugger.interrupt_requester());
-
-    let backend_label = client.name();
 
     // Loaded up front so the summary prints with the transport banner and
     // the completion caches below see them.
@@ -840,33 +931,25 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
     print_alias_load_failures(&alias_report);
 
     if let Some(dump) = user_dump_summary(debugger) {
-        native::render(
-            || native::session::user_dump_card(&dump),
-            || print_user_dump_target(&dump),
-        );
+        print_user_dump_target(&dump);
     } else {
         // Triage dumps may lack the ntoskrnl PE header needed for full kernel
         // discovery; a missing kernel is non-fatal and commands that need it
         // fail individually.
         let target = match debugger.startup_message_data() {
-            Ok(message_data) => native::session::Target {
+            Ok(message_data) => KernelSummary {
                 build: Some(message_data.build_number),
                 base: Some(message_data.base_address.0),
                 modules: Some(message_data.loaded_module_list.0),
             },
-            Err(Error::NtoskrnlNotFound) | Err(Error::AddressNotInDump(_)) => {
-                native::session::Target {
-                    build: None,
-                    base: debugger.kernel_base().map(|base| base.0),
-                    modules: None,
-                }
-            }
+            Err(Error::NtoskrnlNotFound) | Err(Error::AddressNotInDump(_)) => KernelSummary {
+                build: None,
+                base: debugger.kernel_base().map(|base| base.0),
+                modules: None,
+            },
             Err(e) => return Err(e),
         };
-        native::render(
-            || native::session::target_card(&target),
-            || print_target(&target),
-        );
+        print_target(&target);
     }
     let capabilities = client.capabilities();
     print_backend_capability_warning(&capabilities);
@@ -988,12 +1071,27 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
         had_content: Arc::clone(&had_content),
     };
 
+    // Under `NO_COLOR` the prompt and the completion menu are plain, and no
+    // line is suggested: without its dim style a suggestion would read as
+    // typed, and Enter would run something other than what the line shows.
+    let styled = output::stdout_styled();
     let mut line_editor = Reedline::create()
         .with_completer(completor)
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+        .with_ansi_colors(styled)
+        // OSC 133 `A` and `B` around the prompt; the loop below marks the
+        // output (`C`) and the end of each line it runs (`D`).
+        .with_semantic_markers(Some(Osc133Markers::boxed()))
         .with_edit_mode(edit_mode)
         .with_highlighter(Box::new(highlighter))
         .with_history_exclusion_prefix(Some(" ".to_string()));
+    if styled {
+        // The rest of the newest earlier line that starts with what is
+        // typed, dim after the cursor; Right, End or Ctrl+E takes it.
+        line_editor = line_editor.with_hinter(Box::new(
+            DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
+        ));
+    }
     if let Some(history_path) = ntoseye_home().map(|root| root.join("history")) {
         match FileBackedHistory::with_file(REPL_HISTORY_SIZE, history_path.clone()) {
             Ok(history) => {
@@ -1031,8 +1129,12 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
         unseen_stop_rendered: false,
         line_depth: 0,
         printed_debug_seq: 0,
+        last_run: None,
         virtio_seen: Default::default(),
     };
+    if !plain {
+        terminal::begin(!native::active());
+    }
     // An error ends the prompt, not the cleanup below: breakpoints left
     // planted in a guest that resumes without a debugger crash it.
     let prompt: Result<()> = (|| {
@@ -1045,6 +1147,7 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
                 if termination_requested() {
                     break;
                 }
+                separate_prompt();
                 outln!("{}", state.plain_prompt());
                 io::stdout().flush()?;
 
@@ -1057,10 +1160,13 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
                 }
                 let command = buffer.trim();
                 if command.is_empty() {
+                    // Nothing ran, so nothing sets the next prompt apart.
+                    drop_leading_blank_lines();
                     continue;
                 }
 
                 log_input_line(command);
+                drop_leading_blank_lines();
                 state.line = command.to_string();
                 // A Ctrl+C that ended the last command's step is spent.
                 state.ctx.target.interrupt.store(false, Ordering::SeqCst);
@@ -1073,9 +1179,11 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
                 if termination_requested() {
                     break;
                 }
+                separate_prompt();
                 // A run that ended without a result to show still stops
                 // its indicator before the prompt.
                 native::finish_running();
+                terminal::set_title(&state.window_title(false));
                 // In Tern the line is read in Tern's own field.
                 let native = match tern_prompt.as_mut() {
                     Some(native) => native.read(
@@ -1093,7 +1201,8 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
                     tern_prompt::Read::Clear => continue,
                     tern_prompt::Read::Unavailable => {
                         tern_prompt = None;
-                        let prompt = CustomPrompt::new(backend_label, &state.ctx.current_thread);
+                        let prompt =
+                            CustomPrompt::new(&state.prompt_backend(), &state.prompt_thread());
                         match target_loan.lend(&state.ctx.target, || {
                             prompting(|| line_editor.read_line(&prompt))
                         }) {
@@ -1110,10 +1219,17 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
                     Signal::Success(buffer) => {
                         if !buffer.trim().is_empty() {
                             log_input_line(buffer.trim());
+                            drop_leading_blank_lines();
                             state.line = buffer.trim().to_string();
                             // A Ctrl+C that ended the last command's step is spent.
                             state.ctx.target.interrupt.store(false, Ordering::SeqCst);
-                            match state.dispatch_line(&buffer)? {
+                            let errors = diagnostics::errors_reported();
+                            terminal::mark(PromptMark::Output);
+                            let flow = state.dispatch_line(&buffer);
+                            terminal::mark(PromptMark::Finished {
+                                failed: flow.is_err() || diagnostics::errors_reported() != errors,
+                            });
+                            match flow? {
                                 Flow::Quit => break,
                                 Flow::Continue | Flow::Denied | Flow::Jump(_) => {}
                             }
@@ -1144,6 +1260,7 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
         Ok(())
     })();
 
+    terminal::end();
     // The breakpoints, traps and backend to clean up are the target's, which
     // a partition view keeps aside while it is shown.
     state.ctx.leave_partition();
@@ -1189,6 +1306,7 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::arch::Arch;
     use crate::backend::dbg_backend::{BugcheckInfo, StopEvent};
     use crate::base::output::capture;
     use crate::base::types::VirtAddr;
@@ -1224,8 +1342,8 @@ mod tests {
 
     #[test]
     fn kernel_pointer_heuristic_accepts_canonical_kernel_addresses() {
-        assert!(looks_like_kernel_pointer(0xfffff8007f1afb50));
-        assert!(!looks_like_kernel_pointer(0x00000000000000e2));
+        assert!(looks_like_kernel_pointer(Arch::Amd64, 0xfffff8007f1afb50));
+        assert!(!looks_like_kernel_pointer(Arch::Amd64, 0x00000000000000e2));
     }
 
     #[test]

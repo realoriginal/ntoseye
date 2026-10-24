@@ -1,9 +1,11 @@
 use std::fs;
 
+use crate::arch::Arch;
+use crate::base::disasm::instruction_length;
 use crate::base::error::{Error, Result};
 use crate::base::memory::MemoryOps;
 use crate::base::ntstatus::{ntstatus_name, win32_error_name};
-use crate::base::types::{Arch, Dtb, VirtAddr};
+use crate::base::types::{Dtb, VirtAddr};
 use crate::nt::guest::{
     ModuleInfo, ProcessInfo, ProcessModulesDetail, UNKNOWN_MODULE_NAME, merge_wow64_modules,
     walk_loader_list, walk_loader_list32,
@@ -1346,17 +1348,11 @@ impl Target {
         }
         let mut result = SectionCheckResult::default();
         let mut offset = 0usize;
-        let bitness = self.code_bitness(base + section.rva as u64);
+        let machine = self.executing_machine(base + section.rva as u64);
         while offset < section.expected.len() {
-            let instruction_len = match self.arch() {
-                Arch::Amd64 => expected_instruction_len(
-                    &section.expected[offset..],
-                    base.0 + section.rva as u64 + offset as u64,
-                    bitness,
-                ),
-                Arch::Arm64 => 4.min(section.expected.len() - offset),
-            };
-            let end = (offset + instruction_len.max(1)).min(section.expected.len());
+            let instruction_len = instruction_length(&section.expected[offset..], machine)
+                .unwrap_or(machine.min_instruction_bytes());
+            let end = (offset + instruction_len).min(section.expected.len());
             let expected = &section.expected[offset..end];
             let actual = &live[offset..end];
             if expected != actual {
@@ -1492,7 +1488,11 @@ impl Target {
         // KiSystemStartup's `lea rcx, [rip+...]` that fills
         // __guard_dispatch_icall_fptr. Both ends must start a dispatch
         // routine of the module, so code pointed anywhere else still counts.
-        if self.arch() == Arch::Amd64
+        let rip_relative = match self.arch() {
+            Arch::Amd64 => true,
+            Arch::Arm64 => false,
+        };
+        if rip_relative
             && let Some((expected_target, actual_target)) =
                 rip_relative_retarget(expected, expected_ip, actual, actual_ip)
             && self.starts_dispatch_routine(
@@ -1669,16 +1669,6 @@ fn is_skippable_section_read_error(error: &Error) -> bool {
             | Error::NotCaptured { .. }
             | Error::BadPhysicalAddress(_)
     )
-}
-
-fn expected_instruction_len(bytes: &[u8], address: u64, bitness: u32) -> usize {
-    let mut decoder = Decoder::with_ip(bitness, bytes, address, DecoderOptions::NONE);
-    let instruction = decoder.decode();
-    if instruction.code() == Code::INVALID || instruction.len() == 0 {
-        1
-    } else {
-        instruction.len().min(bytes.len())
-    }
 }
 
 fn rel32_target(address: u64, bytes: &[u8]) -> Option<u64> {

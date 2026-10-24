@@ -8,7 +8,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::transport::KdTransport;
-use crate::backend::dbg_backend::{DebugLog, RegisterMap};
+use crate::arch::{Arch, RegisterMap};
+use crate::backend::dbg_backend::DebugLog;
 use crate::backend::kd::api;
 use crate::backend::kd::framing::{
     KdFraming, PACKET_TYPE_KD_DEBUG_IO, PACKET_TYPE_KD_FILE_IO, PACKET_TYPE_KD_STATE_CHANGE64,
@@ -16,12 +17,10 @@ use crate::backend::kd::framing::{
 use crate::backend::kd::trace_enabled;
 use crate::base::bytes::{read_u16, read_u32, read_u64};
 use crate::base::error::{Error, Result};
-use crate::base::types::{Arch, VirtAddr};
+use crate::base::types::VirtAddr;
 
 use super::breakpoints::breakpoint_instruction_at;
-use super::registers::{
-    AMD64_DEBUG_CONTROL_SPACE_KSPECIAL, KSPECIAL_REGISTERS_DR7_OFFSET, KSPECIAL_REGISTERS_MIN_SIZE,
-};
+use super::registers::CONTROL_SPACE_KSPECIAL;
 use super::{
     BugcheckCapture, CONTROL_REPORT_OFFSET, ControlReport, DBG_KD_COMMAND_STRING_STATE_CHANGE,
     DBG_KD_EXCEPTION_STATE_CHANGE, DBG_KD_LOAD_SYMBOLS_STATE_CHANGE, KD_INITIAL_PROBE_TIMEOUT,
@@ -29,7 +28,6 @@ use super::{
     KD_RECONNECT_BREAKIN_INTERVAL, KD_RECONNECT_BREAKIN_TRACE_EVERY, KD_REQUEST_TIMEOUT, PUMP_POLL,
     STATUS_BREAKPOINT, StateChange, handle_debug_io_with_output, handle_file_io,
 };
-use crate::backend::cpu_context::{amd64, arm64};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitialHandshakeStimulus {
@@ -439,19 +437,19 @@ fn continue_preserving_dr7(
     continue_status: u32,
     trace: bool,
 ) -> Result<()> {
+    let special_map = Arch::Amd64.special_register_map();
     let special = api::read_control_space(
         framing,
         processor,
-        AMD64_DEBUG_CONTROL_SPACE_KSPECIAL,
-        KSPECIAL_REGISTERS_MIN_SIZE as u32,
+        CONTROL_SPACE_KSPECIAL,
+        special_map.extent() as u32,
     )?;
-    if special.len() < KSPECIAL_REGISTERS_DR7_OFFSET + 8 {
-        return Err(Error::Kd(format!(
+    let dr7 = special_map.read_u64("dr7", &special).map_err(|_| {
+        Error::Kd(format!(
             "KSPECIAL_REGISTERS buffer too short for KernelDr7: {} bytes",
             special.len()
-        )));
-    }
-    let dr7 = read_u64(&special, KSPECIAL_REGISTERS_DR7_OFFSET);
+        ))
+    })?;
     api::continue_api2(framing, processor, continue_status, trace, dr7)
 }
 
@@ -632,16 +630,9 @@ pub fn read_program_counter(
     processor: u16,
 ) -> Result<u64> {
     let context = with_framing_read_timeout(framing, KD_REQUEST_TIMEOUT, |framing| {
-        api::get_context(framing, processor, context_flags_for(arch))
+        api::get_context(framing, processor, arch.context_flags().all)
     })?;
-    register_map.read_u64("rip", &context)
-}
-
-fn context_flags_for(arch: Arch) -> u32 {
-    match arch {
-        Arch::Amd64 => amd64::CONTEXT_ALL,
-        Arch::Arm64 => arm64::CONTEXT_ALL,
-    }
+    register_map.read_u64(arch.pc_register(), &context)
 }
 
 /// KD reports software-breakpoint stops with the program counter still
@@ -657,11 +648,11 @@ pub fn advance_pc_past_breakpoint(
     processor: u16,
     expected_pc: u64,
 ) -> Result<()> {
-    let context_flags = context_flags_for(arch);
+    let context_flags = arch.context_flags().all;
     let mut context = with_framing_read_timeout(framing, KD_REQUEST_TIMEOUT, |framing| {
         api::get_context(framing, processor, context_flags)
     })?;
-    let pc = register_map.read_u64("rip", &context)?;
+    let pc = register_map.read_u64(arch.pc_register(), &context)?;
     if pc != expected_pc {
         return Err(Error::Kd(format!(
             "refusing to step p{} past a breakpoint: the PC moved from {expected_pc:#x} to \
@@ -670,7 +661,7 @@ pub fn advance_pc_past_breakpoint(
         )));
     }
     let next_pc = pc.wrapping_add(u64::from(arch.breakpoint_size()));
-    register_map.write_u64("rip", &mut context, next_pc)?;
+    register_map.write_u64(arch.pc_register(), &mut context, next_pc)?;
     kd_trace!(
         "kd: advance_pc: p{} read pc={:#x}, writing {}-byte CONTEXT in chunks",
         processor + 1,
@@ -685,7 +676,7 @@ pub fn advance_pc_past_breakpoint(
             with_framing_read_timeout(framing, KD_REQUEST_TIMEOUT, |framing| {
                 api::get_context(framing, processor, context_flags)
             })
-        && let Ok(verify_pc) = register_map.read_u64("rip", &verify_context)
+        && let Ok(verify_pc) = register_map.read_u64(arch.pc_register(), &verify_context)
     {
         kd_trace!(
             "kd: advance_pc: p{} wrote {:#x}, read back {:#x}",
@@ -942,12 +933,13 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use super::*;
+    use crate::arch::amd64;
     use crate::backend::kd::api::test_wire::{ack_then_reply, build_reply, first_outbound_id};
     use crate::backend::kd::framing::INITIAL_PACKET_ID;
 
     #[test]
     fn advance_pc_refuses_a_program_counter_that_moved_since_the_decision() {
-        let register_map = amd64::build_register_map();
+        let register_map = Arch::Amd64.register_map();
         let mut guest_context = vec![0u8; amd64::CONTEXT_SIZE];
         register_map
             .write_u64("rip", &mut guest_context, 0xffff_f800_0011_2233)
@@ -961,7 +953,7 @@ mod tests {
 
         let error = advance_pc_past_breakpoint(
             &mut framing,
-            &register_map,
+            register_map,
             Arch::Amd64,
             0,
             0xffff_f800_0011_0000,

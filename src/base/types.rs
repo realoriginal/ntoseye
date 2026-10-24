@@ -1,6 +1,10 @@
 use std::fmt;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
+use crate::arch::Arch;
+use crate::arch::amd64::disasm::X86;
+use crate::arch::arm64::Arm64;
+use crate::base::disasm::InstructionSet;
 use ntoseye_macros::record;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -164,6 +168,23 @@ impl CodeMachine {
         }
     }
 
+    /// How its code decodes.
+    pub fn instruction_set(self) -> &'static dyn InstructionSet {
+        match self {
+            Self::X86 => &X86::CODE32,
+            Self::Amd64 => &X86::CODE64,
+            Self::Arm64 => &Arm64,
+        }
+    }
+
+    /// Shortest encoded instruction: the step past bytes that decode to none.
+    pub const fn min_instruction_bytes(self) -> usize {
+        match self {
+            Self::X86 | Self::Amd64 => 1,
+            Self::Arm64 => 4,
+        }
+    }
+
     /// Longest encoded instruction, which bounds a lookbehind window.
     pub const fn max_instruction_bytes(self) -> usize {
         match self {
@@ -171,58 +192,13 @@ impl CodeMachine {
             Self::Arm64 => 4,
         }
     }
-}
 
-/// Guest CPU architecture. Determines page-table descriptor interpretation and
-/// register-file layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Arch {
-    #[default]
-    Amd64,
-    Arm64,
-}
-
-impl Arch {
-    pub fn label(self) -> &'static str {
+    /// `address` as this machine's instruction pointer holds it: 32 bits
+    /// on x86.
+    pub const fn code_address(self, address: u64) -> u64 {
         match self {
-            Self::Amd64 => "AMD64",
-            Self::Arm64 => "ARM64",
-        }
-    }
-
-    /// Register holding the current address space's page-table base.
-    pub const fn dtb_register(self) -> &'static str {
-        match self {
-            Self::Amd64 => "cr3",
-            Self::Arm64 => "ttbr0",
-        }
-    }
-
-    /// Bits of the DTB register that select the page-table base frame (PCID,
-    /// ASID, and reserved/canonical bits masked out), for comparing address
-    /// spaces.
-    pub const fn dtb_page_mask(self) -> u64 {
-        match self {
-            Self::Amd64 => 0x000F_FFFF_FFFF_F000,
-            Self::Arm64 => 0x0000_FFFF_FFFF_F000,
-        }
-    }
-
-    /// Bytes in the software breakpoint instruction (x86 `int3`, AArch64
-    /// `brk #0xF000`): how far the program counter must move to step past
-    /// one, and the kind an RSP `Z0` packet names.
-    pub const fn breakpoint_size(self) -> u8 {
-        match self {
-            Self::Amd64 => 1,
-            Self::Arm64 => 4,
-        }
-    }
-
-    pub fn from_machine_type(machine: u16) -> Option<Self> {
-        match machine {
-            0x8664 => Some(Self::Amd64),
-            0xaa64 => Some(Self::Arm64),
-            _ => None,
+            Self::X86 => address & u32::MAX as u64,
+            Self::Amd64 | Self::Arm64 => address,
         }
     }
 }
@@ -251,6 +227,58 @@ pub struct PteAttributes {
     pub flags: String,
 }
 
+/// The bits of an entry WinDbg's `!pte` flag string shows beyond those
+/// [`PteAttributes`] carries.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PteMarks {
+    pub copy_on_write: bool,
+    pub global: bool,
+    pub dirty: bool,
+    pub accessed: bool,
+    pub cache_disable: bool,
+    pub write_through: bool,
+}
+
+impl PteAttributes {
+    /// The attributes with WinDbg's flag string (`CGLDANTUWEV`, `-` for each
+    /// clear bit, `K`/`R` for kernel and read-only).
+    pub fn new(
+        present: bool,
+        large_page: bool,
+        writable: bool,
+        user: bool,
+        nx: bool,
+        pfn: u64,
+        marks: PteMarks,
+    ) -> Self {
+        let flag = |set: bool, letter: char| if set { letter } else { '-' };
+        let flags = [
+            flag(marks.copy_on_write, 'C'),
+            flag(marks.global, 'G'),
+            flag(large_page, 'L'),
+            flag(marks.dirty, 'D'),
+            flag(marks.accessed, 'A'),
+            flag(marks.cache_disable, 'N'),
+            flag(marks.write_through, 'T'),
+            if user { 'U' } else { 'K' },
+            if writable { 'W' } else { 'R' },
+            flag(!nx, 'E'),
+            flag(present, 'V'),
+        ]
+        .into_iter()
+        .collect();
+        Self {
+            present,
+            large_page,
+            writable,
+            user,
+            nx,
+            pfn,
+            flags,
+        }
+    }
+}
+
 /// A page-table level, by WinDbg's name for its entries: `PXE`, `PPE`,
 /// `PDE`, or `PTE`.
 #[record]
@@ -264,6 +292,22 @@ pub enum PageTableLevel {
     Pde,
     #[record(label = "PTE")]
     Pte,
+}
+
+impl PageTableLevel {
+    /// Every level, root first, as four-level tables have them.
+    pub const ALL: [Self; 4] = [Self::Pxe, Self::Ppe, Self::Pde, Self::Pte];
+
+    /// The lowest address bit its entries' index takes: each entry spans
+    /// `1 << shift` bytes.
+    pub const fn shift(self) -> u32 {
+        (match self {
+            Self::Pxe => PML4E_SHIFT,
+            Self::Ppe => PDPTE_SHIFT,
+            Self::Pde => PDE_SHIFT,
+            Self::Pte => PTE_SHIFT,
+        }) as u32
+    }
 }
 
 impl VirtAddr {
@@ -327,10 +371,6 @@ impl PageTableEntry {
         self.0 & 1 != 0
     }
 
-    pub const fn is_large_page(self) -> bool {
-        self.0 & 0x80 != 0
-    }
-
     /// This non-present entry with Windows' L1TF swizzle undone: an entry
     /// whose `SwizzleBit` (bit 4) is clear has `mask` set to point it at no
     /// real memory, and its frame is the one with `mask` cleared.
@@ -376,175 +416,8 @@ impl PageTableEntry {
         self.0 & PFN_MASK
     }
 
-    /// Base of the 1 GiB page a large PDPTE maps. In a large-page entry bit 12
-    /// is PAT and the bits below the page size are reserved, not address.
-    pub const fn huge_page_frame(self) -> u64 {
-        self.0 & PFN_MASK & !((1u64 << PDPTE_SHIFT) - 1)
-    }
-
-    /// Base of the 2 MiB page a large PDE maps (see
-    /// [`huge_page_frame`](Self::huge_page_frame)).
-    pub const fn large_page_frame(self) -> u64 {
-        self.0 & PFN_MASK & !((1u64 << PDE_SHIFT) - 1)
-    }
-
-    pub const fn is_user(self) -> bool {
-        self.0 & 0x4 != 0
-    }
-
-    pub const fn is_nx(self) -> bool {
-        self.0 & (1 << 63) != 0
-    }
-
-    pub const fn is_writable(self) -> bool {
-        self.0 & 0x2 != 0
-    }
-
     pub const fn pfn(self) -> u64 {
         self.page_frame() >> 12
-    }
-
-    /// What this entry means at `level` of `arch`'s tables, for an entry
-    /// on the walk of `address`. The flags are WinDbg's `!pte` string
-    /// (`CGLDANTUWEV`, `-` for each clear bit, `K`/`R` for kernel and
-    /// read-only), filled from each architecture's own bits.
-    pub fn attributes(self, arch: Arch, level: PageTableLevel, address: VirtAddr) -> PteAttributes {
-        let upper_level = matches!(level, PageTableLevel::Ppe | PageTableLevel::Pde);
-        let bit = |n: u32| self.0 & (1 << n) != 0;
-        let (present, large_page, writable, user, nx, pfn) = match arch {
-            // Bit 7 is PS only above the leaf; in a PTE it is PAT.
-            Arch::Amd64 => (
-                self.is_present(),
-                upper_level && self.is_large_page(),
-                self.is_writable(),
-                self.is_user(),
-                self.is_nx(),
-                self.pfn(),
-            ),
-            Arch::Arm64 => {
-                let block = upper_level && self.arm64_is_block();
-                // A block or page descriptor maps; a table descriptor's
-                // permission bits are Windows' own (it sets
-                // `TCR_EL1.HPD`), so it restricts nothing below it.
-                let table = level != PageTableLevel::Pte && !block;
-                let kernel = address.0 & (1 << 55) != 0;
-                let (writable, user, nx) = if table {
-                    (true, !kernel, false)
-                } else {
-                    (
-                        self.arm64_is_writable(),
-                        self.arm64_is_user(),
-                        if kernel {
-                            self.arm64_is_pxn()
-                        } else {
-                            self.arm64_is_uxn()
-                        },
-                    )
-                };
-                // At the leaf only 0b11 is valid.
-                let present = if level == PageTableLevel::Pte {
-                    self.0 & 0b11 == 0b11
-                } else {
-                    self.arm64_is_valid()
-                };
-                (
-                    present,
-                    block,
-                    writable,
-                    user,
-                    nx,
-                    self.arm64_page_frame() >> 12,
-                )
-            }
-        };
-        let (copy_on_write, global, dirty, accessed, cache_disable, write_through) = match arch {
-            Arch::Amd64 => (bit(9), bit(8), bit(6), bit(5), bit(4), bit(3)),
-            // A mapping is global with nG (bit 11) clear, accessed with AF
-            // (bit 10) set, and written once writable with DBM (bit 51)
-            // set. Table descriptors have none of these.
-            Arch::Arm64 if level == PageTableLevel::Pte || large_page => {
-                (false, !bit(11), bit(51) && writable, bit(10), false, false)
-            }
-            Arch::Arm64 => (false, false, false, false, false, false),
-        };
-        let flag = |set: bool, letter: char| if set { letter } else { '-' };
-        let flags = [
-            flag(copy_on_write, 'C'),
-            flag(global, 'G'),
-            flag(large_page, 'L'),
-            flag(dirty, 'D'),
-            flag(accessed, 'A'),
-            flag(cache_disable, 'N'),
-            flag(write_through, 'T'),
-            if user { 'U' } else { 'K' },
-            if writable { 'W' } else { 'R' },
-            flag(!nx, 'E'),
-            flag(present, 'V'),
-        ]
-        .into_iter()
-        .collect();
-        PteAttributes {
-            present,
-            large_page,
-            writable,
-            user,
-            nx,
-            pfn,
-            flags,
-        }
-    }
-
-    // --- AArch64 stage-1 descriptor interpretation (4 KiB granule) ---
-    //
-    // bits[1:0]: 0b00 invalid, 0b01 block (L0-L2), 0b11 table (L0-L2) /
-    // page (L3). Block and page descriptors carry AP[2:1], PXN, and UXN.
-    // Windows disables hierarchical permissions (`TCR_EL1.HPD`), so a table
-    // descriptor's APTable/PXNTable/UXNTable bits restrict nothing. Output
-    // address bits \[47:12\] support a 48-bit PA space.
-    pub const fn arm64_is_valid(self) -> bool {
-        // 0b01 block, 0b11 table/page; 0b00 invalid, 0b10 reserved.
-        self.0 & 0b01 != 0
-    }
-
-    pub const fn arm64_is_block(self) -> bool {
-        self.0 & 0b11 == 0b01
-    }
-
-    /// Output address bits \[47:12\] (48-bit PA space), kept in place.
-    pub const fn arm64_page_frame(self) -> u64 {
-        self.0 & 0x0000_FFFF_FFFF_F000
-    }
-
-    /// Output address of an L1 (1 GiB) block descriptor. The bits below the
-    /// block size are not address: bit 16 is `nT`, the rest are RES0.
-    pub const fn arm64_huge_block_frame(self) -> u64 {
-        self.arm64_page_frame() & !((1u64 << PDPTE_SHIFT) - 1)
-    }
-
-    /// Output address of an L2 (2 MiB) block descriptor (see
-    /// [`arm64_huge_block_frame`](Self::arm64_huge_block_frame)).
-    pub const fn arm64_large_block_frame(self) -> u64 {
-        self.arm64_page_frame() & !((1u64 << PDE_SHIFT) - 1)
-    }
-
-    /// AP\[1\] (bit 6): EL0 may access the mapping.
-    pub const fn arm64_is_user(self) -> bool {
-        self.0 & (1 << 6) != 0
-    }
-
-    /// Privileged execute-never (PXN, bit 53) on a block/page descriptor.
-    pub const fn arm64_is_pxn(self) -> bool {
-        self.0 & (1 << 53) != 0
-    }
-
-    /// Unprivileged execute-never (UXN, bit 54) on a block/page descriptor.
-    pub const fn arm64_is_uxn(self) -> bool {
-        self.0 & (1 << 54) != 0
-    }
-
-    /// AP\[2\] (bit 7) clear: the mapping is not read-only.
-    pub const fn arm64_is_writable(self) -> bool {
-        self.0 & (1 << 7) == 0
     }
 }
 

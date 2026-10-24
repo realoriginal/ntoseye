@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use single_instance::SingleInstance;
 
+use crate::arch::Arch;
 use crate::backend::dbg_backend::{BugcheckInfo, DebugBackend, DebugCapability};
 use crate::backend::gdb::GdbClient;
 use crate::backend::kd::{KdBackend, KdMemorySource};
@@ -15,17 +16,16 @@ use crate::backend::phys::{HaltClock, PhysMem};
 use crate::base::error::{Error, Result};
 use crate::base::memory::MemoryOps;
 use crate::base::notice::Notice;
-use crate::nt::breakpoints::{BreakpointManager, SiteJournal, breakpoint_opcode};
+use crate::base::types::VirtAddr;
+use crate::nt::breakpoints::{BreakpointManager, SiteJournal};
 use crate::nt::bugchecks::plausible_bugcheck_code;
 use crate::nt::cpu_state;
 use crate::nt::dmp::{DmpBackend, DmpInfo};
-use crate::nt::target::hang::bugcheck_processor_from_freeze_states;
-use crate::session::exception_policy::ExceptionPolicyTable;
-
-use crate::base::types::VirtAddr;
 use crate::nt::symbols::ntoseye_home;
+use crate::nt::target::hang::bugcheck_processor_from_freeze_states;
 use crate::nt::target::{Target, TargetKind};
 use crate::nt::userdump::{self, UserDump, UserDumpBackend};
+use crate::session::exception_policy::ExceptionPolicyTable;
 use crate::session::{ContinueOutcome, Session, StopResolution};
 use crate::{Backend, TargetSpec};
 
@@ -49,18 +49,19 @@ fn locate_debugger_data(target: &mut Target, backend: &mut dyn DebugBackend) {
 /// context alone.
 fn read_processor_contexts(target: &Target, info: &DmpInfo, backend: &mut DmpBackend) {
     let processors = backend.processor_count();
-    let saved = if info.context.is_arm64() {
-        cpu_state::read_arm64_prcb_contexts(target, processors)
-    } else {
-        // Triage dumps carry the offset from their embedded KDBG copy; full
-        // dumps read it from the KDBG the header names.
-        let offset = info.offset_prcb_context.or_else(|| {
-            cpu_state::prcb_context_offset(target, VirtAddr(info.debugger_data_block?))
-        });
-        let Some(offset) = offset else {
-            return;
-        };
-        cpu_state::read_amd64_prcb_contexts(target, processors, offset)
+    let saved = match info.context.arch() {
+        Arch::Arm64 => cpu_state::read_arm64_prcb_contexts(target, processors),
+        Arch::Amd64 => {
+            // Triage dumps carry the offset from their embedded KDBG copy; full
+            // dumps read it from the KDBG the header names.
+            let offset = info.offset_prcb_context.or_else(|| {
+                cpu_state::prcb_context_offset(target, VirtAddr(info.debugger_data_block?))
+            });
+            let Some(offset) = offset else {
+                return;
+            };
+            cpu_state::read_amd64_prcb_contexts(target, processors, offset)
+        }
     };
     backend.set_processor_contexts(saved.contexts, saved.warnings);
     // Without a header context to match, the processor that bugchecked is
@@ -320,7 +321,7 @@ impl Session {
         };
         let key = instance_key(resource);
         let journal = SiteJournal::open(&dir, &key, kernel_base.0);
-        let opcode = breakpoint_opcode(self.target.arch());
+        let opcode = self.target.arch().breakpoint_instruction();
         let mut repair = journal.repair(self.target.phys.as_ref(), opcode);
         let orphaned = std::fs::read_dir(&dir)
             .into_iter()

@@ -19,8 +19,8 @@ This feature works over KDCOM and KDNET, and the {command}`capabilities` command
 The quick form takes the driver name and the host path:
 
 ```
-kd:p1.1> .kdfiles -m mydriver.sys /home/me/build/mydriver.sys
-Mapped mydriver.sys -> /home/me/build/mydriver.sys.
+0: kd> .kdfiles -m mydriver.sys /home/me/build/mydriver.sys
+mapped mydriver.sys -> /home/me/build/mydriver.sys
 ```
 
 Then reload the driver in the guest with `sc stop mydriver` and `sc start mydriver`, or with a different loader. The debugger shows a note for each image that it serves:
@@ -33,7 +33,7 @@ note: kdfiles: target opened \??\C:\Users\me\source\repos\mydriver\x64\Debug\myd
 With no argument, {command}`.kdfiles` shows the map and the totals of served files, which you can use to make sure that the mapping matched and served the image:
 
 ```
-kd:p1.1> .kdfiles
+0: kd> .kdfiles
 mydriver.sys  ->  /home/me/build/mydriver.sys
 
 served 1 open, 7920 bytes read, 0 refused
@@ -42,8 +42,8 @@ served 1 open, 7920 bytes read, 0 refused
 If a host path contains spaces, put it in `'` or `"` quotes:
 
 ```
-kd:p1.1> .kdfiles -m mydriver.sys '/home/me/my builds/mydriver.sys'
-Mapped mydriver.sys -> /home/me/my builds/mydriver.sys.
+0: kd> .kdfiles -m mydriver.sys '/home/me/my builds/mydriver.sys'
+mapped mydriver.sys -> /home/me/my builds/mydriver.sys
 ```
 
 After you rebuild the driver, reload it in the guest. You do not have to load the mapping again.

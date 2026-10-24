@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
+use crate::arch::Arch;
 use crate::base::bytes::before_nul;
 use crate::base::error::{Error, Result};
 use crate::base::memory::MemoryOps;
-use crate::base::types::{Arch, VirtAddr};
+use crate::base::types::VirtAddr;
 use crate::nt::cpu_state;
 use crate::nt::guest::Image;
 use crate::nt::layout::{FieldInfo, ParsedType, TypeInfo, le_uint};
@@ -400,10 +401,10 @@ fn nested_field(
     };
     let address = base + u64::from(field.offset);
     let address = if pointer {
-        let pointer: VirtAddr = kernel(target)?
+        let pointer = kernel(target)?
             .types()
             .struct_with_layout(Arc::clone(parent), base)
-            .read_field(name)?;
+            .read_pointer(name)?;
         if pointer.is_zero() {
             return Err(Error::DebugInfo(format!("field {} is null", names[0])));
         }
@@ -785,10 +786,13 @@ impl Target {
     /// fields carry individual byte/symbol failures; `truncated` reports a
     /// descriptor shorter than the full bounded table.
     pub fn inspect_idt(&self, processor: u16, vector: Option<u16>) -> Result<Idt> {
-        if self.arch() == Arch::Arm64 {
-            return Err(Error::DebugInfo(
-                "!idt is not defined on ARM64 targets".into(),
-            ));
+        match self.arch() {
+            Arch::Amd64 => {}
+            Arch::Arm64 => {
+                return Err(Error::DebugInfo(
+                    "!idt is not defined on ARM64 targets".into(),
+                ));
+            }
         }
         validate_idt_vector(vector)?;
         let location = cpu_location(self, processor)?;

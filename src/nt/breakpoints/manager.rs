@@ -11,7 +11,8 @@ use super::spec::CodeSite;
 use super::{BreakpointConfig, BreakpointInfo, BreakpointManager, PartitionFilter, StepFrame};
 #[cfg(test)]
 use super::{HardwareBreakpoint, install::BreakpointPatch};
-use crate::backend::dbg_backend::{DebugBackend, HwBreakpointAccess};
+use crate::arch::HwBreakpointAccess;
+use crate::backend::dbg_backend::DebugBackend;
 use crate::base::error::{Error, Result};
 use crate::base::memory::MemoryOps;
 use crate::base::types::{Dtb, VirtAddr};
@@ -120,7 +121,7 @@ impl BreakpointManager {
                 Some(_) => Some(BreakpointScope::Kernel),
                 // A user-space target is in the process the stop is in,
                 // whichever process inspection is attached to.
-                None => (!Self::is_kernel_space(debugger.arch(), address))
+                None => (!debugger.arch().paging().is_kernel_address(address))
                     .then(|| {
                         debugger.process_for_cr3(debugger.normalize_dtb(debugger.current_dtb()))
                     })
@@ -654,7 +655,7 @@ impl BreakpointManager {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::dbg_backend::HwBreakpointAccess;
+    use crate::arch::HwBreakpointAccess;
     use crate::base::error::Error;
     use crate::base::types::VirtAddr;
     use crate::nt::breakpoints::{BreakpointManager, HardwareBreakpoint};

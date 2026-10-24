@@ -13,6 +13,7 @@ mod whea;
 
 use ntoseye_macros::record;
 
+use crate::base::types::VirtAddr;
 use crate::nt::bugchecks::{
     BugcheckAnalysis, bugcheck_trap_frame_on_stack, fault_at_trap_frame, module_filename,
     trap_on_stack_is_the_fault,
@@ -20,8 +21,6 @@ use crate::nt::bugchecks::{
 use crate::nt::dmp::triage::TriagePrcbInfo;
 use crate::nt::dmp::{DmpException, DmpInfo, DmpSystemInfo, UnloadedDriver};
 use crate::nt::guest::ModuleInfo;
-
-use crate::base::types::VirtAddr;
 use crate::nt::unwind::{StackTrace, resolve_thread_trace_context};
 use crate::session::{RunStatus, Session};
 use blackbox::blackbox_findings;
@@ -674,10 +673,10 @@ fn names_match(left: &str, right: &str) -> bool {
 mod tests {
     use super::user::UserExceptionKind;
     use super::*;
-    use crate::backend::cpu_context::amd64::REGISTER_BUFFER_SIZE;
-    use crate::base::types::{Arch, VirtAddr};
+    use crate::arch::Arch;
+    use crate::arch::RegisterFile;
+    use crate::base::types::VirtAddr;
     use crate::nt::bugchecks::{BugcheckArg, BugcheckFault};
-    use crate::nt::dmp::DmpContext;
     use crate::nt::dmp::triage::TriageDriver;
     use crate::nt::guest::ProcessInfo;
     use crate::nt::symbols::CodeFrame;
@@ -741,7 +740,7 @@ mod tests {
             directory_table_base: 0x1ad000,
             bug_check_code: 0x50,
             bug_check_parameters: [1, 2, 3, 4],
-            context: DmpContext::from_bytes(&vec![0; REGISTER_BUFFER_SIZE]),
+            context: RegisterFile::empty(Arch::Amd64),
             offset_prcb_context: None,
             number_processors: 2,
             is_triage: true,

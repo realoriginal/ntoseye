@@ -1,6 +1,7 @@
 //! [`Image`], a PE image mapped in guest memory together with the handles
 //! that read it and resolve its symbols and types, and [`SymbolRef`].
 
+use crate::arch::Arch;
 use crate::{
     backend::phys::PhysMem,
     base::{
@@ -37,6 +38,11 @@ impl SymbolRef<'_> {
         T: IntoBytes + FromBytes + Copy,
     {
         self.obj.memory().read(self.address())
+    }
+
+    /// The kernel pointer the symbol holds (a pointer-typed global).
+    pub fn read_pointer(&self) -> Result<VirtAddr> {
+        self.obj.memory().read_pointer(self.address())
     }
 }
 

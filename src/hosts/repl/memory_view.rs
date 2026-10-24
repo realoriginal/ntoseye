@@ -413,9 +413,11 @@ impl MemoryDisplayMode {
         }
     }
 
+    /// `dyb`: four bytes a row, their binary groups and then their hex
+    /// bytes, as WinDbg lays them out.
     pub fn binary() -> Self {
         Self {
-            bytes_per_row: 16,
+            bytes_per_row: 4,
             item_size: 1,
             item_format: ItemFormat::Binary,
             show_ascii: false,
@@ -463,35 +465,58 @@ where
 /// Render a memory listing while preserving rows that contain unreadable
 /// bytes. `validity`, when supplied, has one entry per byte in `data`; an
 /// invalid item is shown as question marks and the ASCII column uses `?` for
-/// each unavailable byte.
+/// each unavailable byte. Zeros and unreadable items read quieter than
+/// data, and a byte row's two halves are split by a `-`, as WinDbg splits
+/// them.
 pub fn display_memory_with_validity(
     start_address: VirtAddr,
     data: &[u8],
     validity: Option<&[bool]>,
     mode: &MemoryDisplayMode,
 ) {
+    let bytes = matches!(mode.item_format, ItemFormat::Bytes);
+    let half = mode.bytes_per_row / mode.item_size / 2;
     for (i, chunk) in data.chunks(mode.bytes_per_row).enumerate() {
-        out!(
+        let mut line = format!(
             "{}  ",
             ui::addr((start_address + ((i * mode.bytes_per_row) as u64)).0)
         );
-        row_items(i, chunk, validity, mode, |_, text| out!("{text}"));
+        let mut items = 0;
+        row_items(i, chunk, validity, mode, |kind, text| {
+            let text = text.to_string();
+            // Each item ends in its separator; a partial item's bytes come
+            // first, then the separator on its own.
+            let digits = text.trim_end();
+            let mut separator = &text[digits.len()..];
+            if !separator.is_empty() {
+                items += 1;
+                if bytes && items == half && chunk.len() > half {
+                    separator = "-";
+                }
+            }
+            match kind {
+                ItemKind::Zero | ItemKind::Unreadable => {
+                    line.push_str(&ui::muted(digits));
+                }
+                ItemKind::Value | ItemKind::Padding => line.push_str(digits),
+            }
+            line.push_str(separator);
+        });
         if mode.show_ascii {
-            out!(" ");
+            line.push(' ');
             row_ascii(i, chunk, validity, mode, |cell| match cell {
-                AsciiCell::Unreadable => out!("?"),
-                AsciiCell::Char(character) => out!("{character}"),
-                AsciiCell::Dot => out!("{}", ".".bright_black()),
+                AsciiCell::Unreadable => line.push_str(&ui::muted("?")),
+                AsciiCell::Char(character) => line.push(character),
+                AsciiCell::Dot => line.push_str(&".".bright_black().to_string()),
             });
         }
-
-        outln!();
+        // Without an ASCII column, the last item's separator and a short
+        // row's padding would only leave trailing spaces.
+        outln!("{}", line.trim_end());
     }
-
-    outln!();
 }
 
-/// What an item of a memory row shows, for the native view's styling.
+/// What an item of a memory row shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ItemKind {
     /// A value with a nonzero byte.
@@ -544,7 +569,7 @@ pub fn row_items(
                 ItemFormat::Words => emit(kind, format_args!("???? ")),
                 ItemFormat::Dwords => emit(kind, format_args!("???????? ")),
                 ItemFormat::Qwords => emit(kind, format_args!("???????????????? ")),
-                ItemFormat::Binary => emit(kind, format_args!("???????? ?? ")),
+                ItemFormat::Binary => emit(kind, format_args!("???????? ")),
                 ItemFormat::Floats => emit(kind, format_args!("{:>FLOAT_WIDTH$} ", "?")),
                 ItemFormat::Doubles => emit(kind, format_args!("{:>DOUBLE_WIDTH$} ", "?")),
             }
@@ -570,7 +595,7 @@ pub fn row_items(
                 Ok(bytes) => emit(kind, format_args!("{:016x} ", u64::from_le_bytes(bytes))),
                 Err(_) => emit_partial(item, kind, "   ", &mut emit),
             },
-            ItemFormat::Binary => emit(kind, format_args!("{:08b} {:02x} ", item[0], item[0])),
+            ItemFormat::Binary => emit(kind, format_args!("{:08b} ", item[0])),
             ItemFormat::Floats => match <[u8; 4]>::try_from(item) {
                 Ok(bytes) => emit(
                     kind,
@@ -601,9 +626,30 @@ pub fn row_items(
             ItemFormat::Words => emit(kind, format_args!("     ")),
             ItemFormat::Dwords => emit(kind, format_args!("         ")),
             ItemFormat::Qwords => emit(kind, format_args!("                 ")),
-            ItemFormat::Binary => emit(kind, format_args!("            ")),
+            ItemFormat::Binary => emit(kind, format_args!("         ")),
             ItemFormat::Floats => emit(kind, format_args!("{:FLOAT_WIDTH$} ", "")),
             ItemFormat::Doubles => emit(kind, format_args!("{:DOUBLE_WIDTH$} ", "")),
+        }
+    }
+
+    // `dyb` follows the binary groups with the same bytes in hex, after a
+    // gap, as WinDbg does.
+    if matches!(mode.item_format, ItemFormat::Binary) {
+        emit(ItemKind::Padding, format_args!(" "));
+        for (offset, byte) in chunk.iter().enumerate() {
+            let readable = validity.is_none_or(|valid| {
+                valid
+                    .get(row * mode.bytes_per_row + offset)
+                    .copied()
+                    .unwrap_or(false)
+            });
+            if !readable {
+                emit(ItemKind::Unreadable, format_args!("?? "));
+            } else if *byte == 0 {
+                emit(ItemKind::Zero, format_args!("{byte:02x} "));
+            } else {
+                emit(ItemKind::Value, format_args!("{byte:02x} "));
+            }
         }
     }
 }

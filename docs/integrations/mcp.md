@@ -34,7 +34,7 @@ The `command` tool works like a WinDbg prompt, with one difference: a call never
 
 Every stop costs the agent tokens, so the server draws stops more compactly than the REPL:
 
-- The first stop, and a stop on another thread, show everything: the banner, the registers, the next instructions, and the stack.
+- The first stop, and a stop on another thread, show everything: the banner, the registers, the instructions around the stop, and the stack.
 - A stop on the same thread as the one before, such as after {command}`p` or {command}`t`, shows the banner, the registers that changed on one line, the next three instructions, and the stack only when the function changed. A step then costs about 100 tokens instead of about 350.
 - A stop in the middle of a line, such as the one that {command}`break` causes in `break; bp ...; g`, shows only its banner, because the rest of the line carries on from it.
 
@@ -50,7 +50,7 @@ The trailer takes one of three forms:
 
 In the halted form, `process` is the process whose page tables the stopped vCPU has loaded, and `scope` is the {command}`.process` inspection scope that memory commands read through. The scope stays after the target resumes, so `process` and `scope` can differ.
 
-A vCPU that runs a guest partition's VP shows that guest's code, and the trailer names the VP: `[target halted @ p01.02 0x56383cc2d7df | runs partition 0x5 VP 2]`. While {command}`.partition` shows a guest partition in place of the target, the trailer ends with `| inspecting partition 0x4`, and everything before it is that guest's: its VPs are the vCPUs (`p4.1`), and the process is its own.
+A vCPU that runs a guest partition's VP shows that guest's code, and the trailer names the VP: `[target halted @ processor 1 0x56383cc2d7df | runs partition 0x5 VP 2]`. While {command}`.partition` shows a guest partition in place of the target, the trailer ends with `| inspecting partition 0x4`, and everything before it is that guest's: its VPs are the vCPUs (`p4.1`), and the process is its own.
 
 If a vCPU halted in the Windows hypervisor, the trailer shows `hv+<offset>` and adds the location where Windows stopped, for example `| saved VTL0 nt!HalProcessorIdle+0xf`, with the hypercall that VTL made when its last exit was a `VMCALL` (`| saved VTL0 hvcall!Hypercall (hypercall 0x0003 HvCallFlushVirtualAddressList fast rep 0/1)`). When the processor serves a guest partition's VP, the trailer adds it too: `| serving partition 0x3 VP 2 VTL0 ffffffffc0000000, last exit VMCALL (hypercall 0x000b HvCallSendSyntheticClusterIpi fast)`. For more information, refer to [VBS](../vbs/hypervisor-stops.md#where-nt-left-off-under-the-hypervisor).
 
@@ -97,14 +97,14 @@ The guest runs freely between calls. When a breakpoint on a shared page stops th
 
 ```json
 {"backend": "dump", "connect": "powershell-exception.dmp", "status": "connected",
- "target": "user-mode minidump", "process": "powershell.exe (pid 4340)", "threads": 20,
+ "target": "user-mode minidump", "process": "powershell.exe (PID 4340)", "threads": 20,
  "thread": "10f4.cc4", "exception": "0xe0d7e5e1 at kernelbase!RaiseException+0x8a on thread 10f4.cc4"}
 ```
 
 The trailer names the selected thread and the exception:
 
 ```text
-[minidump powershell.exe (pid 4340), 20 threads | thread ~17 10f4.cc4 0x7ff9493c2d14 ntdll!NtGetContextThread+0x14 | exception 0xe0d7e5e1 on ~17 10f4.cc4]
+[minidump powershell.exe (PID 4340), 20 threads | thread ~17 10f4.cc4 0x7ff9493c2d14 ntdll!NtGetContextThread+0x14 | exception 0xe0d7e5e1 on ~17 10f4.cc4]
 ```
 
 {command}`~` lists the threads and `~<n>s` selects one, and `.ecxr; k` shows the stack of the exception. Commands that need a kernel, run control, breakpoints, and writes return an error result (`isError`), such as `!process: this needs a kernel target; a user-mode minidump holds one process and no kernel` or `the minidump backend cannot run or step the target`.

@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use ntoseye_macros::record;
 
+use crate::arch::{Arch, HwBreakpointAccess, RegisterMap};
 use crate::backend::dbg_backend::{
     BackendCapability, BugcheckInfo, ContinueDisposition, DebugBackend, DebugCapability, DebugLog,
-    DebugOutputPage, HW_BREAKPOINT_SLOTS, HwBreakpointAccess, PciConfigAddress, ProcessorRead,
-    RegisterMap, StopEvent, TebPath, TrapState, debug_registers,
+    DebugOutputPage, PciConfigAddress, ProcessorRead, StopEvent, TebPath, TrapState,
 };
 use crate::backend::debugger_data::DebuggerDataCandidate;
 use crate::backend::kd::framing::KdFraming;
@@ -17,7 +17,7 @@ use crate::base::bytes;
 use crate::base::error::{Error, Result};
 use crate::base::memory::TranslationCache;
 use crate::base::notice::Notice;
-use crate::base::types::{Arch, Dtb, KernelLocation, VirtAddr};
+use crate::base::types::{Dtb, KernelLocation, VirtAddr};
 
 macro_rules! kd_trace {
     ($($arg:tt)*) => {
@@ -479,8 +479,9 @@ impl DebugBackend for KdBackend {
     /// breakpoint hit can decide it has no single-step residue to clear
     /// without fetching a `CONTEXT` it would read two fields from.
     fn stop_trap_state(&mut self) -> Option<TrapState> {
-        if self.arch != Arch::Amd64 {
-            return None;
+        match self.arch {
+            Arch::Amd64 => {}
+            Arch::Arm64 => return None,
         }
         self.registers
             .report(self.current_processor)?
@@ -506,26 +507,17 @@ impl DebugBackend for KdBackend {
     fn supports_watchpoints(&self) -> bool {
         // Both architectures expose per-processor debug state through KD
         // KSPECIAL_REGISTERS (DR0-DR7 on AMD64; BVR/BCR and WVR/WCR on ARM64).
-        matches!(self.arch, Arch::Amd64 | Arch::Arm64)
+        match self.arch {
+            Arch::Amd64 | Arch::Arm64 => true,
+        }
     }
 
     fn hardware_breakpoint_slots(&self) -> usize {
-        match self.arch {
-            Arch::Amd64 => usize::from(HW_BREAKPOINT_SLOTS),
-            Arch::Arm64 => usize::from(
-                debug_registers::ARM64_MAX_BREAKPOINTS + debug_registers::ARM64_MAX_WATCHPOINTS,
-            ),
-        }
+        self.arch.debug_registers().slots()
     }
 
     fn hardware_slot_range(&self, access: HwBreakpointAccess) -> std::ops::Range<usize> {
-        match self.arch {
-            Arch::Amd64 => 0..usize::from(HW_BREAKPOINT_SLOTS),
-            Arch::Arm64 => {
-                let slots = debug_registers::arm64_slot_range(access);
-                usize::from(slots.start)..usize::from(slots.end)
-            }
-        }
+        self.arch.debug_registers().slots_for(access)
     }
 
     fn set_hardware_breakpoint(
@@ -535,20 +527,18 @@ impl DebugBackend for KdBackend {
         access: HwBreakpointAccess,
         len: u8,
     ) -> Result<()> {
-        let slot = u8::try_from(slot)
-            .map_err(|_| Error::Kd(format!("invalid hardware breakpoint slot {slot}")))?;
         self.set_hardware_slot(slot, addr, access, len)
     }
 
     fn clear_hardware_breakpoint(&mut self, slot: usize) -> Result<()> {
-        let slot = u8::try_from(slot)
-            .map_err(|_| Error::Kd(format!("invalid hardware breakpoint slot {slot}")))?;
         self.clear_hardware_slot(slot)
     }
 
     fn supports_user_mode_breakpoints(&self) -> bool {
         // GuestMemoryPatch emits `int3` on AMD64 and `brk #0xF000` on ARM64.
-        matches!(self.arch, Arch::Amd64 | Arch::Arm64)
+        match self.arch {
+            Arch::Amd64 | Arch::Arm64 => true,
+        }
     }
 
     fn supports_msr(&self) -> bool {

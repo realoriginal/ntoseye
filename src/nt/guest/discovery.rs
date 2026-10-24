@@ -3,6 +3,9 @@
 //! dumps.
 
 use super::Image;
+use crate::arch::Arch;
+use crate::arch::amd64::paging::Entry;
+use crate::arch::arm64::paging::Descriptor;
 use crate::{
     backend::phys::PhysMem,
     base::{
@@ -15,25 +18,20 @@ use crate::{
 use std::sync::Arc;
 
 fn is_valid_kernel_dtb_amd64(phys: &PhysMem, dtb: Dtb) -> Result<bool> {
-    let Ok(kernel_pml4) = phys.read::<[PageTableEntry; 256]>(dtb + 8 * 256) else {
+    let Ok(kernel_pml4) = phys.read::<[Entry; 256]>(dtb + 8 * 256) else {
         // Candidate sits outside mapped guest RAM (below the aarch64 RAM
         // base, in an MMIO hole, or past the end): not a kernel root.
         return Ok(false);
     };
 
-    if kernel_pml4
-        .into_iter()
-        .filter(|e| e.page_frame() == dtb)
-        .count()
-        != 1
-    {
+    if kernel_pml4.into_iter().filter(|e| e.frame() == dtb).count() != 1 {
         return Ok(false);
     }
 
     // Check if use KUSER_SHARED_DATA is mapped
     const KUSER_SHARED_DATA_VA: VirtAddr = VirtAddr::from_u64(0xfffff78000000000);
 
-    let addr_space = AddressSpace::new(phys, dtb);
+    let addr_space = AddressSpace::new_amd64(phys, dtb);
 
     if let Some(xlat) = addr_space.virt_to_phys(KUSER_SHARED_DATA_VA)?
         && !xlat.user
@@ -82,15 +80,11 @@ fn is_valid_kernel_dtb_arm64(phys: &PhysMem, dtb: Dtb) -> Result<bool> {
 
 /// Read the PE machine type of the kernel image found through `dtb` with the
 /// arch's walker, or `None` when no valid PE header is there. This is the
-/// definitive architecture check: a kernel image's machine must be 0x8664
-/// (AMD64) or 0xaa64 (ARM64), which an accidental page-table false positive
-/// cannot satisfy.
+/// definitive architecture check: a kernel image's machine must be the
+/// arch's [`Arch::machine_type`], which an accidental page-table false
+/// positive cannot satisfy.
 fn kernel_machine_at(dtb: Dtb, phys: &PhysMem, arch: Arch) -> Result<Option<u16>> {
-    let base = match arch {
-        Arch::Amd64 => find_ntoskrnl_va(dtb, phys)?,
-        Arch::Arm64 => find_ntoskrnl_va_arm64(dtb, phys)?,
-    };
-    let Some(base) = base else {
+    let Some(base) = find_ntoskrnl_va(arch, dtb, phys)? else {
         return Ok(None);
     };
     let space = AddressSpace::for_arch(phys, dtb, dtb, arch);
@@ -115,21 +109,23 @@ fn kernel_machine_at(dtb: Dtb, phys: &PhysMem, arch: Arch) -> Result<Option<u16>
     Ok(Some(u16::from_le_bytes([sig[4], sig[5]])))
 }
 
-/// Discover the kernel page-table root and guest architecture. The AMD64
-/// descriptor format is tried first (the historical default), but a candidate
-/// only counts when the kernel image found through it is genuinely an AMD64
-/// PE: an AArch64 guest's TTBR1 tables can false-positive the x64 descriptor
-/// checks (Windows maps its own page tables), and the weak MZ+POOLCODE page
-/// heuristic can match a data page. The PE machine type is the tie-breaker.
+/// Discover the kernel page-table root and guest architecture. Each
+/// architecture in [`Arch::ALL`] offers its candidate roots in turn, but a
+/// candidate only counts when the kernel image found through it has that
+/// architecture's machine type: an AArch64 guest's TTBR1 tables can
+/// false-positive the x64 descriptor checks (Windows maps its own page
+/// tables), and the weak MZ+POOLCODE page heuristic can match a data page.
+/// The PE machine type is the tie-breaker.
 pub(super) fn find_kernel(phys: &PhysMem) -> Result<Option<(Dtb, Arch)>> {
-    if let Some(dtb) = find_kernel_dtb_amd64(phys)?
-        && matches!(kernel_machine_at(dtb, phys, Arch::Amd64)?, Some(0x8664))
-    {
-        return Ok(Some((dtb, Arch::Amd64)));
-    }
-    for dtb in find_kernel_dtb_arm64_candidates(phys)? {
-        if matches!(kernel_machine_at(dtb, phys, Arch::Arm64)?, Some(0xaa64)) {
-            return Ok(Some((dtb, Arch::Arm64)));
+    for arch in Arch::ALL {
+        let candidates = match arch {
+            Arch::Amd64 => find_kernel_dtb_amd64(phys)?.into_iter().collect(),
+            Arch::Arm64 => find_kernel_dtb_arm64_candidates(phys)?,
+        };
+        for dtb in candidates {
+            if kernel_machine_at(dtb, phys, arch)? == Some(arch.machine_type()) {
+                return Ok(Some((dtb, arch)));
+            }
         }
     }
     Ok(None)
@@ -146,14 +142,14 @@ fn find_kernel_dtb_arm64_candidates(phys: &PhysMem) -> Result<Vec<Dtb>> {
     let ram_end = base.saturating_add(phys.ram_size());
     let mut out = Vec::new();
     for dtb in (base.saturating_add(0x1000)..ram_end).step_by(PAGE_SIZE) {
-        let Ok(entry) = phys.read::<PageTableEntry>(dtb + 8 * KUSER_L0_INDEX) else {
+        let Ok(entry) = phys.read::<Descriptor>(dtb + 8 * KUSER_L0_INDEX) else {
             continue;
         };
-        // Table descriptor (bits[1:0] = 0b11) whose table lies in RAM.
-        if entry.0 & 0b11 != 0b11 {
+        // A table descriptor whose table lies in RAM.
+        if !entry.is_table_or_page() {
             continue;
         }
-        let frame = entry.arm64_page_frame();
+        let frame = entry.frame();
         if frame < base || frame >= ram_end {
             continue;
         }
@@ -177,7 +173,7 @@ fn is_ntoskrnl_header(header: &[u8]) -> bool {
 /// starts with the ntoskrnl image header.
 fn is_ntoskrnl_page(
     phys: &impl MemoryOps<PhysAddr>,
-    entry: PageTableEntry,
+    entry: Entry,
     frame: PhysAddr,
 ) -> Result<bool> {
     if entry.is_user() || !entry.is_nx() {
@@ -190,7 +186,16 @@ fn is_ntoskrnl_page(
     Ok(is_ntoskrnl_header(&header))
 }
 
-pub(super) fn find_ntoskrnl_va(
+/// The kernel image's base, found by scanning the kernel range of the page
+/// tables `kernel_dtb` roots with `arch`'s walker.
+pub fn find_ntoskrnl_va(arch: Arch, kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>> {
+    match arch {
+        Arch::Amd64 => find_ntoskrnl_va_amd64(kernel_dtb, phys),
+        Arch::Arm64 => find_ntoskrnl_va_arm64(kernel_dtb, phys),
+    }
+}
+
+fn find_ntoskrnl_va_amd64(
     kernel_dtb: Dtb,
     phys: &impl MemoryOps<PhysAddr>,
 ) -> Result<Option<VirtAddr>> {
@@ -199,7 +204,7 @@ pub(super) fn find_ntoskrnl_va(
 
     let pml4e_count = KERNEL_VA_MAX.pml4_index() - KERNEL_VA_MIN.pml4_index() + 1;
 
-    let Ok(kernel_pml4) = phys.read::<[PageTableEntry; 256]>(kernel_dtb + 8 * 256) else {
+    let Ok(kernel_pml4) = phys.read::<[Entry; 256]>(kernel_dtb + 8 * 256) else {
         return Ok(None);
     };
     for (rel_pml4_index, pml4e) in kernel_pml4
@@ -213,7 +218,7 @@ pub(super) fn find_ntoskrnl_va(
         if !pml4e.is_present() {
             continue;
         }
-        let Ok(pdpt) = phys.read::<[PageTableEntry; 512]>(pml4e.page_frame()) else {
+        let Ok(pdpt) = phys.read::<[Entry; 512]>(pml4e.frame()) else {
             continue;
         };
 
@@ -231,15 +236,15 @@ pub(super) fn find_ntoskrnl_va(
                 continue;
             }
 
-            if pdpte.is_large_page() {
-                if let Ok(true) = is_ntoskrnl_page(phys, pdpte, pdpte.huge_page_frame()) {
+            if pdpte.is_large() {
+                if let Ok(true) = is_ntoskrnl_page(phys, pdpte, pdpte.huge_frame()) {
                     return Ok(Some(VirtAddr::construct(pml4_index, pdpt_index, 0, 0)));
                 }
 
                 continue;
             }
 
-            let Ok(pd) = phys.read::<[PageTableEntry; 512]>(pdpte.page_frame()) else {
+            let Ok(pd) = phys.read::<[Entry; 512]>(pdpte.frame()) else {
                 continue;
             };
 
@@ -255,8 +260,8 @@ pub(super) fn find_ntoskrnl_va(
                     continue;
                 }
 
-                if pde.is_large_page() {
-                    if let Ok(true) = is_ntoskrnl_page(phys, pde, pde.large_page_frame()) {
+                if pde.is_large() {
+                    if let Ok(true) = is_ntoskrnl_page(phys, pde, pde.large_frame()) {
                         return Ok(Some(VirtAddr::construct(
                             pml4_index, pdpt_index, pd_index, 0,
                         )));
@@ -265,7 +270,7 @@ pub(super) fn find_ntoskrnl_va(
                     continue;
                 }
 
-                let Ok(pt) = phys.read::<[PageTableEntry; 512]>(pde.page_frame()) else {
+                let Ok(pt) = phys.read::<[Entry; 512]>(pde.frame()) else {
                     continue;
                 };
 
@@ -280,7 +285,7 @@ pub(super) fn find_ntoskrnl_va(
                         continue;
                     }
 
-                    if let Ok(true) = is_ntoskrnl_page(phys, pte, pte.page_frame()) {
+                    if let Ok(true) = is_ntoskrnl_page(phys, pte, pte.frame()) {
                         return Ok(Some(VirtAddr::construct(
                             pml4_index, pdpt_index, pd_index, pt_index,
                         )));
@@ -293,14 +298,14 @@ pub(super) fn find_ntoskrnl_va(
     Ok(None)
 }
 
-fn is_ntoskrnl_pte_arm64(phys: &PhysMem, pte: PageTableEntry) -> Result<bool> {
+fn is_ntoskrnl_pte_arm64(phys: &PhysMem, pte: Descriptor) -> Result<bool> {
     // Kernel code pages: AP[1]=0 (EL1 only), PXN=0 (executable from EL1).
     // (UXN is always set on Windows kernel pages, so it cannot identify code.)
-    if pte.arm64_is_user() || !pte.arm64_is_pxn() {
+    if pte.is_user() || !pte.is_pxn() {
         return Ok(false);
     }
 
-    is_ntoskrnl_header_at(phys, pte.arm64_page_frame())
+    is_ntoskrnl_header_at(phys, pte.frame())
 }
 
 /// Whether the physical page at `frame` holds the ntoskrnl PE header
@@ -312,10 +317,10 @@ fn is_ntoskrnl_header_at(phys: &PhysMem, frame: u64) -> Result<bool> {
     Ok(is_ntoskrnl_header(&header))
 }
 
-/// Same bounded kernel-VA scan as [`find_ntoskrnl_va`] but interpreting
+/// Same bounded kernel-VA scan as [`find_ntoskrnl_va_amd64`] but interpreting
 /// AArch64 descriptors (TTBR1 root, 4 KiB granule). The VA index math is
 /// identical to x64's four 9-bit levels.
-pub(super) fn find_ntoskrnl_va_arm64(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>> {
+fn find_ntoskrnl_va_arm64(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>> {
     // Cover the Windows ARM64 kernel VA range. Unlike the AMD64 scan's narrow
     // low-kernel slot, this includes every populated L0 slot from 496 through
     // the inclusive upper bound.
@@ -324,7 +329,7 @@ pub(super) fn find_ntoskrnl_va_arm64(kernel_dtb: Dtb, phys: &PhysMem) -> Result<
 
     let pml4e_count = KERNEL_VA_MAX.pml4_index() - KERNEL_VA_MIN.pml4_index() + 1;
 
-    let Ok(kernel_table) = phys.read::<[PageTableEntry; 256]>(kernel_dtb + 8 * 256) else {
+    let Ok(kernel_table) = phys.read::<[Descriptor; 256]>(kernel_dtb + 8 * 256) else {
         return Ok(None);
     };
     for (rel_index, l0) in kernel_table
@@ -335,10 +340,10 @@ pub(super) fn find_ntoskrnl_va_arm64(kernel_dtb: Dtb, phys: &PhysMem) -> Result<
     {
         let pml4_index = 256 + rel_index;
 
-        if !l0.arm64_is_valid() || l0.arm64_is_block() {
+        if !l0.is_valid() || l0.is_block() {
             continue;
         }
-        let Ok(l1_table) = phys.read::<[PageTableEntry; 512]>(l0.arm64_page_frame()) else {
+        let Ok(l1_table) = phys.read::<[Descriptor; 512]>(l0.frame()) else {
             continue;
         };
 
@@ -350,14 +355,14 @@ pub(super) fn find_ntoskrnl_va_arm64(kernel_dtb: Dtb, phys: &PhysMem) -> Result<
         };
 
         for (l1_index, l1) in l1_table.into_iter().take(l1_count).enumerate() {
-            if !l1.arm64_is_valid() {
+            if !l1.is_valid() {
                 continue;
             }
 
-            if l1.arm64_is_block() {
+            if l1.is_block() {
                 // A 1 GiB block is unlikely for ntoskrnl. Probe each 2 MiB
                 // boundary and reconstruct the matching VA at the L2 index.
-                let block = l1.arm64_huge_block_frame();
+                let block = l1.huge_frame();
                 for l2_index in 0..512u64 {
                     if is_ntoskrnl_header_at(phys, block + l2_index * (2 << 20))? {
                         return Ok(Some(VirtAddr::construct(
@@ -371,7 +376,7 @@ pub(super) fn find_ntoskrnl_va_arm64(kernel_dtb: Dtb, phys: &PhysMem) -> Result<
                 continue;
             }
 
-            let Ok(l2_table) = phys.read::<[PageTableEntry; 512]>(l1.arm64_page_frame()) else {
+            let Ok(l2_table) = phys.read::<[Descriptor; 512]>(l1.frame()) else {
                 continue;
             };
 
@@ -383,14 +388,14 @@ pub(super) fn find_ntoskrnl_va_arm64(kernel_dtb: Dtb, phys: &PhysMem) -> Result<
             };
 
             for (l2_index, l2) in l2_table.into_iter().take(l2_count).enumerate() {
-                if !l2.arm64_is_valid() {
+                if !l2.is_valid() {
                     continue;
                 }
 
-                if l2.arm64_is_block() {
+                if l2.is_block() {
                     // Probe every 4 KiB page in the 2 MiB block; the PE image
                     // need not begin at the block's first page.
-                    let block = l2.arm64_large_block_frame();
+                    let block = l2.large_frame();
                     for pt_index in 0..512u64 {
                         if is_ntoskrnl_header_at(phys, block + pt_index * 0x1000)? {
                             return Ok(Some(VirtAddr::construct(
@@ -404,7 +409,7 @@ pub(super) fn find_ntoskrnl_va_arm64(kernel_dtb: Dtb, phys: &PhysMem) -> Result<
                     continue;
                 }
 
-                let Ok(l3_table) = phys.read::<[PageTableEntry; 512]>(l2.arm64_page_frame()) else {
+                let Ok(l3_table) = phys.read::<[Descriptor; 512]>(l2.frame()) else {
                     continue;
                 };
 
@@ -416,7 +421,7 @@ pub(super) fn find_ntoskrnl_va_arm64(kernel_dtb: Dtb, phys: &PhysMem) -> Result<
                 };
 
                 for (l3_index, l3) in l3_table.into_iter().take(l3_count).enumerate() {
-                    if l3.0 & 0b11 != 0b11 {
+                    if !l3.is_table_or_page() {
                         continue;
                     }
 
@@ -440,7 +445,7 @@ pub(super) fn find_ntoskrnl_va_arm64(kernel_dtb: Dtb, phys: &PhysMem) -> Result<
 /// marker, the same heuristic `is_ntoskrnl_pte` uses but at the virtual
 /// layer.
 pub(super) fn find_ntoskrnl_va_triage(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>> {
-    let space = AddressSpace::new(phys, kernel_dtb);
+    let space = AddressSpace::new_amd64(phys, kernel_dtb);
 
     // No PDB yet, so PsLoadedModuleList can't be walked; probe the data
     // blocks for kernel-space PE headers instead.
@@ -485,11 +490,7 @@ pub(super) fn find_ntoskrnl(
         return Ok(None);
     };
 
-    let ntoskrnl_va = match arch {
-        Arch::Amd64 => find_ntoskrnl_va(kernel_dtb, &phys)?,
-        Arch::Arm64 => find_ntoskrnl_va_arm64(kernel_dtb, &phys)?,
-    };
-    let Some(ntoskrnl_va) = ntoskrnl_va else {
+    let Some(ntoskrnl_va) = find_ntoskrnl_va(arch, kernel_dtb, &phys)? else {
         return Ok(None);
     };
 
@@ -504,7 +505,7 @@ pub(super) fn find_ntoskrnl(
 
 #[cfg(test)]
 mod tests {
-    use super::find_ntoskrnl_va;
+    use super::find_ntoskrnl_va_amd64;
     use crate::base::error::{Error, Result};
     use crate::base::memory::MemoryOps;
     use crate::base::types::{PhysAddr, VirtAddr};
@@ -564,11 +565,11 @@ mod tests {
         let past = upper.pdpt_index() as u64 + 1;
         phys.write_u64(PDPT + 8 * past, 0x8000_0000 | KERNEL_LARGE_PAGE);
         phys.write_ntoskrnl_header(0x8000_0000);
-        assert_eq!(find_ntoskrnl_va(DTB, &phys).unwrap(), None);
+        assert_eq!(find_ntoskrnl_va_amd64(DTB, &phys).unwrap(), None);
 
         let at_bound = upper.pdpt_index() as u64;
         phys.write_u64(PDPT + 8 * at_bound, 0x4000_0000 | KERNEL_LARGE_PAGE);
         phys.write_ntoskrnl_header(0x4000_0000);
-        assert_eq!(find_ntoskrnl_va(DTB, &phys).unwrap(), Some(upper));
+        assert_eq!(find_ntoskrnl_va_amd64(DTB, &phys).unwrap(), Some(upper));
     }
 }
