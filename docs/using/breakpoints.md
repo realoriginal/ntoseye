@@ -178,6 +178,23 @@ k
 
 On the `gdb` backend, `ntoseye` plants an unload trap the same way as the load trap, at `nt!DbgUnLoadImageSymbols` and `nt!DbgUnLoadImageSymbolsUnicode`, the kernel functions that report an unload. The unload trap is in place only while an `sxe`/`sxn ud` filter is set, and a breakpoint that waits for its module does not keep it.
 
+## Stopping at a user-mode DLL load
+
+`sxe ld:mydll` stops when a process maps `mydll.dll`, and `sxn ld` shows a `ModLoad:` line for each user-mode image as well as each kernel image. Windows reports user-mode images to a kernel debugger only while the `ksl` global flag is set, and then only for the first process that maps each image. `ntoseye` therefore sets its own trap, the user-image trap, at `nt!PsCallImageNotifyRoutines`, which the kernel runs for every image that it maps into every process. The trap works on KD, KDNET, and the `gdb` backend.
+
+The trap is in place only while something waits for a user-mode load: a deferred breakpoint scoped to a process, or an `ld` filter that can name a DLL, which is bare `ld` or a filter for any module that is not a `.sys` driver. `ntoseye` sets the trap when the target resumes and says so, and it removes the trap at the first resume after which nothing waits. While the trap is in place, every image that any process maps halts the target briefly, so starting a process takes noticeably longer.
+
+Windows maps some images more than once: the loader can map a DLL again, and an image can be mapped for its resources. `ntoseye` reports each mapping.
+
+A deferred breakpoint scoped to a process waits for the module in that process: `bu /p <pid> mydll!DllMain` is armed as `mydll.dll` is mapped into that process, before its entry point runs. At that point the loader has not yet added the DLL to the process's module lists, so `ntoseye` loads its symbols from the image itself. If the PDB cannot be found, `ntoseye` says so, and the breakpoint stays deferred. The process has not touched the page that holds the breakpoint yet, so on KD `ntoseye` hands the breakpoint to the target's breakpoint table, which writes it when the process first runs that page. The `gdb` backend sets no software breakpoint in user space (see below).
+
+The kernel has no notify routine for a user-mode image that is unmapped. Over KD with {command}`!gflag` `+ksl` set, Windows reports those unloads, and the `ud` filters apply to them.
+
+```text
+bu /p 4140 mydll!DllMain
+g
+```
+
 ## User-mode breakpoints in shared pages
 
 The `gdb` backend sets no software breakpoint in user space, whatever the scope. A GDB stub writes and removes the `int3` through the page tables of the vCPU that it has selected, and that vCPU might not map the page, for example a vCPU that is stopped in the Windows hypervisor or that runs a Hyper-V guest. The byte would then stay in shared code after the session, and the next process to run it would trap in the guest. Under VBS, a step or {command}`wt` that goes on into user space marks each next instruction with a free hardware breakpoint slot instead. A step over a call or a {command}`gu` that returns there ends with an error. Use a hardware breakpoint ({command}`ba` `e1`) to stop in user space.

@@ -8,7 +8,9 @@ use super::stepping::{
 };
 use super::*;
 use crate::arch::{Arch, HwBreakpointAccess, RegisterInfo, amd64::REGISTER_BUFFER_SIZE, arm64};
-use crate::backend::dbg_backend::{ContinueDisposition, TrapState, clear_trap_flag};
+use crate::backend::dbg_backend::{
+    ContinueDisposition, ModuleNotification, TrapState, clear_trap_flag,
+};
 use crate::backend::partition_backend::PartitionVp;
 use crate::base::memory::PAGE_SIZE;
 use crate::base::types::VirtAddr;
@@ -1462,8 +1464,8 @@ fn successors_cover_both_branch_arms_and_resolve_returns_and_indirect_calls() {
 
 /// Transfers whose target is not a branch operand: `sysret` returns to RCX,
 /// `iretq` pops an 8-byte RIP and a 64-bit-mode `retf` a 4-byte one, a far
-/// `jmp [m16:32]` reads a 4-byte offset, and a hypercall comes back to the
-/// next instruction.
+/// `jmp [m16:32]` reads a 4-byte offset, and a hypercall and a user-mode
+/// system call come back to the next instruction.
 #[test]
 fn successors_follow_privilege_and_far_transfers() {
     let mut memory = vec![0x90u8; 0x80];
@@ -1472,6 +1474,8 @@ fn successors_follow_privilege_and_far_transfers() {
     memory[0x10] = 0xcb; // retf
     memory[0x18..0x1b].copy_from_slice(&[0x0f, 0x01, 0xc1]); // vmcall
     memory[0x20..0x22].copy_from_slice(&[0xff, 0x2b]); // jmp far [rbx]
+    memory[0x28..0x2a].copy_from_slice(&[0x0f, 0x05]); // syscall
+    memory[0x30..0x32].copy_from_slice(&[0xcd, 0x2e]); // int 0x2e
     memory[0x40..0x48].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
     memory[0x50..0x58].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
     let session = session_over_memory(0x1000, &memory);
@@ -1489,6 +1493,9 @@ fn successors_follow_privilege_and_far_transfers() {
     assert_eq!(successors(0x1010), [0x3333_4444]);
     assert_eq!(successors(0x1018), [0x101b]);
     assert_eq!(successors(0x1020), [0x7777_8888]);
+    // A user-mode system call comes back to the next instruction.
+    assert_eq!(successors(0x1028), [0x102a]);
+    assert_eq!(successors(0x1030), [0x1032]);
 }
 
 fn stepping_session(code: &[u8], backend: MockBackend) -> Session {
@@ -3047,6 +3054,7 @@ fn module_trap(event: ModuleEvent, address: u64) -> ModuleTrap {
             address: VirtAddr(address),
             original: vec![0x48],
         },
+        user: false,
     }
 }
 
@@ -3348,7 +3356,13 @@ fn a_kd_module_notification_stops_only_for_its_own_filter() {
     let notification = |event| {
         let mut stop = module_change_event();
         stop.target_kernel_base_hint = Some(VirtAddr(0x2000));
-        stop.module_event = Some((event, VirtAddr(0x2000)));
+        stop.module_event = Some(ModuleNotification {
+            kind: event,
+            base: VirtAddr(0x2000),
+            size: 0,
+            path: None,
+            process: None,
+        });
         stop
     };
 
@@ -3399,6 +3413,56 @@ fn a_kd_module_notification_stops_only_for_its_own_filter() {
         panic!("expected a module-unload stop, got {resolution:?}");
     };
     assert_eq!(module.name, "driver.sys");
+    assert_eq!(continues.load(Ordering::Relaxed), 1);
+}
+
+/// With `!gflag +ksl`, KD reports the user-mode images processes map. The
+/// kernel module list does not hold them, so the `ld` filters match the
+/// path the notification names: a filter for the DLL stops there, one for
+/// another module lets the load continue.
+#[test]
+fn a_user_image_notification_is_filtered_by_its_path() {
+    let user_load = || {
+        let mut stop = module_change_event();
+        stop.modules_changed = false;
+        stop.module_event = Some(ModuleNotification {
+            kind: ModuleEvent::Load,
+            base: VirtAddr(0x7ff8_0000_0000),
+            size: 0x4_0000,
+            path: Some(r"\Windows\System32\MyDll.dll".to_string()),
+            process: Some(0xf63e_c080),
+        });
+        stop
+    };
+
+    let (mut session, _, _, continues) = session_at_module_trap(ModuleEvent::Load);
+    session.module_traps.clear();
+    session.exception_policies.set_module_event(
+        ModuleEvent::Load,
+        Some("other".into()),
+        ExceptionPolicyMode::Break,
+        None,
+    );
+    assert!(matches!(
+        session.classify_stop_event(user_load()).unwrap(),
+        StopResolution::ModulesChanged
+    ));
+    assert_eq!(continues.load(Ordering::Relaxed), 1);
+
+    session.exception_policies.set_module_event(
+        ModuleEvent::Load,
+        Some("mydll".into()),
+        ExceptionPolicyMode::Break,
+        None,
+    );
+    let resolution = session.classify_stop_event(user_load()).unwrap();
+    let StopResolution::ModuleLoad { module, .. } = resolution else {
+        panic!("expected a module-load stop, got {resolution:?}");
+    };
+    assert_eq!(module.name, "MyDll.dll");
+    assert_eq!(module.short_name, "mydll");
+    assert_eq!(module.base_address, VirtAddr(0x7ff8_0000_0000));
+    assert_eq!(module.end_address(), VirtAddr(0x7ff8_0004_0000));
     assert_eq!(continues.load(Ordering::Relaxed), 1);
 }
 
@@ -3497,6 +3561,69 @@ fn hardware_breakpoint_hit_claims_matching_dr6_bit_and_clears_status() {
     assert_eq!(backend.get("dr6"), DR6_BS);
     assert_eq!(backend.writes, 1);
     assert_eq!(backend.get("eflags"), EFLAGS_BASE);
+}
+
+#[test]
+fn an_execute_hit_whose_dr6_names_no_cause_is_the_slot_at_the_pc() {
+    let manager = manager_with_hw(0, HwBreakpointAccess::Execute, true);
+    let map = Arch::Amd64.register_map();
+    let hit_at = |rip: u64, eflags: u64| {
+        let mut backend = MockBackend::default();
+        backend.set("dr6", 0xffff_0ff0);
+        backend.set("rip", rip);
+        backend.set("eflags", eflags);
+        let hit = hardware_breakpoint_hit(
+            &mut backend,
+            map,
+            &manager,
+            &single_step_event(),
+            Arch::Amd64,
+        )
+        .unwrap();
+        (hit.map(|bp| bp.id), backend.get("eflags") & (1 << 16) != 0)
+    };
+
+    // Claimed, and resumed past: without RF the instruction faults again.
+    assert_eq!(hit_at(0x1000, EFLAGS_BASE), (Some(7), true));
+    // A trap flag explains the exception: a step that landed on the site.
+    assert_eq!(hit_at(0x1000, EFLAGS_BASE | 0x100), (None, false));
+    // An execute breakpoint faults at its own address only.
+    assert_eq!(hit_at(0x2000, EFLAGS_BASE), (None, false));
+}
+
+/// A break-in that keeps landing on hits a filter declines (a watched
+/// address other threads run faster than the target polls for the
+/// break-in) holds the last one as the pause: the stop is a pause, not the
+/// hit's exception, and the target stays halted on the site.
+#[test]
+fn a_break_in_out_of_retries_holds_a_declined_hit_as_the_pause() {
+    let mut backend = MockBackend::default().running();
+    backend.set("dr6", 1);
+    backend.set("rip", 0x1000);
+    for _ in 0..8 {
+        backend.queue_interrupt(single_step_event());
+    }
+    let continues = Arc::clone(&backend.continues);
+    let mut session = session_with_mock(backend);
+    session.breakpoints = manager_with_hw(0, HwBreakpointAccess::Execute, true);
+    session
+        .set_breakpoint_condition(7, Some("0".into()))
+        .unwrap();
+
+    let outcome = session.halt().unwrap();
+
+    assert!(
+        matches!(
+            outcome,
+            ContinueOutcome::Stopped {
+                exception_code: None,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(continues.load(Ordering::Relaxed), 7);
+    assert!(!session.backend.is_running());
 }
 
 #[test]

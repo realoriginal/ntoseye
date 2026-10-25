@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::thread::spawn;
 use std::time::Instant;
 
-use crate::backend::dbg_backend::ModuleEvent;
+use crate::backend::dbg_backend::{ModuleEvent, ModuleNotification};
 use crate::backend::kd::amd64::{reported_dr7, trap_state};
 use crate::backend::kd::event_loop::PumpBugcheck;
 use crate::backend::kd::framing::{
@@ -31,7 +31,8 @@ fn transparent_arm64_state_change_uses_arm64_continue_layout() {
         exception_address: None,
         program_counter: 0xffff_f800_1234_5678,
         kernel_base_hint: None,
-        unload_symbols: false,
+        load_symbols: None,
+        exception_record: None,
         is_bugcheck: false,
         bugcheck: None,
         target_reloaded: false,
@@ -98,6 +99,23 @@ fn parse_state_change_extracts_exception_record_metadata() {
     assert_eq!(second.exception_first_chance, Some(false));
 }
 
+/// A trap in a WOW64 thread's x86 code reports `STATUS_WX86_SINGLE_STEP` or
+/// `STATUS_WX86_BREAKPOINT`; to the debugger they are a single step and a
+/// breakpoint, which is what ends a step and what a hit is.
+#[test]
+fn wow64_traps_parse_as_the_native_ones() {
+    let mut payload = vec![0u8; 188];
+    payload[0..4].copy_from_slice(&DBG_KD_EXCEPTION_STATE_CHANGE.to_le_bytes());
+    for (reported, native) in [
+        (0x4000_001eu32, 0x8000_0004u32),
+        (0x4000_001f, 0x8000_0003),
+        (0xc000_0005, 0xc000_0005),
+    ] {
+        payload[32..36].copy_from_slice(&reported.to_le_bytes());
+        assert_eq!(parse_state_change(&payload).unwrap().exception_code, native);
+    }
+}
+
 #[test]
 fn parse_load_symbols_state_change_extracts_base_hint() {
     let mut payload = vec![0u8; 64];
@@ -124,7 +142,7 @@ fn load_symbols_unload_flag_separates_loads_from_unloads() {
     let load = stop_event(parse_state_change(&payload).unwrap());
     assert!(load.modules_changed);
     assert_eq!(
-        load.module_event,
+        load.module_event.map(|event| (event.kind, event.base)),
         Some((ModuleEvent::Load, VirtAddr(0xfffff807_12340000)))
     );
 
@@ -132,12 +150,43 @@ fn load_symbols_unload_flag_separates_loads_from_unloads() {
     let unload = stop_event(parse_state_change(&payload).unwrap());
     assert!(unload.modules_changed);
     assert_eq!(
-        unload.module_event,
+        unload.module_event.map(|event| (event.kind, event.base)),
         Some((ModuleEvent::Unload, VirtAddr(0xfffff807_12340000)))
     );
     assert_eq!(
         unload.target_kernel_base_hint,
         Some(VirtAddr(0xfffff807_12340000))
+    );
+}
+
+/// With `!gflag +ksl` the kernel reports each user-mode image it maps: the
+/// path follows the 240-byte state change, and `ProcessId` carries the
+/// mapping process's `EPROCESS`, of which KD keeps 32 bits. A user-mode base
+/// is no hint at the kernel, and the kernel's module list is unchanged.
+#[test]
+fn a_user_image_load_names_its_path_size_and_process() {
+    let path = b"\\Windows\\System32\\ws2_32.dll\0";
+    let mut payload = vec![0u8; 240];
+    payload[0..4].copy_from_slice(&DBG_KD_LOAD_SYMBOLS_STATE_CHANGE.to_le_bytes());
+    payload[8..12].copy_from_slice(&4u32.to_le_bytes());
+    payload[32..36].copy_from_slice(&(path.len() as u32).to_le_bytes());
+    payload[40..48].copy_from_slice(&0x7fff_a141_0000u64.to_le_bytes());
+    payload[48..56].copy_from_slice(&0xf63e_c080u64.to_le_bytes());
+    payload[60..64].copy_from_slice(&0x81000u32.to_le_bytes());
+    payload.extend_from_slice(path);
+
+    let load = stop_event(parse_state_change(&payload).unwrap());
+    assert!(!load.modules_changed);
+    assert_eq!(load.target_kernel_base_hint, None);
+    assert_eq!(
+        load.module_event,
+        Some(ModuleNotification {
+            kind: ModuleEvent::Load,
+            base: VirtAddr(0x7fff_a141_0000),
+            size: 0x81000,
+            path: Some(r"\Windows\System32\ws2_32.dll".to_string()),
+            process: Some(0xf63e_c080),
+        })
     );
 }
 
@@ -179,6 +228,16 @@ fn state_change_carries_the_amd64_control_report() {
     let stop = parse_state_change(&payload).unwrap();
     assert_eq!(stop.program_counter, 0x7ffa_7cc5_17e0);
     assert_eq!(stop.exception_code, STATUS_BREAKPOINT);
+    let record = stop.exception_record.as_ref().expect("an exception record");
+    assert_eq!(
+        (record.code, record.flags, record.address),
+        (STATUS_BREAKPOINT, 0, 0x7ffa_7cc5_17e0)
+    );
+    assert_eq!(
+        record.parameters,
+        [0],
+        "an int3's one parameter, BREAKPOINT_BREAK"
+    );
 
     let report = stop.control_report.expect("240 bytes carry a report");
     let trap = trap_state(&report).expect("AMD64 report");
@@ -269,7 +328,8 @@ fn continue_drains_in_place_rebreak_stale_breakin_and_retired_breakpoint_trap() 
         exception_address: Some(pc),
         program_counter: pc,
         kernel_base_hint: None,
-        unload_symbols: false,
+        load_symbols: None,
+        exception_record: None,
         is_bugcheck: false,
         bugcheck: None,
         target_reloaded: false,

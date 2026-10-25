@@ -413,7 +413,9 @@ pub struct PendingWalk {
 pub enum StepStack {
     /// Anywhere: a run through straight-line code, which may push.
     Any,
-    /// At or above the current one: the return from the call at the PC.
+    /// At or above the current one: the return from the call at the PC. In
+    /// x86 code anywhere, as a callee there may leave its caller's frame
+    /// allocated.
     CallReturn,
     /// Above the current frame: the return from the current function.
     FunctionReturn,
@@ -446,6 +448,10 @@ pub enum BreakpointStopAction {
     /// conditional breakpoint. It has been stepped over and the VM resumed, so
     /// the caller should keep waiting.
     Resumed,
+    /// A hit absorbed as for `Resumed` but kept where it is, for a break-in
+    /// out of retries (see [`Session::interrupt_classified`]): the target
+    /// stays halted on the site, which the next resume steps over.
+    Held,
     /// `rip` is not one of our breakpoints (a genuine exception or manual pause).
     NotBreakpoint,
 }
@@ -651,13 +657,16 @@ pub struct TrapSite {
     pub original: Vec<u8>,
 }
 
-/// A trap on a kernel function that reports a module `event`, planted for
-/// a backend that reports no module events itself. The image base is the
-/// function's second argument.
+/// A trap on a kernel function that reports a module `event`: for a
+/// backend that reports no module events itself, one on the function that
+/// reports a kernel image, whose base is its second argument; on any
+/// backend, `user` on the one every user-mode image map runs
+/// (`nt!PsCallImageNotifyRoutines`), which Windows reports to no debugger.
 #[derive(Debug, Clone)]
 pub struct ModuleTrap {
     pub event: ModuleEvent,
     pub site: TrapSite,
+    pub user: bool,
 }
 
 /// What [`Session::page_in`] observed once the target came back.
@@ -819,6 +828,10 @@ pub struct Session {
     /// module trap while being run past it, before executing it: its next
     /// hit on that event's trap is the same event, not a new one.
     module_trap_interrupted: Option<(ModuleEvent, u64)>,
+    /// A break-in's last try is classifying a stop: a hit a filter declines
+    /// is held as the pause rather than resumed (see
+    /// [`Session::interrupt_classified`]).
+    hold_declined_hits: bool,
     /// Whether a detected reload has not yet been surfaced to the host: the
     /// guest-state rebuild failed at the detection stop, so no
     /// [`ContinueOutcome::TargetReloaded`] went out. While set, the eventual

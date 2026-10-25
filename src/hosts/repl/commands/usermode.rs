@@ -3,6 +3,8 @@ use crate::base::types::VirtAddr;
 use crate::hosts::repl::args::{ArgCursor, ArgCx, ArgError};
 use crate::hosts::repl::*;
 use crate::hosts::ui;
+use crate::nt::target::usermode::critsec::{CriticalSection, CriticalSections};
+use crate::nt::target::usermode::runaway::{ThreadTime, ThreadTimes};
 use crate::nt::target::usermode::{
     ImageByteDiff, ImageCheck, ImageMismatchRange, ImageSectionCheck, ImageSelfPatchCounts,
     ImageSelfPatchRange, LastError, LoaderListHead, LoaderLists, LoaderModules, Peb, Peb32,
@@ -153,6 +155,266 @@ impl Render for LastError {
     fn render(&self, _: &mut ReplState<'_>, (): ()) {
         print_last_error(self);
     }
+}
+
+/// Show the critical sections of the current process, or one critical section.
+///
+/// Without an address, the command lists the sections ntdll keeps on
+/// RtlCriticalSectionList, each with whether a thread holds it, the owner's
+/// thread ID, its recursion count, how many threads wait for it, and how
+/// often threads have waited; -l lists only the held ones. A section
+/// initialized without debug information (DebugInfo -1, as
+/// ntdll!FastPebLock is) is not on that list: give its address. The current
+/// process is the one that .process selected, else the owner of the current
+/// thread; on a user-mode minidump, its one process. Needs ntdll's symbols.
+#[command(
+    names = ["!cs", "cs"],
+    category = "user mode",
+    kind = Query,
+    target = Nt,
+    forms = [critical_section, critical_sections],
+)]
+fn cs(
+    session: &Session,
+    #[arg(switch = "-l")] locked_only: bool,
+    #[arg(name = "address")] address: Option<VirtAddr>,
+) -> Result<CriticalSectionView> {
+    match address {
+        Some(address) => critical_section(session, address).map(CriticalSectionView::One),
+        None => {
+            critical_sections(session).map(|list| CriticalSectionView::List { list, locked_only })
+        }
+    }
+}
+
+/// Decode a critical section (`!cs address`).
+#[command(form_of = cs, python = [Process, UserProcess])]
+fn critical_section(session: &Session, address: VirtAddr) -> Result<CriticalSection> {
+    session.target.critical_section(address)
+}
+
+/// List the critical sections of the process (`!cs`).
+#[command(form_of = cs, python = [Process, UserProcess])]
+fn critical_sections(session: &Session) -> Result<CriticalSections> {
+    session.target.critical_sections()
+}
+
+/// What `!cs` read: one section, or the list, whole or only the held ones.
+enum CriticalSectionView {
+    One(CriticalSection),
+    List {
+        list: CriticalSections,
+        locked_only: bool,
+    },
+}
+
+impl Render for CriticalSectionView {
+    fn render(&self, _: &mut ReplState<'_>, (): ()) {
+        match self {
+            Self::One(section) => print_critical_section(section),
+            Self::List { list, locked_only } => {
+                let locked = list
+                    .sections
+                    .iter()
+                    .filter(|section| section.locked() == Some(true))
+                    .count();
+                let count = list.sections.len();
+                let walk = match &list.termination {
+                    ListTermination::Head => String::new(),
+                    ListTermination::Null => ", then a null link (the list is corrupt)".into(),
+                    ListTermination::Cycle(address) => {
+                        format!(", then a cycle at {:#x} (the list is corrupt)", address.0)
+                    }
+                    ListTermination::Bound => " (the walk stops there)".into(),
+                    ListTermination::Corrupt(error) => format!(", then a read error: {error}"),
+                };
+                outln!(
+                    "critical sections: list head {}, {count}{walk}, {locked} held",
+                    ui::addr(list.list_head.0)
+                );
+                let shown: Vec<&CriticalSection> = list
+                    .sections
+                    .iter()
+                    .filter(|section| !locked_only || section.locked() == Some(true))
+                    .collect();
+                if shown.is_empty() {
+                    outln!("{}", ui::muted("no critical section is held"));
+                    return;
+                }
+                let mut builder = Builder::default();
+                builder.push_record([
+                    "Address",
+                    "State",
+                    "Owner",
+                    "Recursion",
+                    "Waiters",
+                    "Contention",
+                    "Symbol",
+                ]);
+                for section in shown {
+                    let (state, owner, recursion, waiters) = section_state(section);
+                    builder.push_record([
+                        ui::addr(section.address.0).to_string(),
+                        state,
+                        owner,
+                        recursion,
+                        waiters,
+                        value_or_dash(&section.contention_count),
+                        section.symbol.clone().unwrap_or_else(|| "-".into()),
+                    ]);
+                }
+                print_padded_table(builder);
+            }
+        }
+    }
+}
+
+/// A section's state, its owner's TID, its recursion count and its
+/// waiters, each `-` while it is not held.
+fn section_state(section: &CriticalSection) -> (String, String, String, String) {
+    match section.locked() {
+        Some(true) => (
+            "locked".into(),
+            match &section.owning_thread {
+                DiagnosticValue::Available(tid) => format!("TID {tid:#x}"),
+                DiagnosticValue::Unavailable(_) => "?".into(),
+            },
+            value_or_dash(&section.recursion_count),
+            section
+                .waiters()
+                .map_or_else(|| "?".into(), |waiters| waiters.to_string()),
+        ),
+        Some(false) => ("free".into(), "-".into(), "-".into(), "-".into()),
+        None => ("?".into(), "-".into(), "-".into(), "-".into()),
+    }
+}
+
+fn value_or_dash<T: Display>(value: &DiagnosticValue<T>) -> String {
+    match value {
+        DiagnosticValue::Available(value) => value.to_string(),
+        DiagnosticValue::Unavailable(_) => "-".into(),
+    }
+}
+
+fn print_critical_section(section: &CriticalSection) {
+    let field = |name: &str, value: String| outln!("  {name:<16} : {value}");
+    outln!(
+        "critical section {}{}",
+        ui::addr(section.address.0),
+        section
+            .symbol
+            .as_ref()
+            .map(|symbol| format!(" ({})", ui::symbol(symbol)))
+            .unwrap_or_default()
+    );
+    let (state, owner, recursion, waiters) = section_state(section);
+    field("State", state);
+    field("OwningThread", owner);
+    field("RecursionCount", recursion);
+    field("Waiters", waiters);
+    field(
+        "LockCount",
+        match section.lock_count {
+            DiagnosticValue::Available(count) => format!("{count:#x}"),
+            DiagnosticValue::Unavailable(ref error) => format!("unavailable: {error}"),
+        },
+    );
+    field("ContentionCount", value_or_dash(&section.contention_count));
+    field(
+        "DebugInfo",
+        match section.debug_info {
+            DiagnosticValue::Available(address) => ui::addr(address.0).to_string(),
+            DiagnosticValue::Unavailable(ref error) => format!("unavailable: {error}"),
+        },
+    );
+    field(
+        "LockSemaphore",
+        match section.lock_semaphore {
+            DiagnosticValue::Available(address) => ui::addr(address.0).to_string(),
+            DiagnosticValue::Unavailable(ref error) => format!("unavailable: {error}"),
+        },
+    );
+    field(
+        "SpinCount",
+        match section.spin_count {
+            DiagnosticValue::Available(count) => format!("{count:#x}"),
+            DiagnosticValue::Unavailable(ref error) => format!("unavailable: {error}"),
+        },
+    );
+}
+
+/// Show how much processor time each thread of the current process has used.
+///
+/// The flags choose what to show, each as a list of the threads by that time,
+/// most first: 1 the user-mode time (the default), 2 the kernel-mode time,
+/// 4 the time since each thread started, so 7 shows all three. The current
+/// process is the one that .process selected, else the owner of the current
+/// thread; on a user-mode minidump, its one process, whose thread-info
+/// stream records the times. A kernel target counts them in clock ticks, so
+/// they are as precise as one tick (15.6 ms by default).
+#[command(
+    names = ["!runaway", "runaway"],
+    category = "user mode",
+    kind = Query,
+    target = Nt,
+    python = [Process, UserProcess],
+    python_name = "thread_times",
+)]
+fn runaway(session: &Session, #[arg(default = 1, render)] flags: u64) -> Result<ThreadTimes> {
+    session.target.thread_times()
+}
+
+impl Render<u64> for ThreadTimes {
+    fn render(&self, _: &mut ReplState<'_>, flags: u64) {
+        let flags = if flags & 7 == 0 { 1 } else { flags };
+        let sections: [Section; 3] = [
+            (1, "User Mode Time", |thread| thread.user_time),
+            (2, "Kernel Mode Time", |thread| thread.kernel_time),
+            (4, "Elapsed Time", |thread| thread.elapsed),
+        ];
+        if let (Some(process), Some(pid)) = (&self.process, self.pid) {
+            outln!("{}", ui::muted(&format!("{process} (PID {pid})")));
+        }
+        for (bit, title, time) in sections {
+            if flags & bit == 0 {
+                continue;
+            }
+            let mut threads: Vec<&ThreadTime> = self.threads.iter().collect();
+            threads.sort_by_key(|thread| std::cmp::Reverse(time(thread)));
+            outln!(" {}", ui::label(title));
+            let mut builder = Builder::default();
+            builder.push_record(["Thread", "Time"]);
+            for thread in threads {
+                let label = match thread.index {
+                    Some(index) => format!("{index}:{:x}", thread.tid),
+                    None => format!("TID {}", thread.tid),
+                };
+                builder.push_record([
+                    label,
+                    time(thread).map_or_else(|| "-".to_string(), format_thread_time),
+                ]);
+            }
+            print_padded_table(builder);
+        }
+    }
+}
+
+/// One list `!runaway` shows: its flag, its title, and the time it sorts by.
+type Section = (u64, &'static str, fn(&ThreadTime) -> Option<u64>);
+
+/// A time in 100 ns units as WinDbg's `!runaway` writes it:
+/// `0 days 0:00:01.453`.
+fn format_thread_time(time: u64) -> String {
+    let millis = time / 10_000;
+    let seconds = millis / 1000;
+    format!(
+        "{} days {}:{:02}:{:02}.{:03}",
+        seconds / 86_400,
+        seconds / 3600 % 24,
+        seconds / 60 % 60,
+        seconds % 60,
+        millis % 1000
+    )
 }
 
 /// `<module>`: the one word the switches leave; none, or more, print the

@@ -10,6 +10,7 @@ use std::sync::mpsc;
 use std::thread::{self, spawn};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::backend::dbg_backend::{ExceptionRecord, ModuleEvent, ModuleNotification};
 use crate::backend::kd::event_loop::{PumpBugcheck, PumpResult};
 use crate::backend::kd::framing::{
     BREAKIN_BYTE, PACKET_TYPE_KD_DEBUG_IO, PACKET_TYPE_KD_STATE_CHANGE64, SYNC_PACKET_ID,
@@ -152,6 +153,21 @@ fn send_exception(kernel: &mut UnixStream, packet_id: u32, pc: u64) {
         .unwrap();
 }
 
+fn exception_payload_with_record(pc: u64, record: &ExceptionRecord) -> Vec<u8> {
+    let mut payload = exception_state_change_payload(pc);
+    payload.resize(188, 0);
+    bytes::write_u32(&mut payload, 32, record.code);
+    bytes::write_u32(&mut payload, 36, record.flags);
+    bytes::write_u64(&mut payload, 40, record.record);
+    bytes::write_u64(&mut payload, 48, record.address);
+    bytes::write_u32(&mut payload, 56, record.parameters.len() as u32);
+    for (index, &parameter) in record.parameters.iter().enumerate() {
+        bytes::write_u64(&mut payload, 64 + index * 8, parameter);
+    }
+    bytes::write_u32(&mut payload, 184, 1);
+    payload
+}
+
 fn assert_ack(kernel: &mut UnixStream, packet_id: u32) {
     let packet = read_wire_packet(kernel);
     let header = wire_header(&packet);
@@ -194,7 +210,7 @@ fn blocking_wait_reconnects_and_surfaces_a_fresh_exception_at_a_known_breakin_pc
     const PC: u64 = 0xffff_f800_0011_2233;
     const BP: u64 = 0xffff_f800_0090_0000;
     let (mut fixture, mut backend, kernel) = SerialFixture::connected();
-    backend.breakin_addresses.insert(PC);
+    backend.note_breakin_site(PC);
     backend.late_breakin = true;
     backend.bp_handles.insert(BP, 7);
     backend.managed_bp_addresses.insert(BP);
@@ -505,7 +521,19 @@ fn session_wait_observes_a_cross_thread_return_running_flag_after_one_recovery_p
 fn shared_backend_handle_polls_and_recovers_the_existing_serial_session() {
     const PC: u64 = 0xffff_f800_00aa_3000;
     const BP: u64 = 0xffff_f800_00bb_0000;
+    let record = ExceptionRecord {
+        code: STATUS_WX86_BREAKPOINT,
+        flags: 2,
+        record: 0xffff_f800_00cc_0000,
+        address: PC,
+        parameters: vec![0x1234, 0x5678],
+    };
     let (mut fixture, mut backend, kernel) = SerialFixture::connected();
+    backend.last_exception_record = Some(ExceptionRecord {
+        code: 0xc000_0005,
+        address: PC - 1,
+        ..record.clone()
+    });
     backend.bp_handles.insert(BP, 23);
     backend.managed_bp_addresses.insert(BP);
     backend.start_pump(None, None).unwrap();
@@ -523,9 +551,19 @@ fn shared_backend_handle_polls_and_recovers_the_existing_serial_session() {
     fixture.listen();
     let mut kernel = fixture.accept_while_polling(&mut handle);
     assert_quiet(&mut kernel);
-    send_exception(&mut kernel, INITIAL_PACKET_ID, PC);
+    kernel
+        .write_all(&data_packet(
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            INITIAL_PACKET_ID,
+            &exception_payload_with_record(PC, &record),
+        ))
+        .unwrap();
     let stop = handle.try_wait_for_stop(FIXTURE_TIMEOUT).unwrap().unwrap();
     assert_eq!(stop.program_counter, Some(PC));
+    assert_eq!(stop.exception_code, Some(STATUS_BREAKPOINT));
+    assert_eq!(stop.exception_address, Some(PC));
+    assert_eq!(stop.first_chance, Some(true));
+    assert_eq!(handle.last_exception_record(), Some(record));
     assert!(!stop.assisted_breakin);
     assert!(!stop.target_reloaded);
     assert!(!handle.is_running());
@@ -537,6 +575,79 @@ fn shared_backend_handle_polls_and_recovers_the_existing_serial_session() {
     }
     assert_ack(&mut kernel, INITIAL_PACKET_ID);
     assert_quiet(&mut kernel);
+}
+
+#[test]
+fn recovered_module_notifications_keep_metadata_and_clear_the_old_exception_record() {
+    const PC: u64 = 0xffff_f800_00aa_4000;
+    const PROCESS: u64 = 0xffff_a38c_ae66_1800;
+    const SIZE: u32 = 0x81000;
+    let path = b"\\Windows\\System32\\test.dll\0";
+    for base in [0x7fff_a141_0000u64, 0xffff_f800_00bb_0000] {
+        for unload in [false, true] {
+            let (mut fixture, mut backend, kernel) = SerialFixture::connected();
+            backend.last_exception_record = Some(ExceptionRecord {
+                code: 0xc000_0005,
+                flags: 0,
+                record: 0,
+                address: PC,
+                parameters: vec![0, 0x1234],
+            });
+            backend.start_pump(None, None).unwrap();
+            let (mut handle, _memory) = backend.into_remote_memory();
+            fixture.disconnect_listener(true);
+            drop(kernel);
+            assert!(handle.try_wait_for_stop(POLL_TIMEOUT).unwrap().is_none());
+            fixture.listen();
+            let mut kernel = fixture.accept_while_polling(&mut handle);
+            assert_quiet(&mut kernel);
+
+            let mut payload = state_change_payload(DBG_KD_LOAD_SYMBOLS_STATE_CHANGE, PC);
+            payload.resize(240, 0);
+            bytes::write_u32(&mut payload, 32, path.len() as u32);
+            bytes::write_u64(&mut payload, 40, base);
+            bytes::write_u64(&mut payload, 48, PROCESS);
+            bytes::write_u32(&mut payload, 60, SIZE);
+            payload[64] = u8::from(unload);
+            payload.extend_from_slice(path);
+            kernel
+                .write_all(&data_packet(
+                    PACKET_TYPE_KD_STATE_CHANGE64,
+                    INITIAL_PACKET_ID,
+                    &payload,
+                ))
+                .unwrap();
+
+            let stop = handle.try_wait_for_stop(FIXTURE_TIMEOUT).unwrap().unwrap();
+            let user = base >> 63 == 0;
+            assert_eq!(stop.program_counter, Some(PC));
+            assert_eq!(stop.modules_changed, !user);
+            assert_eq!(
+                stop.target_kernel_base_hint,
+                (!user).then_some(VirtAddr(base))
+            );
+            assert_eq!(
+                stop.module_event,
+                Some(ModuleNotification {
+                    kind: if unload {
+                        ModuleEvent::Unload
+                    } else {
+                        ModuleEvent::Load
+                    },
+                    base: VirtAddr(base),
+                    size: SIZE,
+                    path: Some(r"\Windows\System32\test.dll".to_string()),
+                    process: user.then_some(PROCESS & 0xffff_ffff),
+                })
+            );
+            assert_eq!(handle.last_exception_record(), None);
+            assert!(!stop.assisted_breakin);
+            assert!(!stop.target_reloaded);
+            assert!(!handle.is_running());
+            assert_ack(&mut kernel, INITIAL_PACKET_ID);
+            assert_quiet(&mut kernel);
+        }
+    }
 }
 
 #[test]
@@ -940,9 +1051,23 @@ fn regression_fatal_print_acked_before_eof_keeps_bugcheck_details_after_reconnec
     fixture.listen();
     let mut kernel = fixture.accept_while_polling(&mut backend);
     assert_quiet(&mut kernel);
-    send_exception(&mut kernel, INITIAL_PACKET_ID, PC);
+    let record = ExceptionRecord {
+        code: STATUS_BREAKPOINT,
+        flags: 0,
+        record: 0,
+        address: PC,
+        parameters: vec![0xd1],
+    };
+    kernel
+        .write_all(&data_packet(
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            INITIAL_PACKET_ID,
+            &exception_payload_with_record(PC, &record),
+        ))
+        .unwrap();
 
     let stop = backend.try_wait_for_stop(FIXTURE_TIMEOUT).unwrap().unwrap();
+    assert_eq!(backend.last_exception_record(), Some(record));
     assert_eq!(stop.program_counter, Some(PC));
     assert_eq!(stop.exception_code, Some(STATUS_BREAKPOINT));
     assert!(!stop.target_reloaded);

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use super::transport::KdTransport;
 use crate::arch::{Arch, RegisterMap};
-use crate::backend::dbg_backend::DebugLog;
+use crate::backend::dbg_backend::{DebugLog, ExceptionRecord};
 use crate::backend::kd::api;
 use crate::backend::kd::framing::{
     KdFraming, PACKET_TYPE_KD_DEBUG_IO, PACKET_TYPE_KD_FILE_IO, PACKET_TYPE_KD_STATE_CHANGE64,
@@ -25,8 +25,9 @@ use super::{
     BugcheckCapture, CONTROL_REPORT_OFFSET, ControlReport, DBG_KD_COMMAND_STRING_STATE_CHANGE,
     DBG_KD_EXCEPTION_STATE_CHANGE, DBG_KD_LOAD_SYMBOLS_STATE_CHANGE, KD_INITIAL_PROBE_TIMEOUT,
     KD_INITIAL_PROGRESS_INTERVAL, KD_INITIAL_TIMEOUT_DEFAULT, KD_INITIAL_TIMEOUT_ENV,
-    KD_RECONNECT_BREAKIN_INTERVAL, KD_RECONNECT_BREAKIN_TRACE_EVERY, KD_REQUEST_TIMEOUT, PUMP_POLL,
-    STATUS_BREAKPOINT, StateChange, handle_debug_io_with_output, handle_file_io,
+    KD_RECONNECT_BREAKIN_INTERVAL, KD_RECONNECT_BREAKIN_TRACE_EVERY, KD_REQUEST_TIMEOUT,
+    LoadSymbols, PUMP_POLL, STATUS_BREAKPOINT, StateChange, handle_debug_io_with_output,
+    handle_file_io, native_trap_code,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +76,7 @@ pub fn parse_state_change(payload: &[u8]) -> Result<StateChange> {
     }
     let new_state = read_u32(payload, 0);
     let exception_code = if new_state == DBG_KD_EXCEPTION_STATE_CHANGE && payload.len() >= 36 {
-        read_u32(payload, 32)
+        native_trap_code(read_u32(payload, 32))
     } else {
         0
     };
@@ -84,23 +85,37 @@ pub fn parse_state_change(payload: &[u8]) -> Result<StateChange> {
     } else {
         None
     };
+    // DBGKM_EXCEPTION64 at 32: ExceptionCode u32 @32, ExceptionFlags u32
+    // @36, ExceptionRecord u64 @40, ExceptionAddress u64 @48,
+    // NumberParameters u32 @56, ExceptionInformation[15] u64 @64.
+    let exception_record = (new_state == DBG_KD_EXCEPTION_STATE_CHANGE && payload.len() >= 184)
+        .then(|| {
+            let count = (read_u32(payload, 56) as usize).min(EXCEPTION_MAXIMUM_PARAMETERS);
+            ExceptionRecord {
+                code: read_u32(payload, 32),
+                flags: read_u32(payload, 36),
+                record: read_u64(payload, 40),
+                address: read_u64(payload, 48),
+                parameters: (0..count)
+                    .map(|index| read_u64(payload, 64 + index * 8))
+                    .collect(),
+            }
+        });
     let exception_first_chance =
         if new_state == DBG_KD_EXCEPTION_STATE_CHANGE && payload.len() >= 188 {
             Some(read_u32(payload, 184) != 0)
         } else {
             None
         };
-    let kernel_base_hint = if new_state == DBG_KD_LOAD_SYMBOLS_STATE_CHANGE && payload.len() >= 48 {
-        let base = read_u64(payload, 40);
-        (base != 0).then_some(VirtAddr(base))
-    } else {
-        None
-    };
-    // DBGKD_LOAD_SYMBOLS64 at 32: PathNameLength u32 @32, BaseOfDll u64 @40,
-    // ProcessId u64 @48, CheckSum u32 @56, SizeOfImage u32 @60,
-    // UnloadSymbols BOOLEAN @64.
-    let unload_symbols = new_state == DBG_KD_LOAD_SYMBOLS_STATE_CHANGE
-        && payload.get(64).is_some_and(|&flag| flag != 0);
+    let load_symbols = (new_state == DBG_KD_LOAD_SYMBOLS_STATE_CHANGE)
+        .then(|| load_symbols(payload))
+        .flatten();
+    // A user-mode image (`!gflag +ksl` reports them) lies in the lower half
+    // on both architectures, and is no hint at where the kernel is.
+    let kernel_base_hint = load_symbols
+        .as_ref()
+        .map(|image| image.base)
+        .filter(|base| base.0 >> 63 == 1);
     let processor = read_u16(payload, 6);
     let number_processors = read_u32(payload, 8);
     // Both drive thread ids and per-processor requests; a malformed count
@@ -125,12 +140,75 @@ pub fn parse_state_change(payload: &[u8]) -> Result<StateChange> {
         exception_address,
         program_counter: read_u64(payload, 24),
         kernel_base_hint,
-        unload_symbols,
+        load_symbols,
+        exception_record,
         is_bugcheck: false,
         bugcheck: None,
         target_reloaded: false,
         assisted_breakin: false,
         control_report: control_report(payload),
+    })
+}
+
+/// `EXCEPTION_MAXIMUM_PARAMETERS`: the room `ExceptionInformation` has.
+const EXCEPTION_MAXIMUM_PARAMETERS: usize = 15;
+
+/// The `DBGKD_LOAD_SYMBOLS64` of a load-symbols state change, at 32:
+/// PathNameLength u32 @32, BaseOfDll u64 @40, ProcessId u64 @48, CheckSum
+/// u32 @56, SizeOfImage u32 @60, UnloadSymbols BOOLEAN @64. The path, ANSI
+/// and NUL-terminated, is the payload's last PathNameLength bytes. `None`
+/// for a payload too short to hold the base or with no image base; a field
+/// past a short payload's end reads as 0.
+fn load_symbols(payload: &[u8]) -> Option<LoadSymbols> {
+    if payload.len() < 48 {
+        return None;
+    }
+    let base = read_u64(payload, 40);
+    if base == 0 {
+        return None;
+    }
+    let path_len = read_u32(payload, 32) as usize;
+    let path = payload
+        .len()
+        .checked_sub(path_len)
+        .filter(|&start| path_len != 0 && start >= 65)
+        .map(|start| {
+            let bytes = &payload[start..];
+            let end = bytes
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        })
+        .filter(|path| !path.is_empty());
+    kd_trace!(
+        "kd: load-symbols {} {} at {base:#x}, process {:#x}",
+        if payload.get(64).is_some_and(|&flag| flag != 0) {
+            "unload"
+        } else {
+            "load"
+        },
+        path.as_deref().unwrap_or("<no path>"),
+        if payload.len() >= 56 {
+            read_u64(payload, 48)
+        } else {
+            0
+        }
+    );
+    Some(LoadSymbols {
+        base: VirtAddr(base),
+        size: if payload.len() >= 64 {
+            read_u32(payload, 60)
+        } else {
+            0
+        },
+        process: if payload.len() >= 56 {
+            read_u64(payload, 48)
+        } else {
+            0
+        },
+        unload: payload.get(64).is_some_and(|&flag| flag != 0),
+        path,
     })
 }
 

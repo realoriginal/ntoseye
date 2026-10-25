@@ -19,7 +19,7 @@ use crate::base::disasm::{ControlFlow, classify, decode_first};
 use crate::base::error::{Error, Result};
 use crate::base::memory::MemoryOps;
 use crate::base::notice::Notice;
-use crate::base::types::{Dtb, VirtAddr};
+use crate::base::types::{CodeMachine, Dtb, VirtAddr};
 use crate::nt::breakpoints::{
     BreakpointManager, StepFrame, ThreadScope, lift_target_site, plant_target_site,
 };
@@ -34,7 +34,7 @@ use crate::session::hits::{reported_watch_hit, stack_pointer};
 use crate::session::{
     CallTrace, CallTraceEnd, CallTraceFrame, Cancel, CancelBehavior, ContinueOutcome, ControlState,
     CurrentInstruction, ModuleTrap, PendingWalk, STATUS_BREAKPOINT, STATUS_SINGLE_STEP, Session,
-    StepKind, StepMode, StepStack,
+    StepKind, StepMode, StepStack, StopResolution,
 };
 
 impl Session {
@@ -93,15 +93,11 @@ impl Session {
                 &self.breakpoints,
                 &self.current_thread,
             )?,
-            None => {
-                step_one_and_clear_tf(
-                    self.target.arch(),
-                    self.backend.as_mut(),
-                    &self.register_map,
-                    &self.target.interrupt,
-                )?;
-                RunPast::Reached
-            }
+            None => match self.trap_flag_step()? {
+                None => RunPast::Reached,
+                // Another thread's stop came first, and is the step's.
+                Some(outcome) => return Ok((outcome, RunPast::Reached)),
+            },
         };
         for id in self.breakpoints.one_shot_hit_ids() {
             self.breakpoints
@@ -157,6 +153,53 @@ impl Session {
         Ok((ContinueOutcome::Step { rip }, stepped))
     }
 
+    /// Single-step the current thread by the trap flag, as
+    /// [`step_one_and_clear_tf`] does, past what other threads stop on
+    /// meanwhile; `None` when the step's own trap ended it. KD runs every
+    /// processor during a step, so while the instruction takes long (a
+    /// system call that waits), another thread can reach a breakpoint first.
+    /// A stop the session absorbs, such as a hit in another process on a site
+    /// scoped to this thread's, or the single step an absorb left another
+    /// thread, is passed and the wait goes on. Any other is where the step
+    /// stops, and is returned, the trap flag cleared on the stepping thread if
+    /// its processor still runs it.
+    fn trap_flag_step(&mut self) -> Result<Option<ContinueOutcome>> {
+        let arch = self.target.arch();
+        let stepping = self.current_thread.clone();
+        let stepping_thread = nt_thread_on(&self.target, &stepping);
+        self.backend.step()?;
+        loop {
+            let event = wait_for_step_stop(self.backend.as_mut(), &self.target.interrupt)?;
+            // The step's own stop is its thread's, on whichever processor it
+            // finished; one whose thread is not known is taken for it.
+            let reporter = event
+                .thread_id
+                .as_deref()
+                .and_then(|reported| nt_thread_on(&self.target, reported));
+            let foreign = stepping_thread
+                .zip(reporter)
+                .is_some_and(|(stepping, reporter)| reporter != stepping);
+            if !foreign {
+                clear_trap_flag(arch, self.backend.as_mut(), &self.register_map)?;
+                step_stop_error(&event)?;
+                return Ok(None);
+            }
+            match self.classify_stop_event(event)? {
+                StopResolution::Resumed | StopResolution::ModulesChanged => {}
+                resolution => {
+                    let outcome = self.continue_outcome_from_resolution(resolution);
+                    if nt_thread_on(&self.target, &stepping) == stepping_thread {
+                        let reported = self.current_thread.clone();
+                        self.backend.set_current_thread(&stepping)?;
+                        clear_trap_flag(arch, self.backend.as_mut(), &self.register_map)?;
+                        self.backend.set_current_thread(&reported)?;
+                    }
+                    return Ok(Some(outcome));
+                }
+            }
+        }
+    }
+
     /// Step the thread on the VP selected in a partition view past its
     /// instruction. The VP runs on whichever of the target's processors the
     /// hypervisor gives it, which no single step of a vCPU follows, so the
@@ -210,7 +253,9 @@ impl Session {
         else {
             return self.step_over_breakpoint_at_pc();
         };
-        let ModuleTrap { event, site: trap } = self.module_traps[index].clone();
+        let ModuleTrap {
+            event, site: trap, ..
+        } = self.module_traps[index].clone();
         let cr3 = self
             .register_map
             .read_u64(self.target.arch().dtb_register(), &regs)
@@ -368,14 +413,20 @@ impl Session {
         let arch = self.target.arch();
         let ip = self.register_map.read_u64(arch.pc_register(), &registers)?;
         let sp = self.register_map.read_u64(arch.sp_register(), &registers)?;
-        let dtb = self
+        let cr3 = self
             .register_map
             .read_u64(arch.dtb_register(), &registers)
-            .unwrap_or(0);
+            .ok();
+        let dtb = cr3.unwrap_or(0);
         let mut bytes = [0u8; 16];
         let machine = self.target.executing_machine(VirtAddr(ip));
         let length = machine.max_instruction_bytes();
-        self.read_masked(VirtAddr(ip), &mut bytes[..length])?;
+        // The thread's own code, whichever process inspection is attached to.
+        self.read_masked_in(
+            code_root(&self.target, cr3, ip),
+            VirtAddr(ip),
+            &mut bytes[..length],
+        )?;
         let state = ControlState {
             ip,
             sp,
@@ -883,6 +934,16 @@ impl Session {
     /// find its stack per `stack`. `None` when the thread cannot be
     /// identified (a VTL1 stop, no kernel symbols): the run-to then stops for
     /// any thread.
+    /// Whether the instruction at the stepping thread's PC is x86 code: a
+    /// WOW64 program's, in compatibility mode.
+    fn pc_runs_x86(&mut self) -> Result<bool> {
+        let registers = self.read_registers()?;
+        let pc = self
+            .register_map
+            .read_u64(self.target.arch().pc_register(), &registers)?;
+        Ok(self.target.executing_machine(VirtAddr(pc)) == CodeMachine::X86)
+    }
+
     pub fn step_frame(&mut self, stack: StepStack) -> Result<Option<StepFrame>> {
         let Some(thread) = windows_thread_on_backend_thread(&self.target, &self.current_thread)
         else {
@@ -890,6 +951,11 @@ impl Session {
         };
         let min_stack_pointer = match stack {
             StepStack::Any => None,
+            // An x86 callee may return with the stack below where the call
+            // left it: `_SEH_prolog4` and `_chkstk` allocate their caller's
+            // frame. No floor then tells the call's return from a recursive
+            // call's, and the thread alone decides.
+            StepStack::CallReturn if self.pc_runs_x86()? => None,
             StepStack::CallReturn | StepStack::FunctionReturn => {
                 let registers = self.read_registers()?;
                 stack_pointer(self.target.arch(), &self.register_map, &registers).map(|sp| {
@@ -1185,6 +1251,13 @@ pub fn step_one_and_clear_tf(
     backend.step()?;
     let event = wait_for_step_stop(backend, interrupt)?;
     clear_trap_flag(arch, backend, register_map)?;
+    step_stop_error(&event)
+}
+
+/// The error the stop `event` that ended a step makes, when it is not the
+/// step's trap: a bugcheck, or an exception other than a single step or a
+/// breakpoint.
+fn step_stop_error(event: &StopEvent) -> Result<()> {
     if event.is_bugcheck {
         return Err(Error::DebugInfo(
             "target bugchecked while single-stepping".into(),
@@ -2223,6 +2296,10 @@ fn rip_of(
     register_map.read_u64(arch.pc_register(), &registers).ok()
 }
 
+/// `int 0x2e`: the system call of x86 Windows, which x64 ntdll's stubs still
+/// make when `SharedUserData` says `syscall` is not to be used.
+const SYSTEM_SERVICE_VECTOR: u8 = 0x2e;
+
 /// Every address execution can continue at after the instruction at `rip`,
 /// decoded from the guest (the site is already lifted) and resolved against
 /// the stopped vCPU's registers and memory. `thread` is the backend thread
@@ -2314,7 +2391,16 @@ fn instruction_successors(
             format!("{:?}", instruction.mnemonic()).to_ascii_lowercase()
         )));
     }
+    // A system call made from user mode continues, for the code that made
+    // it, at the next instruction once the kernel returns. The kernel's
+    // entry is where the processor goes, but nothing can be planted there
+    // (KVASCODE), and the thread comes back here.
+    let user_mode = !debugger.arch().paging().is_kernel_address(VirtAddr(rip));
     let mut successors = match instruction.code() {
+        Code::Syscall if user_mode => vec![instruction.next_ip()],
+        Code::Int_imm8 if user_mode && instruction.immediate8() == SYSTEM_SERVICE_VECTOR => {
+            vec![instruction.next_ip()]
+        }
         Code::Syscall => vec![system_call_entry(debugger, bitness)?],
         // `sysret` returns to RCX, `sysexit` to RDX; the 32-bit forms to
         // their low halves.

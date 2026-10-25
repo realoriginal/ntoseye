@@ -589,6 +589,40 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
     }
 }
 
+impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
+    /// Whether the committed user page `va`, which nothing in memory backs,
+    /// holds zeros because it was never touched: for `private` memory, its
+    /// PTE is a demand-zero one or there is none (no table, or zero); for a
+    /// view, the section PTE the page maps is a demand-zero one. A page in
+    /// the page file, or a view's page in its file, is not.
+    pub fn page_is_demand_zero(&self, va: VirtAddr, private: bool) -> bool {
+        if self.dtb == DTB_IDENTITY || self.arch.paging().is_kernel_address(va) {
+            return false;
+        }
+        let leaf = match self.walk_tables(va, |_| {}) {
+            Ok(Walked::Unmapped(leaf)) => leaf,
+            Ok(Walked::Mapped(_)) | Err(_) => return false,
+        };
+        let mask = self.backend.invalid_pte_mask();
+        if private {
+            return leaf.is_none_or(|pte| pte.0 == 0 || pte.unswizzled(mask).is_demand_zero());
+        }
+        let Some(views) = self.backend.section_views() else {
+            return false;
+        };
+        let from_vad = || views.prototype_pte(self, self.dtb, va);
+        let prototype = match leaf {
+            None => from_vad(),
+            Some(pte) if pte.0 == 0 => from_vad(),
+            Some(pte) if pte.is_prototype() => pte.prototype_address().or_else(from_vad),
+            Some(_) => None,
+        };
+        prototype
+            .and_then(|address| self.read::<u64>(address).ok())
+            .is_some_and(|pte| PageTableEntry(pte).unswizzled(mask).is_demand_zero())
+    }
+}
+
 /// Where a table walk ended.
 enum Walked {
     Mapped(Translation),
@@ -665,7 +699,7 @@ impl<'a, B: MemoryOps<PhysAddr>> MemoryOps<VirtAddr> for AddressSpace<'a, B> {
                     return Err(Error::PartialWrite(offset));
                 }
                 return Err(Error::DebugInfo(format!(
-                    "{curr_vaddr} is resident but not mapped ({reason}); \
+                    "{curr_vaddr:#x} is resident but not mapped ({reason}); \
                      it cannot be written until the target faults it back in"
                 )));
             }

@@ -7,11 +7,16 @@ use crate::backend::dbg_backend::{
     ContinueDisposition, DebugBackend, LastEvent, ModuleEvent, StopEvent, clear_trap_flag,
     processor_index_from_backend_thread_id,
 };
+use crate::base::bytes::utf16le_lossy;
 use crate::base::error::Result;
 use crate::base::memory::MemoryOps;
+use crate::base::notice::Notice;
 use crate::base::types::VirtAddr;
-use crate::nt::breakpoints::{BreakpointInfo, BreakpointManager};
+use crate::nt::breakpoints::{BreakpointInfo, BreakpointManager, BreakpointScope, BreakpointSpec};
 use crate::nt::guest::{ModuleInfo, ProcessInfo};
+use crate::nt::pe::headers::decode_headers;
+use crate::nt::pe::read_pe_header_page;
+use crate::nt::symbols::ModuleSymbolStatus;
 use crate::nt::target::{BreakpointStop, HYPERVISOR_CONTEXT, ThreadInfo};
 use crate::nt::unwind::{UNKNOWN_CONTEXT, thread_root, try_format_symbol_at};
 use crate::session::context::{
@@ -428,12 +433,39 @@ impl Session {
             ReloadDisposition::Ordinary => {}
         }
 
-        if event.modules_changed {
-            self.unreported_module_change = self.refresh_modules_on_stop();
-            if let Some((kind, module)) = event.module_event.and_then(|(kind, base)| {
-                self.module_event_to_surface(kind, base)
-                    .map(|module| (kind, module))
-            }) {
+        if event.modules_changed || event.module_event.is_some() {
+            let surfaced = match event.module_event.clone() {
+                // A user-mode image changes no kernel module list.
+                // While the user-image trap is planted it reports every
+                // mapping, this one too.
+                Some(notification) if notification.process.is_some() => {
+                    if self.user_image_trap_planted() {
+                        None
+                    } else {
+                        notification.path.as_deref().and_then(|path| {
+                            self.user_module_event(
+                                notification.kind,
+                                notification.base,
+                                notification.size,
+                                path,
+                                notification.process.map(ImageProcess::Eprocess32),
+                            )
+                        })
+                    }
+                    .map(|module| (notification.kind, module))
+                }
+                notification => {
+                    self.unreported_module_change = self.refresh_modules_on_stop();
+                    notification.and_then(|notification| {
+                        self.kernel_module_at(notification.base)
+                            .and_then(|module| {
+                                self.module_event_to_surface(notification.kind, module)
+                            })
+                            .map(|module| (notification.kind, module))
+                    })
+                }
+            };
+            if let Some((kind, module)) = surfaced {
                 let registers = self.backend.read_registers()?;
                 let rip = self
                     .register_map
@@ -476,6 +508,15 @@ impl Session {
                 }
                 self.continue_backend(ContinueDisposition::Handled)?;
                 return Ok(StopResolution::Resumed);
+            }
+            WatchpointStopAction::Declined if self.hold_declined_hits => {
+                let rip = event.program_counter.unwrap_or(0);
+                let resolution = StopResolution::Stopped {
+                    event: held_pause(event),
+                    rip,
+                };
+                self.record_visible_stop(&resolution);
+                return Ok(resolution);
             }
             WatchpointStopAction::Declined => {
                 self.continue_backend(ContinueDisposition::Handled)?;
@@ -531,13 +572,17 @@ impl Session {
             return Ok(resolution);
         }
 
-        if let Some(kind) = self
+        if let Some((kind, user)) = self
             .module_traps
             .iter()
             .find(|trap| trap.site.address.0 == rip)
-            .map(|trap| trap.event)
+            .map(|trap| (trap.event, trap.user))
         {
-            return self.classify_module_trap_hit(kind, event, rip, cr3);
+            return if user {
+                self.classify_user_image_trap_hit(event, rip, cr3)
+            } else {
+                self.classify_module_trap_hit(kind, event, rip, cr3)
+            };
         }
 
         let resolution = match self.resolve_breakpoint_stop(rip, cr3)? {
@@ -551,6 +596,10 @@ impl Session {
                 condition_error,
             },
             BreakpointStopAction::Resumed => StopResolution::Resumed,
+            BreakpointStopAction::Held => StopResolution::Stopped {
+                event: held_pause(event),
+                rip,
+            },
             BreakpointStopAction::NotBreakpoint
                 if self.is_stale_breakpoint_hit(&event, rip, cr3) =>
             {
@@ -629,12 +678,109 @@ impl Session {
         let module = self
             .argument_on_entry(1, |name| self.target.register_value(name))
             .filter(|_| !repeated)
-            .and_then(|base| self.module_event_to_surface(kind, VirtAddr(base)));
+            .and_then(|base| self.kernel_module_at(VirtAddr(base)))
+            .and_then(|module| self.module_event_to_surface(kind, module));
         if let Some(module) = module {
             let resolution = module_event_resolution(kind, module, event, rip);
             self.record_visible_stop(&resolution);
             return Ok(resolution);
         }
+        self.resume_past_module_trap(event, rip, cr3)
+    }
+
+    /// A stop on the user-image trap
+    /// ([`USER_IMAGE_TRAP`](crate::session::breakpoints::USER_IMAGE_TRAP)): a user-mode
+    /// image was mapped into a process. Its deferred breakpoints are armed
+    /// and the `sx ld` filters applied as for KD's report of one (see
+    /// [`Self::user_module_event`]); a kernel image, which the trap sees
+    /// too, is reported the way the backend reports kernel images.
+    fn classify_user_image_trap_hit(
+        &mut self,
+        event: StopEvent,
+        rip: u64,
+        cr3: u64,
+    ) -> Result<StopResolution> {
+        let stack = self.target.register_value(self.target.arch().sp_register());
+        let repeated = self
+            .module_trap_interrupted
+            .take_if(|(event, interrupted)| {
+                *event == ModuleEvent::Load && Some(*interrupted) == stack
+            })
+            .is_some();
+        let module = (!repeated)
+            .then(|| self.user_image_at_trap(cr3))
+            .flatten()
+            .and_then(|(base, size, path, process)| {
+                self.user_module_event(
+                    ModuleEvent::Load,
+                    base,
+                    size,
+                    &path,
+                    Some(ImageProcess::IdOrObject(process)),
+                )
+            });
+        if let Some(module) = module {
+            let resolution = module_event_resolution(ModuleEvent::Load, module, event, rip);
+            self.record_visible_stop(&resolution);
+            return Ok(resolution);
+        }
+        self.resume_past_module_trap(event, rip, cr3)
+    }
+
+    /// What the call the user-image trap stopped at reports: the image's
+    /// base, size and name, and the mapping process (its ID or its
+    /// `EPROCESS`: builds pass either), from its first three arguments. The
+    /// third points at the `IMAGE_INFO`, or at a wrapper that holds it 8
+    /// bytes in, as current builds pass it; the one whose base holds a PE
+    /// header of its size in the mapping address space (`dtb`) is it. `None`
+    /// for a kernel image (`IMAGE_INFO.SystemModeImage`) or when neither
+    /// layout holds an image.
+    fn user_image_at_trap(&self, dtb: u64) -> Option<(VirtAddr, u32, String, u64)> {
+        let argument =
+            |index| self.argument_on_entry(index, |name| self.target.register_value(name));
+        let (name, process, info) = (argument(0)?, argument(1)?, argument(2)?);
+        let kernel = self.target.kernel_address_space();
+        let user = self
+            .target
+            .address_space(dtb & self.target.arch().dtb_page_mask());
+        let image = [info, info + IMAGE_INFO_EX_IMAGE_INFO]
+            .into_iter()
+            .find_map(|at| {
+                let properties: u32 = kernel.read(VirtAddr(at)).ok()?;
+                let base: u64 = kernel.read(VirtAddr(at + IMAGE_INFO_IMAGE_BASE)).ok()?;
+                let size: u64 = kernel.read(VirtAddr(at + IMAGE_INFO_IMAGE_SIZE)).ok()?;
+                let headers = read_pe_header_page(VirtAddr(base), &user).ok()?;
+                let headers = decode_headers(&headers[..]).ok()?;
+                (u64::from(headers.optional.size_of_image) == size)
+                    .then_some((properties, base, size))
+            });
+        let (properties, base, size) = image?;
+        if properties & IMAGE_INFO_SYSTEM_MODE_IMAGE != 0 {
+            return None;
+        }
+        let length: u16 = kernel.read(VirtAddr(name)).ok()?;
+        let buffer: u64 = kernel.read(VirtAddr(name + 8)).ok()?;
+        let mut bytes = vec![0u8; usize::from(length)];
+        kernel.read_bytes(VirtAddr(buffer), &mut bytes).ok()?;
+        Some((
+            VirtAddr(base),
+            u32::try_from(size).unwrap_or(u32::MAX),
+            utf16le_lossy(&bytes),
+            process,
+        ))
+    }
+
+    /// Resume past a module trap no filter stopped at: a breakpoint of the
+    /// manager's at the same address takes the hit as usual; otherwise the
+    /// thread is stepped past the trap, the traps and breakpoints are synced
+    /// (a load may have resolved the last breakpoint waiting on one), and
+    /// the target resumed.
+    fn resume_past_module_trap(
+        &mut self,
+        event: StopEvent,
+        rip: u64,
+        cr3: u64,
+    ) -> Result<StopResolution> {
         if self.breakpoints.breakpoint_id_at_address(rip).is_some() {
             // A load may have resolved the last breakpoint waiting on one.
             self.arm_traps();
@@ -653,6 +799,14 @@ impl Session {
                     return Ok(resolution);
                 }
                 BreakpointStopAction::Resumed => return Ok(StopResolution::ModulesChanged),
+                BreakpointStopAction::Held => {
+                    let resolution = StopResolution::Stopped {
+                        event: held_pause(event),
+                        rip,
+                    };
+                    self.record_visible_stop(&resolution);
+                    return Ok(resolution);
+                }
                 BreakpointStopAction::NotBreakpoint => {}
             }
         }
@@ -666,18 +820,24 @@ impl Session {
         Ok(StopResolution::ModulesChanged)
     }
 
-    /// Apply the `sx* ld` or `sx* ud` filters to `kind` for the kernel image
-    /// at `base`, with the module list already refreshed: the module to stop
-    /// for (`sxe`), else `None`, with its [`module_event_line`] queued as a
-    /// notice for `sxn`. An image the kernel module list does not hold
-    /// matches no filter; an unloading image is still in the list.
-    fn module_event_to_surface(&mut self, kind: ModuleEvent, base: VirtAddr) -> Option<ModuleInfo> {
-        let module = self
-            .target
+    /// The kernel image at `base`, from the module list as last refreshed;
+    /// an unloading image is still in the list.
+    fn kernel_module_at(&self, base: VirtAddr) -> Option<ModuleInfo> {
+        self.target
             .kernel_modules()
             .ok()?
             .into_iter()
-            .find(|module| module.base_address == base)?;
+            .find(|module| module.base_address == base)
+    }
+
+    /// Apply the `sx* ld` or `sx* ud` filters to `kind` for `module`: the
+    /// module to stop for (`sxe`), else `None`, with its
+    /// [`module_event_line`] queued as a notice for `sxn`.
+    fn module_event_to_surface(
+        &mut self,
+        kind: ModuleEvent,
+        module: ModuleInfo,
+    ) -> Option<ModuleInfo> {
         match self
             .exception_policies
             .module_event_policy(kind, &module.name)?
@@ -692,6 +852,178 @@ impl Session {
                 None
             }
             ExceptionPolicyMode::SecondChance | ExceptionPolicyMode::Ignore => None,
+        }
+    }
+
+    /// A user-mode image mapped into or unmapped from `process`, as KD
+    /// reports with `!gflag +ksl` or the user-image trap sees: on a load,
+    /// the deferred breakpoints that wait on it in that process are armed
+    /// in it before it runs; then the `sx* ld`/`sx* ud` filters apply, as
+    /// for a kernel image. The report comes as the image is mapped, before
+    /// the loader lists hold it, so the module is what the report says.
+    fn user_module_event(
+        &mut self,
+        kind: ModuleEvent,
+        base: VirtAddr,
+        size: u32,
+        path: &str,
+        process: Option<ImageProcess>,
+    ) -> Option<ModuleInfo> {
+        let name = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
+        let mut module = ModuleInfo {
+            short_name: ModuleInfo::derive_short_name(&name),
+            name,
+            path: Some(path.to_string()),
+            base_address: base,
+            size,
+            is_32bit: false,
+            entry_point: None,
+            time_date_stamp: None,
+            checksum: None,
+            file_version: None,
+            product_version: None,
+            codeview: None,
+        };
+        if kind == ModuleEvent::Load
+            && let Some(process) = process
+                .and_then(|process| self.deferred_process_for_module(process, &module.short_name))
+        {
+            self.arm_deferred_in_user_module(&process, &mut module);
+        }
+        self.module_event_to_surface(kind, module)
+    }
+
+    /// The process `process` names, when a deferred breakpoint scoped to it
+    /// names the module `short_name`. An `ntdll32!` breakpoint waits on an
+    /// image named ntdll too: only its header tells the WOW64 copy from the
+    /// native one. Processes are only walked when some deferred breakpoint
+    /// names the module.
+    fn deferred_process_for_module(
+        &self,
+        process: ImageProcess,
+        short_name: &str,
+    ) -> Option<ProcessInfo> {
+        let waiting: Vec<u64> = self
+            .breakpoints
+            .list()
+            .iter()
+            .filter(|bp| !bp.resolved)
+            .filter_map(|bp| match (&bp.scope, &bp.spec) {
+                (
+                    BreakpointScope::Process { pid, .. },
+                    Some(BreakpointSpec::Symbol { name, .. }),
+                ) => {
+                    let module = name.split_once('!')?.0.trim();
+                    let names_it = module.eq_ignore_ascii_case(short_name)
+                        || (short_name == "ntdll" && module.eq_ignore_ascii_case("ntdll32"));
+                    names_it.then_some(*pid)
+                }
+                _ => None,
+            })
+            .collect();
+        if waiting.is_empty() {
+            return None;
+        }
+        self.target
+            .guest
+            .as_ref()?
+            .enumerate_processes()
+            .ok()?
+            .into_iter()
+            .find(|candidate| waiting.contains(&candidate.pid) && process.names(candidate))
+    }
+
+    /// Load the symbols of `module`, just mapped into `process`, and arm the
+    /// deferred breakpoints they resolve. The stopped processor's registers
+    /// are read first: whether the target can owe a site in a page not yet
+    /// faulted in depends on which address space it stopped in.
+    fn arm_deferred_in_user_module(&mut self, process: &ProcessInfo, module: &mut ModuleInfo) {
+        let registers = self.backend.read_registers();
+        update_target_context_from_registers(&mut self.target, &self.register_map, registers);
+        let memory = self.target.address_space(process.dtb);
+        module.is_32bit = read_pe_header_page(module.base_address, &memory)
+            .ok()
+            .and_then(|headers| decode_headers(&headers[..]).ok())
+            .is_some_and(|headers| !headers.is_pe32_plus());
+        if module.is_32bit && module.short_name == "ntdll" {
+            module.short_name.push_str("32");
+        }
+        let failure = match self
+            .target
+            .load_mapped_module_symbols(process.dtb, module.clone())
+        {
+            Ok(Some(report)) if report.loaded == 0 => Some(
+                match self
+                    .target
+                    .symbols
+                    .module_symbol_status(process.dtb, module.base_address)
+                {
+                    Some(ModuleSymbolStatus::Failed(reason)) => reason,
+                    Some(ModuleSymbolStatus::MissingDebugInfo) => {
+                        "neither its image in memory nor the symbol server names a PDB".into()
+                    }
+                    status => report.diagnostics.first().map_or_else(
+                        || {
+                            status
+                                .map_or("no PDB was found", |status| status.label())
+                                .to_string()
+                        },
+                        |diagnostic| format!("{}: {}", diagnostic.phase, diagnostic.message),
+                    ),
+                },
+            ),
+            Ok(_) => None,
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(failure) = failure {
+            self.notices.push(Notice::warning(format!(
+                "{} loaded in {} (PID {}), but its symbols did not ({failure}); the breakpoints \
+                 waiting on it stay deferred",
+                module.name, process.name, process.pid
+            )));
+            return;
+        }
+        self.reconcile_deferred_breakpoints();
+    }
+}
+
+/// A hit held as a break-in's pause: the stop is the pause the host asked
+/// for, not the exception the hit raised.
+fn held_pause(event: StopEvent) -> StopEvent {
+    StopEvent {
+        exception_code: None,
+        first_chance: None,
+        exception_address: None,
+        break_in: true,
+        ..event
+    }
+}
+
+/// `IMAGE_INFO.SystemModeImage`: the image is a kernel image.
+const IMAGE_INFO_SYSTEM_MODE_IMAGE: u32 = 1 << 8;
+/// `IMAGE_INFO.ImageBase` and `ImageSize`, on a 64-bit kernel.
+const IMAGE_INFO_IMAGE_BASE: u64 = 8;
+const IMAGE_INFO_IMAGE_SIZE: u64 = 24;
+/// Where the wrapper current builds pass the notify call holds its
+/// `IMAGE_INFO` (`IMAGE_INFO_EX.ImageInfo`, after its `Size`).
+const IMAGE_INFO_EX_IMAGE_INFO: u64 = 8;
+
+/// The process a user-mode image report names.
+#[derive(Debug, Clone, Copy)]
+enum ImageProcess {
+    /// KD's `DBGKD_LOAD_SYMBOLS64.ProcessId`: the low 32 bits of the
+    /// mapping process's `EPROCESS`.
+    Eprocess32(u64),
+    /// Its process ID or its `EPROCESS`, as the user-image trap's call
+    /// passes it.
+    IdOrObject(u64),
+}
+
+impl ImageProcess {
+    fn names(self, process: &ProcessInfo) -> bool {
+        match self {
+            Self::Eprocess32(bits) => process.eprocess.0 & 0xffff_ffff == bits,
+            Self::IdOrObject(value) => process.pid == value || process.eprocess.0 == value,
         }
     }
 }

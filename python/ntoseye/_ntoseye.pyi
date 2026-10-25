@@ -2987,6 +2987,71 @@ class Cpus:
         """
 
 @final
+class CriticalSection(BaseRecord):
+    """
+    An `RTL_CRITICAL_SECTION` (`!cs <address>`).
+    """
+    __match_args__: Final[tuple[Literal["address"], Literal["symbol"], Literal["debug_info"], Literal["lock_count"], Literal["recursion_count"], Literal["owning_thread"], Literal["lock_semaphore"], Literal["spin_count"], Literal["contention_count"]]]
+    @property
+    def address(self, /) -> int: ...
+    @property
+    def contention_count(self, /) -> Diagnostic[int]:
+        """
+        How many times threads waited for it (the debug record's
+        `ContentionCount`).
+        """
+    @property
+    def debug_info(self, /) -> Diagnostic[int]: ...
+    @property
+    def lock_count(self, /) -> Diagnostic[int]:
+        """
+        `LockCount`: from Windows Server 2003 SP1, bit 0 is clear while the
+        section is held, bit 1 clear when a waiter was woken, and the bits
+        above count the waiters, inverted.
+        """
+    @property
+    def lock_semaphore(self, /) -> Diagnostic[int]: ...
+    @property
+    def locked(self, /) -> bool |None:
+        """
+        Whether a thread holds it.
+        """
+    @property
+    def owning_thread(self, /) -> Diagnostic[int]:
+        """
+        The thread that holds it, by its TID (`OwningThread`).
+        """
+    @property
+    def recursion_count(self, /) -> Diagnostic[int]: ...
+    @property
+    def spin_count(self, /) -> Diagnostic[int]: ...
+    @property
+    def symbol(self, /) -> str |None:
+        """
+        The symbol at its address (`ntdll!LdrpLoaderLock`), when it is a
+        global.
+        """
+    @property
+    def waiters(self, /) -> int |None:
+        """
+        How many threads wait for it.
+        """
+
+@final
+class CriticalSections(BaseRecord):
+    """
+    A process's critical sections, from `ntdll!RtlCriticalSectionList`
+    (`!cs`).
+    """
+    __match_args__: Final[tuple[Literal["list_head"], Literal["sections"], Literal["termination"]]]
+    @property
+    def list_head(self, /) -> int: ...
+    @property
+    def sections(self, /) -> list[CriticalSection]: ...
+    @property
+    def termination(self, /) -> ListTermination: ...
+
+@final
 class CulpritAttribution(BaseRecord):
     """
     What the available evidence identifies as the cause of the crash: a
@@ -3449,11 +3514,7 @@ class Debugger:
         """
     def write_dump(self, /, path: str) -> DumpWrite:
         """
-        Write a full PAGEDU64 kernel dump from the halted target.
-        
-        .dump accepts both /f and /ma as WinDbg-compatible full-dump switches.
-        ntoseye writes the dump as a stream, page by page, and you can cancel it
-        with Ctrl+C.
+        Write a full PAGEDU64 kernel dump of the live target (`.dump`).
         """
 
 @final
@@ -10989,6 +11050,46 @@ class MemorySearchMatch(BaseRecord):
         """
 
 @final
+class MinidumpWrite(BaseRecord):
+    """
+    A user-mode minidump that `.dump /u` wrote.
+    """
+    __match_args__: Final[tuple[Literal["path"], Literal["process"], Literal["pid"], Literal["threads"], Literal["threads_without_context"], Literal["modules"], Literal["regions"], Literal["captured_bytes"], Literal["demand_zero_bytes"], Literal["unreadable_pages"]]]
+    @property
+    def captured_bytes(self, /) -> int:
+        """
+        The bytes of memory the minidump holds.
+        """
+    @property
+    def demand_zero_bytes(self, /) -> int:
+        """
+        Of those, the bytes of committed pages never touched, which are
+        zeros.
+        """
+    @property
+    def modules(self, /) -> int: ...
+    @property
+    def path(self, /) -> str: ...
+    @property
+    def pid(self, /) -> int: ...
+    @property
+    def process(self, /) -> str: ...
+    @property
+    def regions(self, /) -> int: ...
+    @property
+    def threads(self, /) -> int: ...
+    @property
+    def threads_without_context(self, /) -> int:
+        """
+        The threads whose user-mode registers their stacks did not give.
+        """
+    @property
+    def unreadable_pages(self, /) -> int:
+        """
+        The pages that translated but could not be read, written as zeros.
+        """
+
+@final
 class Module:
     """
     One loaded image in the kernel address space or in a process address space.
@@ -14767,6 +14868,14 @@ class Process:
         """
         Decode the kernel and user APC queues of this process (`!apc`).
         """
+    def critical_section(self, /, address: int |str |Process |Thread |Module |Driver |Device |Heap) -> CriticalSection:
+        """
+        Decode a critical section (`!cs address`).
+        """
+    def critical_sections(self, /) -> CriticalSections:
+        """
+        List the critical sections of the process (`!cs`).
+        """
     def decode_peb(self, /, address: int |str |Process |Thread |Module |Driver |Device |Heap |None = None) -> Peb:
         """
         Decode the process environment block and process parameters of the
@@ -14923,6 +15032,18 @@ class Process:
         """
         The symbols, resolved in the address space of this process.
         """
+    def thread_times(self, /) -> ThreadTimes:
+        """
+        Show how much processor time each thread of the current process has used.
+        
+        The flags choose what to show, each as a list of the threads by that time,
+        most first: 1 the user-mode time (the default), 2 the kernel-mode time,
+        4 the time since each thread started, so 7 shows all three. The current
+        process is the one that .process selected, else the owner of the current
+        thread; on a user-mode minidump, its one process, whose thread-info
+        stream records the times. A kernel target counts them in clock ticks, so
+        they are as precise as one tick (15.6 ms by default).
+        """
     @property
     def threads(self, /) -> Threads:
         """
@@ -14955,6 +15076,12 @@ class Process:
         """
         The 32-bit PEB of a WOW64 process (`_EPROCESS.WoW64Process`), `None`
         for a native process.
+        """
+    def write_minidump(self, /, path: str) -> MinidumpWrite:
+        """
+        Write a user-mode minidump of the process (`.dump /u`): its threads with
+        their user-mode registers, its modules, its regions, and its memory that
+        is in physical memory.
         """
 
 @final
@@ -19088,6 +19215,48 @@ class ThreadStacks(BaseRecord):
     def threads(self, /) -> list[ThreadStack]: ...
 
 @final
+class ThreadTime(BaseRecord):
+    """
+    The times of one thread, in 100 ns units.
+    """
+    __match_args__: Final[tuple[Literal["tid"], Literal["index"], Literal["user_time"], Literal["kernel_time"], Literal["elapsed"]]]
+    @property
+    def elapsed(self, /) -> int |None:
+        """
+        How long ago it started, at the time of the target: now on a live
+        one, when the dump was written on a dump. Until it exited, for one
+        that has.
+        """
+    @property
+    def index(self, /) -> int |None:
+        """
+        Its place in a user-mode minidump's thread list (`~` numbers), `None`
+        on a kernel target.
+        """
+    @property
+    def kernel_time(self, /) -> int |None: ...
+    @property
+    def tid(self, /) -> int: ...
+    @property
+    def user_time(self, /) -> int |None: ...
+
+@final
+class ThreadTimes(BaseRecord):
+    """
+    The processor times of a process's threads (`!runaway`).
+    """
+    __match_args__: Final[tuple[Literal["process"], Literal["pid"], Literal["threads"]]]
+    @property
+    def pid(self, /) -> int |None: ...
+    @property
+    def process(self, /) -> str |None:
+        """
+        The process's image name.
+        """
+    @property
+    def threads(self, /) -> list[ThreadTime]: ...
+
+@final
 class Threads:
     """
     A collection of threads: `dbg.threads` (all threads) or `proc.threads`,
@@ -20178,6 +20347,14 @@ class UserProcess:
     def __eq__(self, other: object, /) -> bool: ...
     def __hash__(self, /) -> int: ...
     def __repr__(self, /) -> str: ...
+    def critical_section(self, /, address: int |str |Process |Thread |Module |Driver |Device |Heap) -> CriticalSection:
+        """
+        Decode a critical section (`!cs address`).
+        """
+    def critical_sections(self, /) -> CriticalSections:
+        """
+        List the critical sections of the process (`!cs`).
+        """
     def decode_peb(self, /, address: int |str |Process |Thread |Module |Driver |Device |Heap |None = None) -> Peb:
         """
         Decode the process environment block and process parameters of the
@@ -20231,6 +20408,18 @@ class UserProcess:
     def pid(self, /) -> int |None:
         """
         The process id, when the dump records it.
+        """
+    def thread_times(self, /) -> ThreadTimes:
+        """
+        Show how much processor time each thread of the current process has used.
+        
+        The flags choose what to show, each as a list of the threads by that time,
+        most first: 1 the user-mode time (the default), 2 the kernel-mode time,
+        4 the time since each thread started, so 7 shows all three. The current
+        process is the one that .process selected, else the owner of the current
+        thread; on a user-mode minidump, its one process, whose thread-info
+        stream records the times. A kernel target counts them in clock ticks, so
+        they are as precise as one tick (15.6 ms by default).
         """
     @property
     def threads(self, /) -> UserThreads:

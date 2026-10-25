@@ -9,7 +9,8 @@ use ntoseye_macros::record;
 use crate::arch::{Arch, HwBreakpointAccess, RegisterMap};
 use crate::backend::dbg_backend::{
     BackendCapability, BugcheckInfo, ContinueDisposition, DebugBackend, DebugCapability, DebugLog,
-    DebugOutputPage, PciConfigAddress, ProcessorRead, StopEvent, TebPath, TrapState,
+    DebugOutputPage, ExceptionRecord, PciConfigAddress, ProcessorRead, StopEvent, TebPath,
+    TrapState,
 };
 use crate::backend::debugger_data::DebuggerDataCandidate;
 use crate::backend::kd::framing::KdFraming;
@@ -81,6 +82,21 @@ pub use file_io::*;
 mod event_loop;
 pub use event_loop::*;
 
+/// `DBGKD_LOAD_SYMBOLS64`, and the image path KD sends after the state
+/// change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadSymbols {
+    base: VirtAddr,
+    size: u32,
+    /// `ProcessId`, which for a user-mode image carries the low 32 bits of
+    /// the `EPROCESS` mapping it: Windows passes the process object and KD
+    /// keeps 32 bits of it.
+    process: u64,
+    /// `UnloadSymbols`: the image is unloading.
+    unload: bool,
+    path: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct StateChange {
     processor: u16,
@@ -90,11 +106,15 @@ pub struct StateChange {
     exception_first_chance: Option<bool>,
     exception_address: Option<u64>,
     program_counter: u64,
+    /// The base of the kernel image a load-symbols state change reports
+    /// (the kernel's own, for the first after a boot).
     kernel_base_hint: Option<VirtAddr>,
-    /// `DBGKD_LOAD_SYMBOLS64.UnloadSymbols` of a load-symbols state change:
-    /// the image at `kernel_base_hint` is unloading. False for every other
+    /// What a load-symbols state change reports; `None` for every other
     /// kind.
-    unload_symbols: bool,
+    load_symbols: Option<LoadSymbols>,
+    /// The `EXCEPTION_RECORD64` an exception state change reports; `None`
+    /// for every other kind.
+    exception_record: Option<ExceptionRecord>,
     is_bugcheck: bool,
     bugcheck: Option<BugcheckInfo>,
     target_reloaded: bool,
@@ -135,6 +155,20 @@ const DBG_KD_COMMAND_STRING_STATE_CHANGE: u32 = 0x0000_3032;
 
 const STATUS_BREAKPOINT: u32 = 0x8000_0003;
 const STATUS_SINGLE_STEP: u32 = 0x8000_0004;
+/// The single step and breakpoint of a WOW64 thread's x86 code, which
+/// Windows reports for a trap taken in compatibility mode.
+const STATUS_WX86_SINGLE_STEP: u32 = 0x4000_001E;
+const STATUS_WX86_BREAKPOINT: u32 = 0x4000_001F;
+
+/// `code` as the trap it is to the debugger: a WOW64 thread's x86 single
+/// step and breakpoint are the native ones, whatever code Windows gave them.
+fn native_trap_code(code: u32) -> u32 {
+    match code {
+        STATUS_WX86_SINGLE_STEP => STATUS_SINGLE_STEP,
+        STATUS_WX86_BREAKPOINT => STATUS_BREAKPOINT,
+        code => code,
+    }
+}
 const KD_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bytes of configuration space per `DbgKdGetBusDataApi` request, well inside
 /// a KD packet.
@@ -304,7 +338,14 @@ pub struct KdBackend {
     serial_reconnected: bool,
     bp_handles: HashMap<u64, u32>,
     managed_bp_addresses: HashSet<u64>,
+    /// Where break-ins land: the connect's stop, when it was one, and the
+    /// kernel's break-in site once the host names it
+    /// ([`DebugBackend::note_breakin_site`]). A connect to a target already
+    /// halted at a break of its own collects that break instead, and the
+    /// kernel keeps the break-in for its next clock tick.
     breakin_addresses: HashSet<u64>,
+    /// The exception record of the last stop, when it was an exception.
+    last_exception_record: Option<ExceptionRecord>,
     /// Our breakpoints removed since the target last resumed; see
     /// [`ContinueDrain`].
     retired_bp_addresses: HashSet<u64>,
@@ -457,6 +498,14 @@ impl DebugBackend for KdBackend {
 
     fn surface_next_break_at(&mut self, address: Option<u64>) {
         self.surface_break_at = address;
+    }
+
+    fn note_breakin_site(&mut self, address: u64) {
+        self.breakin_addresses.insert(address);
+    }
+
+    fn last_exception_record(&self) -> Option<ExceptionRecord> {
+        self.last_exception_record.clone()
     }
 
     fn write_registers(&mut self, data: &[u8]) -> Result<()> {
