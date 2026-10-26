@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::arch::Family;
+use crate::arch::{Arch, Family};
 use crate::base::bytes::before_nul;
 use crate::base::error::{Error, Result};
 use crate::base::memory::MemoryOps;
@@ -180,10 +180,11 @@ pub struct IdtGate {
     pub present: DiagnosticValue<bool>,
     /// Whether the handler is in a module other than NT.
     pub non_nt_hook: DiagnosticValue<bool>,
-    /// For a handler in `KiIsrThunk` (a chained interrupt), the offset of
-    /// the handler in `KiIsrThunk` and the location of
-    /// `_KINTERRUPT.DispatchCode`. The diagnostic value is None for other
-    /// handlers.
+    /// The `_KINTERRUPT` connected to the vector and its service routine:
+    /// through the processor's `_KPRCB.InterruptObject` table for a
+    /// handler in `KiIsrThunk` (or `KiIsrThunkShadow`), or, before those
+    /// (Windows 8.1), the object whose `DispatchCode` the gate points into.
+    /// None for other handlers and for a vector nothing is connected to.
     pub ki_isr_thunk: DiagnosticValue<Option<String>>,
 }
 
@@ -312,21 +313,107 @@ const MSRS: &[(u32, &str)] = &[
     (0xc000_0102, "IA32_KERNEL_GS_BASE"),
 ];
 
-/// Return the conventional name for a known MSR number.
-pub fn msr_name(msr: u32) -> Option<&'static str> {
-    MSRS.iter()
+/// Common AArch64 system registers, by the number Windows KD reads them
+/// with (`rdmsr` on an ARM64 target): op0 << 16 | op1 << 12 | CRn << 8 |
+/// CRm << 4 | op2.
+const ARM64_SYSTEM_REGISTERS: &[(u32, &str)] = &[
+    (0x3_0000, "MIDR_EL1"),
+    (0x3_0005, "MPIDR_EL1"),
+    (0x3_0006, "REVIDR_EL1"),
+    (0x3_0040, "ID_AA64PFR0_EL1"),
+    (0x3_0050, "ID_AA64DFR0_EL1"),
+    (0x3_0060, "ID_AA64ISAR0_EL1"),
+    (0x3_0061, "ID_AA64ISAR1_EL1"),
+    (0x3_0070, "ID_AA64MMFR0_EL1"),
+    (0x3_0071, "ID_AA64MMFR1_EL1"),
+    (0x3_0100, "SCTLR_EL1"),
+    (0x3_0102, "CPACR_EL1"),
+    (0x3_0200, "TTBR0_EL1"),
+    (0x3_0201, "TTBR1_EL1"),
+    (0x3_0202, "TCR_EL1"),
+    (0x3_0520, "ESR_EL1"),
+    (0x3_0600, "FAR_EL1"),
+    (0x3_0740, "PAR_EL1"),
+    (0x3_0a20, "MAIR_EL1"),
+    (0x3_0c00, "VBAR_EL1"),
+    (0x3_0d01, "CONTEXTIDR_EL1"),
+    (0x3_0d04, "TPIDR_EL1"),
+    (0x3_0e10, "CNTKCTL_EL1"),
+    (0x3_3001, "CTR_EL0"),
+    (0x3_3007, "DCZID_EL0"),
+    (0x3_3d02, "TPIDR_EL0"),
+    (0x3_3d03, "TPIDRRO_EL0"),
+    (0x3_3e00, "CNTFRQ_EL0"),
+    (0x3_3e01, "CNTPCT_EL0"),
+    (0x3_3e02, "CNTVCT_EL0"),
+    (0x3_3e31, "CNTV_CTL_EL0"),
+    (0x3_3e32, "CNTV_CVAL_EL0"),
+];
+
+fn named_registers(arch: Arch) -> &'static [(u32, &'static str)] {
+    match arch {
+        Arch::Amd64 => MSRS,
+        Arch::Arm64 => ARM64_SYSTEM_REGISTERS,
+    }
+}
+
+/// What `rdmsr` reads on `arch`: an `MSR`, or an ARM64 `system register`.
+pub fn msr_kind(arch: Arch) -> &'static str {
+    match arch {
+        Arch::Amd64 => "MSR",
+        Arch::Arm64 => "system register",
+    }
+}
+
+/// The conventional name of register `msr` on `arch`.
+pub fn msr_name(arch: Arch, msr: u32) -> Option<&'static str> {
+    named_registers(arch)
+        .iter()
         .find_map(|(value, name)| (*value == msr).then_some(*name))
 }
 
-/// Parse a conventional `IA32_*`/`MSR_IA32_*` (or short `TSC`) name.
-/// Numeric expressions are intentionally handled by the REPL, not here.
-pub fn parse_msr_name(name: &str) -> Option<u32> {
+/// A register's number from its name on `arch`: a conventional
+/// `IA32_*`/`MSR_IA32_*` (or short `TSC`) MSR name on AMD64; on ARM64 a
+/// system register's (`MIDR_EL1`), or its generic spelling
+/// `S<op0>_<op1>_C<n>_C<m>_<op2>` (`S3_0_C0_C0_0`). Numeric expressions are
+/// left to the REPL.
+pub fn parse_msr_name(arch: Arch, name: &str) -> Option<u32> {
     let normalized = name.trim().to_ascii_uppercase().replace('-', "_");
-    let normalized = normalized.strip_prefix("MSR_").unwrap_or(&normalized);
-    let normalized = normalized.strip_prefix("IA32_").unwrap_or(normalized);
-    MSRS.iter()
-        .find(|(_, candidate)| normalized == candidate.strip_prefix("IA32_").unwrap_or(candidate))
-        .map(|(value, _)| *value)
+    match arch {
+        Arch::Amd64 => {
+            let normalized = normalized.strip_prefix("MSR_").unwrap_or(&normalized);
+            let normalized = normalized.strip_prefix("IA32_").unwrap_or(normalized);
+            MSRS.iter()
+                .find(|(_, candidate)| {
+                    normalized == candidate.strip_prefix("IA32_").unwrap_or(candidate)
+                })
+                .map(|(value, _)| *value)
+        }
+        Arch::Arm64 => ARM64_SYSTEM_REGISTERS
+            .iter()
+            .find(|(_, candidate)| normalized == *candidate)
+            .map(|(value, _)| *value)
+            .or_else(|| generic_system_register(&normalized)),
+    }
+}
+
+/// `S<op0>_<op1>_C<n>_C<m>_<op2>`, upper case, as the number KD reads the
+/// register by.
+fn generic_system_register(name: &str) -> Option<u32> {
+    let mut parts = name.strip_prefix('S')?.split('_');
+    let mut field = |prefix: &str, max: u32| {
+        let value: u32 = parts.next()?.strip_prefix(prefix)?.parse().ok()?;
+        (value <= max).then_some(value)
+    };
+    let op0 = field("", 3)?;
+    let op1 = field("", 7)?;
+    let crn = field("C", 15)?;
+    let crm = field("C", 15)?;
+    let op2 = field("", 7)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(op0 << 16 | op1 << 12 | crn << 8 | crm << 4 | op2)
 }
 
 fn kernel(target: &Target) -> Result<&Image> {
@@ -881,6 +968,23 @@ impl Target {
                 )
             }
         };
+        // An ARM64 processor names itself in MIDR_EL1, which its PRCB does
+        // not copy: the x86 fields are not missing there, but not kept.
+        let (vendor, family, model, stepping) = if self.arch() == Arch::Arm64 {
+            let reason = "an ARM64 PRCB keeps none; MIDR_EL1 identifies the processor \
+                          (rdmsr MIDR_EL1 on a live target)";
+            let kept = |value: DiagnosticValue<u64>| match value {
+                DiagnosticValue::Unavailable(_) => DiagnosticValue::unavailable(reason.to_string()),
+                value => value,
+            };
+            let vendor = match vendor {
+                DiagnosticValue::Unavailable(_) => DiagnosticValue::unavailable(reason.to_string()),
+                vendor => vendor,
+            };
+            (vendor, kept(family), kept(model), kept(stepping))
+        } else {
+            (vendor, family, model, stepping)
+        };
         let mhz = DiagnosticValue::from_result(field_u64(
             self,
             &prcb_layout,
@@ -944,28 +1048,82 @@ fn is_nt_module(name: &str) -> bool {
     name.contains("ntoskrnl") || name.contains("ntkrnl") || name == "nt"
 }
 
-fn interrupt_chain_hint(target: &Target, handler: u64) -> Option<String> {
-    let thunk = target
-        .symbols
-        .find_symbol_with_module(target.kernel_dtb(), "nt!KiIsrThunk")
-        .ok()
-        .flatten()
-        .map(|(address, _)| address.0)?;
-    if handler < thunk || handler - thunk >= 0x1000 {
-        return None;
-    }
-    let dispatch = layout(target, "_KINTERRUPT").ok().and_then(|layout| {
-        layout.fields.get("DispatchCode").map(|field| {
-            format!(
-                "KiIsrThunk (+{:#x}); _KINTERRUPT.DispatchCode offset {:#x}",
-                handler - thunk,
-                field.offset
-            )
-        })
+/// The `_KINTERRUPT` connected to `vector` and its service routine: for a
+/// `handler` in `KiIsrThunk(Shadow)`, through `objects` (the processor's
+/// `_KPRCB.InterruptObject` table); otherwise the object `handler` points
+/// into. None for another handler, and for a vector nothing is connected to.
+fn connected_interrupt(
+    target: &Target,
+    objects: Option<VirtAddr>,
+    handler: u64,
+    vector: u16,
+) -> Option<String> {
+    // `KiIsrThunkShadow` where the kernel shadows its address space
+    // (KVA shadow), from the 2018 updates on.
+    let in_thunks = ["nt!KiIsrThunk", "nt!KiIsrThunkShadow"].iter().any(|name| {
+        target
+            .symbols
+            .find_symbol_with_module(target.kernel_dtb(), name)
+            .ok()
+            .flatten()
+            .is_some_and(|(thunk, _)| handler >= thunk.0 && handler - thunk.0 < 0x1000)
     });
-    Some(dispatch.unwrap_or_else(|| {
-        "KiIsrThunk (chained interrupt; _KINTERRUPT.DispatchCode unavailable)".into()
-    }))
+    let memory = kernel(target).ok()?.memory();
+    let interrupt = if in_thunks {
+        let Some(objects) = objects else {
+            return Some("KiIsrThunk: the processor's interrupt object table is not known".into());
+        };
+        memory
+            .read_pointer(objects + u64::from(vector) * 8)
+            .ok()
+            .filter(|interrupt| !interrupt.is_zero())?
+    } else {
+        // Before the thunks (Windows 8.1), the gate points into the
+        // interrupt object's own `DispatchCode`.
+        embedding_interrupt(target, handler)?
+    };
+    // A message-signalled interrupt's ServiceRoutine is the kernel's
+    // KiInterruptMessageDispatch; the driver's is MessageServiceRoutine.
+    let interrupt_layout = layout(target, "_KINTERRUPT").ok();
+    let routine_in = |field: &str| {
+        let offset = interrupt_layout.as_ref()?.field_offset(field).ok()?;
+        memory
+            .read_pointer(interrupt + offset)
+            .ok()
+            .filter(|routine| !routine.is_zero())
+    };
+    let routine = routine_in("MessageServiceRoutine")
+        .or_else(|| routine_in("ServiceRoutine"))
+        .map(|routine| {
+            target
+                .symbols
+                .format_closest_symbol_for_address(target.kernel_dtb(), routine)
+                .unwrap_or_else(|| format!("{:#x}", routine.0))
+        })
+        .unwrap_or_else(|| "-".into());
+    Some(format!("KINTERRUPT {:#x}  {routine}", interrupt.0))
+}
+
+/// The `_KINTERRUPT` whose `DispatchCode` holds `handler`: one whose
+/// header says it is an interrupt object of the type's size.
+fn embedding_interrupt(target: &Target, handler: u64) -> Option<VirtAddr> {
+    /// `KOBJECTS.InterruptObject`.
+    const INTERRUPT_OBJECT: i16 = 0x16;
+    let layout = layout(target, "_KINTERRUPT").ok()?;
+    let interrupt = VirtAddr(handler.checked_sub(layout.field_offset("DispatchCode").ok()?)?);
+    let memory = kernel(target).ok()?.memory();
+    let header: [i16; 2] = memory.read(interrupt).ok()?;
+    (header == [INTERRUPT_OBJECT, layout.size as i16]).then_some(interrupt)
+}
+
+/// Where `processor`'s `_KPRCB.InterruptObject` table is.
+fn interrupt_objects(target: &Target, processor: u16) -> Option<VirtAddr> {
+    let prcb = cpu_state::kprcb_for_processor(target, processor).ok()?;
+    let offset = layout(target, "_KPRCB")
+        .ok()?
+        .field_offset("InterruptObject")
+        .ok()?;
+    Some(prcb + offset)
 }
 
 fn unavailable_idt_entry(vector: u16, address: VirtAddr, error: String) -> IdtGate {
@@ -985,7 +1143,7 @@ fn unavailable_idt_entry(vector: u16, address: VirtAddr, error: String) -> IdtGa
     }
 }
 
-fn decode_idt_entry(target: &Target, base: u64, vector: u16) -> IdtGate {
+fn decode_idt_entry(target: &Target, base: u64, vector: u16, objects: Option<VirtAddr>) -> IdtGate {
     let address = VirtAddr(base.wrapping_add(u64::from(vector) * 16));
     let mut bytes = [0u8; 16];
     let read = kernel(target).and_then(|nt| nt.memory().read_bytes(address, &mut bytes));
@@ -1021,6 +1179,7 @@ fn decode_idt_entry(target: &Target, base: u64, vector: u16) -> IdtGate {
             .as_ref()
             .is_some_and(|module| !is_nt_module(&module.name))
             || symbol_module_is_hook;
+        let connected = connected_interrupt(target, objects, offset, vector);
         return IdtGate {
             vector,
             address,
@@ -1032,8 +1191,10 @@ fn decode_idt_entry(target: &Target, base: u64, vector: u16) -> IdtGate {
             gate_name: DiagnosticValue::Available(gate_name.to_string()),
             dpl: DiagnosticValue::Available(dpl),
             present: DiagnosticValue::Available(present),
-            non_nt_hook: DiagnosticValue::Available(hook),
-            ki_isr_thunk: DiagnosticValue::Available(interrupt_chain_hint(target, offset)),
+            // A gate into an interrupt object is the kernel's dispatch, not
+            // a hook, wherever the object lies.
+            non_nt_hook: DiagnosticValue::Available(hook && connected.is_none()),
+            ki_isr_thunk: DiagnosticValue::Available(connected),
         };
     };
     unavailable_idt_entry(vector, address, error.to_string())
@@ -1049,9 +1210,10 @@ pub fn decode_idt(
     let vectors: Vec<u16> = vector
         .map(|vector| vec![vector])
         .unwrap_or_else(|| (0..IDT_VECTOR_COUNT).collect());
+    let objects = interrupt_objects(target, processor);
     let entries = vectors
         .into_iter()
-        .map(|vector| decode_idt_entry(target, descriptor.base.0, vector))
+        .map(|vector| decode_idt_entry(target, descriptor.base.0, vector, objects))
         .collect();
     let descriptor_entries = descriptor.limit.saturating_add(1) / 16;
     let truncated = match vector {
@@ -1207,6 +1369,8 @@ pub fn decode_gdt(target: &Target, processor: u16, descriptor: DescriptorRegiste
 #[cfg(test)]
 mod tests {
     use super::{msr_name, parse_msr_name};
+    use crate::arch::Arch;
+    use crate::backend::kd::registers::{ARM64_WINDBG_ESR_EL1, ARM64_WINDBG_TTBR1_EL1};
 
     #[test]
     fn msr_name_aliases_round_trip() {
@@ -1216,9 +1380,28 @@ mod tests {
             ("MSR_IA32_LSTAR", 0xc000_0082, "IA32_LSTAR"),
             ("msr-ia32-gs-base", 0xc000_0101, "IA32_GS_BASE"),
         ] {
-            assert_eq!(parse_msr_name(name), Some(value));
-            assert_eq!(msr_name(value), Some(canonical));
+            assert_eq!(parse_msr_name(Arch::Amd64, name), Some(value));
+            assert_eq!(msr_name(Arch::Amd64, value), Some(canonical));
         }
-        assert_eq!(parse_msr_name("0x10"), None);
+        assert_eq!(parse_msr_name(Arch::Amd64, "0x10"), None);
+    }
+
+    /// An ARM64 target's registers are its system registers, by name or
+    /// generic spelling, in the encoding KD reads them by; x86 names mean
+    /// nothing there.
+    #[test]
+    fn arm64_names_are_system_registers() {
+        assert_eq!(
+            parse_msr_name(Arch::Arm64, "ttbr1_el1"),
+            Some(ARM64_WINDBG_TTBR1_EL1)
+        );
+        assert_eq!(
+            parse_msr_name(Arch::Arm64, "S3_0_C5_C2_0"),
+            Some(ARM64_WINDBG_ESR_EL1)
+        );
+        assert_eq!(msr_name(Arch::Arm64, ARM64_WINDBG_ESR_EL1), Some("ESR_EL1"));
+        assert_eq!(parse_msr_name(Arch::Arm64, "TSC"), None);
+        assert_eq!(parse_msr_name(Arch::Arm64, "S3_0_C16_C0_0"), None);
+        assert_eq!(msr_name(Arch::Arm64, 0x10), None);
     }
 }

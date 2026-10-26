@@ -217,6 +217,7 @@ impl Target {
         triage_modules_cache: Option<Vec<ModuleInfo>>,
         notices: Vec<crate::base::notice::Notice>,
     ) -> Self {
+        let interrupt = phys.interrupt_flag();
         Self {
             phys,
             symbols,
@@ -237,7 +238,7 @@ impl Target {
             results_origin: None,
             last_exception_code: None,
             breakpoint_stop: None,
-            interrupt: Arc::new(AtomicBool::new(false)),
+            interrupt,
             interrupt_requests: Arc::new(AtomicU64::new(0)),
             notices,
             generation: Arc::new(AtomicU64::new(0)),
@@ -272,8 +273,15 @@ impl Target {
     /// in the REPL), and work this target does, a run from the view among
     /// it, must see it.
     pub fn share_interrupt(&mut self, other: &Target) {
-        self.interrupt = Arc::clone(&other.interrupt);
+        self.set_interrupt(Arc::clone(&other.interrupt));
         self.interrupt_requests = Arc::clone(&other.interrupt_requests);
+    }
+
+    /// Make `flag` the interrupt flag, this target's and its memory's, so
+    /// Ctrl+C on it stops the work either does.
+    pub fn set_interrupt(&mut self, flag: Arc<AtomicBool>) {
+        self.phys.set_interrupt_flag(Arc::clone(&flag));
+        self.interrupt = flag;
     }
 
     /// Count a rebuild without one, so a host takes the handles it minted

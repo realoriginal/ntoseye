@@ -3,19 +3,30 @@ use crate::{
     backend::phys::PhysMem,
     base::{
         error::{Error, Result},
-        memory::{DTB_IDENTITY, MemoryOps, SectionLayout, SectionViews},
+        memory::{
+            CompressedPages, DTB_IDENTITY, MemoryOps, PAGE_FILE_LOW, SectionLayout, SectionViews,
+            StoreLayout,
+        },
         types::*,
     },
     nt::{
-        dmp::DmpInfo, layout::ParsedType, pe::headers::CodeView, symbols::SymbolStore,
-        target::ListTermination, target::object::DriverObjectInfo,
+        dmp::DmpInfo,
+        layout::ParsedType,
+        pe::{self, PeImage, headers::CodeView},
+        symbols::{ImageFetch, SymbolStore},
+        target::ListTermination,
+        target::object::DriverObjectInfo,
     },
 };
 use ntoseye_macros::record;
+use pelite::pe64::{Pe, PeView};
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, atomic::AtomicBool};
-use vad::{MissingOffset, VadTreeOffsets};
+use std::sync::{
+    Arc, Mutex, MutexGuard, OnceLock, PoisonError,
+    atomic::{AtomicBool, Ordering},
+};
+use vad::{MissingOffset, VadTreeOffsets, vad_root_offset};
 
 mod discovery;
 pub mod ept;
@@ -31,6 +42,7 @@ mod modules;
 pub mod pdb_recovery;
 mod process;
 pub mod secure_kernel;
+pub mod store_layout;
 mod symbol_load;
 mod trustlet_layout;
 pub mod vad;
@@ -198,6 +210,9 @@ pub struct ModuleSymbolDiagnostic {
 pub enum SessionSpace {
     Load,
     Skip,
+    /// Read their images through this root, a session process's; the
+    /// symbols stay under the load's own root.
+    Through(Dtb),
 }
 
 /// When a symbol load rebuilds a missing PDB from guest memory (see
@@ -336,11 +351,31 @@ impl Guest {
             .set_invalid_pte_mask(invalid_pte_mask(&ntoskrnl).unwrap_or(0));
         ntoskrnl
             .phys
+            .set_page_file_low(page_file_low(&ntoskrnl).unwrap_or(PAGE_FILE_LOW));
+        ntoskrnl
+            .phys
             .set_section_views(section_layout(&ntoskrnl).map(SectionViews::new));
-        if let Ok(pte_base) = ntoskrnl
-            .symbol("MmPteBase")
-            .and_then(|symbol| symbol.read_pointer())
-        {
+        // Reading the kernel's code for the store layout waits until a page
+        // may be in the store, and is done once; the store itself is looked
+        // for until it exists. The resolver holds the physical memory
+        // weakly, since that memory holds the resolver.
+        let phys = Arc::downgrade(&ntoskrnl.phys);
+        let symbols = Arc::clone(ntoskrnl.symbols());
+        let (dtb, base, arch, guid) = (
+            ntoskrnl.dtb(),
+            ntoskrnl.base_address,
+            ntoskrnl.arch(),
+            ntoskrnl.guid,
+        );
+        let mut layout = None;
+        ntoskrnl
+            .phys
+            .set_compressed_pages(Box::new(move |interrupt: &AtomicBool| {
+                let mut kernel = Image::new(phys.upgrade()?, Arc::clone(&symbols), dtb, base, arch);
+                kernel.guid = guid;
+                compressed_pages(&mut kernel, &mut layout, interrupt)
+            }));
+        if let Ok(pte_base) = ntoskrnl.pte_base() {
             ntoskrnl.phys.set_pte_self_map(pte_base.0);
         }
         Self {
@@ -711,8 +746,20 @@ fn system_dtb(kernel: &Image) -> Option<Dtb> {
         .ok()?
         .field_offset("DirectoryTableBase")
         .ok()?;
-    let dtb = kernel.memory().read::<u64>(system + pcb + offset).ok()?;
+    // Pointer-wide: a `ULONG` on x86, the first of two on XP x64.
+    let dtb = kernel.memory().read_pointer(system + pcb + offset).ok()?.0;
     Some(dtb & kernel.arch().dtb_page_mask()).filter(|dtb| *dtb != 0)
+}
+
+/// The first bit of a software PTE's page-file number
+/// (`_MMPTE_SOFTWARE.PageFileLow`): bit 12 on kernels with the L1TF
+/// mitigation, bit 1 before it. `None` when the PDB does not type it.
+fn page_file_low(kernel: &Image) -> Option<u32> {
+    let software = kernel.types().layout("_MMPTE_SOFTWARE").ok()?;
+    match software.fields.get("PageFileLow")?.type_data {
+        ParsedType::Bitfield { pos, .. } => Some(u32::from(pos)),
+        _ => None,
+    }
 }
 
 /// The kernel's `MiState.Hardware.InvalidPteMask`: the bits it sets in a
@@ -734,13 +781,185 @@ fn invalid_pte_mask(kernel: &Image) -> Option<u64> {
     kernel.memory().read::<u64>(state + hardware + mask).ok()
 }
 
+/// The RVAs of the kernel functions the store layout is read from, by
+/// name.
+fn store_functions(kernel: &Image) -> Option<HashMap<String, u64>> {
+    let guid = kernel.guid?;
+    let symbols = kernel.symbols();
+    let mut names: Vec<String> = [
+        "SMKM_STORE<SM_TRAITS>::",
+        "SMKM_STORE_MGR<SM_TRAITS>::",
+        "ST_STORE<SM_TRAITS>::",
+        "B_TREE<_SM_PAGE_KEY, ",
+    ]
+    .iter()
+    .flat_map(|prefix| symbols.names_starting_with(guid, prefix))
+    .collect();
+    names.extend(
+        [
+            "SmStoreDecompressBuffer",
+            "RtlDecompressBufferEx",
+            "RtlDecompressBufferProcs",
+            "KeStackAttachProcess",
+            "KiStackAttachProcess",
+        ]
+        .map(String::from),
+    );
+    Some(
+        names
+            .into_iter()
+            .filter_map(|name| {
+                let rva = symbols.symbol_rva(guid, &name).ok()??;
+                Some((name, u64::from(rva)))
+            })
+            .collect(),
+    )
+}
+
+/// The file names the symbol servers keep kernels under: the usual one,
+/// and x64's kernel for 5-level paging.
+const KERNEL_FILE_NAMES: [&str; 2] = ["ntoskrnl.exe", "ntkrla57.exe"];
+
+/// The kernel's file, matched by its mapped header page `mapped`: from the
+/// image cache, and from the symbol servers too when reads go through the
+/// target, where reading the kernel's 12 MiB of code takes over half a
+/// minute.
+fn kernel_file(kernel: &Image, mapped: &[u8]) -> Option<Arc<PeImage>> {
+    let fetches: &[ImageFetch] = if kernel.phys.reads_through_target() {
+        &[ImageFetch::CacheOnly, ImageFetch::Download]
+    } else {
+        &[ImageFetch::CacheOnly]
+    };
+    fetches
+        .iter()
+        .flat_map(|&fetch| KERNEL_FILE_NAMES.map(|name| (name, fetch)))
+        .find_map(|(name, fetch)| kernel.symbols().module_image_matching(name, mapped, fetch))
+}
+
+/// The layout of the kernel's memory-compression store, from its code
+/// (AMD64, 1703 and later): the kernel file's when [`kernel_file`] finds
+/// it, at the file's own base as the corpus test reads it, else the mapped
+/// image's.
+fn store_layout_of(kernel: &mut Image, interrupt: &AtomicBool) -> Option<StoreLayout> {
+    let headers = kernel.view()?.image().to_vec();
+    let functions = store_functions(kernel)?;
+    let arch = kernel.arch();
+    let derive = |base: u64, bytes: &[u8], code: Vec<(u32, u32)>| {
+        let functions = functions
+            .iter()
+            .map(|(name, rva)| (name.clone(), base + rva))
+            .collect();
+        let code = store_layout::KernelCode {
+            image: hv_layout::ImageView {
+                base,
+                bytes,
+                code,
+                data: Vec::new(),
+            },
+            functions: &functions,
+        };
+        match arch {
+            Arch::Amd64 => store_layout::derive(&code),
+            Arch::Arm64 => store_layout::arm64::derive(&code),
+        }
+        .ok()
+    };
+    if let Some(file) = kernel_file(kernel, &headers) {
+        let bytes = file.headers();
+        let view = PeView::from_bytes(bytes).ok()?;
+        return derive(
+            view.optional_header().ImageBase,
+            bytes,
+            pe::executable_ranges(&view),
+        );
+    }
+    let base = kernel.base_address.0;
+    let code = store_layout::mapped_code(&kernel.memory(), base, &headers, interrupt).ok()?;
+    derive(base, &code.bytes, code.code)
+}
+
+/// The guest's memory-compression store, when its PDB types the
+/// partition's store fields, the store has an owner process (it has none
+/// when compression is off, or before the store manager creates it after
+/// boot), and the kernel's code gives the layout. `layout` keeps the
+/// derivation's outcome, so the code is read once: a layout the code does
+/// not give is not looked for again, unless Ctrl+C (`interrupt`) stopped
+/// the derivation.
+fn compressed_pages(
+    kernel: &mut Image,
+    layout: &mut Option<Option<StoreLayout>>,
+    interrupt: &AtomicBool,
+) -> Option<CompressedPages> {
+    let memory = kernel.memory();
+    let types = kernel.types();
+    let partition = kernel.symbol("MiSystemPartition").ok()?.address();
+    let partition_type = types.layout("_MI_PARTITION").ok()?;
+    let stores_type = types.layout("_MI_PARTITION_STORES").ok()?;
+    let stores = partition + partition_type.field_offset("Store").ok()?;
+    let page_file = memory
+        .read::<u32>(stores + stores_type.field_offset("VirtualPageFileNumber").ok()?)
+        .ok()?;
+    let owner = memory
+        .read_pointer(stores + stores_type.field_offset("StoreProcess").ok()?)
+        .ok()?;
+    if owner.0 == 0 {
+        return None;
+    }
+    // From 22H2 the manager is the system partition's SmPartition; before
+    // it, SmGlobals itself.
+    let manager = match types
+        .layout("_EPARTITION")
+        .ok()
+        .and_then(|epartition| epartition.field_offset("SmPartition").ok())
+    {
+        Some(sm_partition) => {
+            let core = partition_type.field_offset("Core").ok()?
+                + types
+                    .layout("_MI_PARTITION_CORE")
+                    .ok()?
+                    .field_offset("PartitionObject")
+                    .ok()?;
+            let epartition = memory.read_pointer(partition + core).ok()?;
+            memory.read_pointer(epartition + sm_partition).ok()?.0
+        }
+        None => kernel.symbol("SmGlobals").ok()?.address().0,
+    };
+    let eprocess = types.layout("_EPROCESS").ok()?;
+    let kprocess = types.layout("_KPROCESS").ok()?;
+    let root = memory
+        .read_pointer(
+            owner
+                + eprocess.field_offset("Pcb").ok()?
+                + kprocess.field_offset("DirectoryTableBase").ok()?,
+        )
+        .ok()?
+        .0;
+    let owner_root = root & kernel.arch().dtb_page_mask();
+    let layout = match layout {
+        Some(known) => known.clone()?,
+        None => {
+            let derived = store_layout_of(kernel, interrupt);
+            if derived.is_some() || !interrupt.load(Ordering::Relaxed) {
+                *layout = Some(derived.clone());
+            }
+            derived?
+        }
+    };
+    Some(CompressedPages {
+        layout,
+        manager: VirtAddr(manager),
+        owner,
+        owner_root,
+        page_file: u8::try_from(page_file).ok()?,
+    })
+}
+
 /// Where the kernel keeps what [`SectionViews`] reads: the process list and
 /// each process's VAD tree. `None` when the PDB lacks any of it.
 fn section_layout(kernel: &Image) -> Option<SectionLayout> {
     let types = kernel.types();
     let eprocess = types.layout("_EPROCESS").ok()?;
     let kprocess = types.layout("_KPROCESS").ok()?;
-    let tree = types.layout("_RTL_AVL_TREE").ok()?;
     let short = types.layout("_MMVAD_SHORT").ok()?;
     let links = VadTreeOffsets::resolve(types, &short, MissingOffset::Fail).ok()?;
     let vad = types.layout("_MMVAD").ok()?;
@@ -749,12 +968,13 @@ fn section_layout(kernel: &Image) -> Option<SectionLayout> {
         return None;
     };
     Some(SectionLayout {
+        arch: kernel.arch(),
         process_list_head: kernel.symbol("PsActiveProcessHead").ok()?.address(),
         active_process_links: eprocess.field_offset("ActiveProcessLinks").ok()?,
         directory_table_base: eprocess.field_offset("Pcb").ok()?
             + kprocess.field_offset("DirectoryTableBase").ok()?,
         root_mask: kernel.arch().dtb_page_mask(),
-        vad_root: eprocess.field_offset("VadRoot").ok()? + tree.field_offset("Root").ok()?,
+        vad_root: vad_root_offset(types, &eprocess).ok()?,
         left: links.left,
         right: links.right,
         vad_node: links.vad_node,

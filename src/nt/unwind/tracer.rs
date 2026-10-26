@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use pelite::pe64::{Pe, PeView, image::IMAGE_SCN_MEM_EXECUTE};
+use pelite::pe64::{Pe, PeView};
 
 use super::{
     CachedModule, FrameMemory, FrameRegisters, OwnedModule, StackPage, StackTracer,
@@ -15,14 +15,14 @@ use crate::nt::trapframe::decode_ktrap_frame_for_thread;
 use crate::{
     base::{
         error::{Error, Result},
-        memory::{MemoryOps, PAGE_SIZE, read_page_chunks},
+        memory::{MemoryOps, PAGE_SIZE, Residency, read_page_chunks},
         types::{CodeMachine, VirtAddr},
     },
     nt::{
         guest::{Image, ModuleInfo},
-        pe::{CodeLayout, PeImage, pe_headers_end},
+        pe::{self, CodeLayout, PeImage},
         symbols::ImageFetch,
-        target::Target,
+        target::{Target, TargetKind},
     },
 };
 
@@ -170,6 +170,24 @@ impl<'a> StackTracer<'a> {
             .any(|(start, end)| rva >= *start && rva < *end)
     }
 
+    /// Whether a return address the unwind found is code: by
+    /// [`Self::is_executable_address`], or, outside every module of a
+    /// kernel target, in a page the tables map executable. JIT-compiled code
+    /// is there, and .NET Framework's has no tables to read: an in-process
+    /// callback gives its unwind data. The stack scan keeps to the strict
+    /// test, which needs no page walk for each slot it reads.
+    pub(super) fn is_return_address(&mut self, address: u64) -> bool {
+        if self.is_executable_address(address) {
+            return true;
+        }
+        self.target.kind() == TargetKind::Kernel
+            && self.module_containing(address).is_none()
+            && matches!(
+                self.memory.virt_to_phys(VirtAddr(address)),
+                Ok(Some(page)) if page.residency == Residency::Mapped && !page.nx
+            )
+    }
+
     pub(super) fn module_containing(&mut self, address: u64) -> Option<&CachedModule> {
         let module = self.trace.module_for_address(address)?;
 
@@ -263,10 +281,19 @@ impl<'a> StackTracer<'a> {
         let image = match kernel_image {
             Some(image) => image,
             None => {
+                // A session-space driver (win32k) is not mapped in the
+                // kernel's address space, its module's, but is in the
+                // traced thread's process's.
                 match self
                     .target
                     .mapped_pe_image(module.dtb, module.info.base_address)
-                {
+                    .or_else(|error| {
+                        if self.trace.active_dtb == module.dtb {
+                            return Err(error);
+                        }
+                        self.target
+                            .mapped_pe_image(self.trace.active_dtb, module.info.base_address)
+                    }) {
                     Ok(img) => Arc::new(img),
                     Err(_) => {
                         // Triage dumps don't contain PE headers; download the PE from
@@ -317,13 +344,8 @@ impl<'a> StackTracer<'a> {
     /// from the target. The file must open with the headers the guest
     /// mapped; a mismatch keeps the guest image. Nothing is downloaded here.
     fn cached_on_disk_image(&self, image: &PeImage, info: &ModuleInfo) -> Option<Arc<PeImage>> {
-        let disk = self.on_disk_image(image, info, ImageFetch::CacheOnly)?;
-        let headers_end = pe_headers_end(image.headers())?;
-        headers_match_relocated(
-            disk.headers().get(..headers_end)?,
-            image.headers().get(..headers_end)?,
-        )
-        .then_some(disk)
+        self.symbols
+            .module_image_matching(&info.name, image.headers(), ImageFetch::CacheOnly)
     }
 
     /// Whether `info` is the trace's foreign image (the Windows
@@ -371,49 +393,8 @@ impl CachedModule {
 /// The `[start, end)` RVA ranges of a module's executable sections (used to
 /// validate scan candidates).
 fn executable_ranges(image: &PeImage) -> Vec<(u32, u32)> {
-    let Ok(view) = PeView::from_bytes(image.headers()) else {
-        return Vec::new();
-    };
-    view.section_headers()
-        .iter()
-        .filter_map(|section| {
-            if section.Characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
-                return None;
-            }
-            let size = section.VirtualSize.max(section.SizeOfRawData);
-            if size == 0 {
-                return None;
-            }
-            Some((
-                section.VirtualAddress,
-                section.VirtualAddress.saturating_add(size),
-            ))
-        })
-        .collect()
-}
-
-/// Whether `disk` is the file `mapped` was loaded from: the headers agree
-/// except in `OptionalHeader.ImageBase`, which the loader rewrites to the
-/// address it relocated the image to.
-fn headers_match_relocated(disk: &[u8], mapped: &[u8]) -> bool {
-    if disk.len() != mapped.len() || disk.len() < 0x40 {
-        return false;
-    }
-    let e_lfanew = u32::from_le_bytes(disk[0x3c..0x40].try_into().unwrap()) as usize;
-    let optional = e_lfanew + 24;
-    let Some(magic) = disk.get(optional..optional + 2) else {
-        return false;
-    };
-    let image_base = match u16::from_le_bytes([magic[0], magic[1]]) {
-        0x20b => optional + 24..optional + 32,
-        0x10b => optional + 28..optional + 32,
-        _ => return false,
-    };
-    if image_base.end > disk.len() {
-        return false;
-    }
-    disk[..image_base.start] == mapped[..image_base.start]
-        && disk[image_base.end..] == mapped[image_base.end..]
+    PeView::from_bytes(image.headers())
+        .map_or_else(|_| Vec::new(), |view| pe::executable_ranges(&view))
 }
 
 impl FrameMemory for StackTracer<'_> {

@@ -172,6 +172,22 @@ impl PoolUsageRow {
 }
 
 impl PoolUsageRow {
+    /// Whether an allocation with the tag is outstanding in either pool:
+    /// more allocations than frees, or bytes in use where no counts are
+    /// kept.
+    pub fn in_use(&self) -> bool {
+        let outstanding =
+            |allocs: Option<i64>, frees: Option<i64>, bytes: Option<i64>| match (allocs, frees) {
+                (Some(allocs), Some(frees)) => allocs != frees,
+                _ => bytes.unwrap_or(0) != 0,
+            };
+        outstanding(
+            self.nonpaged_allocs,
+            self.nonpaged_frees,
+            self.nonpaged_bytes,
+        ) || outstanding(self.paged_allocs, self.paged_frees, self.paged_bytes)
+    }
+
     fn new(tag: u32) -> Self {
         Self {
             tag,
@@ -231,7 +247,7 @@ pub(crate) fn read_kernel_global_u64(debugger: &Target, name: &str) -> Result<u6
     debugger.kernel_address_space().read(address)
 }
 
-fn read_kernel_global_u32(debugger: &Target, name: &str) -> Result<u32> {
+pub fn read_kernel_global_u32(debugger: &Target, name: &str) -> Result<u32> {
     let address = kernel_symbol_address(debugger, name)?;
     debugger.kernel_address_space().read(address)
 }
@@ -553,7 +569,7 @@ fn collect_tracker_usage(
     let mut source = "PoolTrackTable";
     if let (Ok(array), Ok(processors)) = (
         kernel_symbol_address(debugger, "ExPoolTagTables"),
-        read_kernel_global_u32(debugger, "KeNumberProcessors"),
+        crate::nt::cpu_state::processor_count(debugger),
     ) && processors > 0
     {
         source = "ExPoolTagTables";
@@ -644,15 +660,35 @@ fn aggregate_big_pool_entry(
     }
 }
 
-/// Aggregate all per-processor tracker tables and the big-page table without
-/// retaining every entry.
+/// Aggregate the per-processor tracker tables without retaining every
+/// entry. The tracker counts every allocation, big ones too, as WinDbg's
+/// `!poolused` reads it alone: the big-page table stands in only when the
+/// tracker cannot be read, and then gives the big allocations alone.
 pub fn collect_pool_usage(debugger: &Target) -> PoolUsageSummary {
     let mut rows = BTreeMap::<u32, PoolUsageRow>::new();
     let mut rows_truncated = false;
-    let tracker_status = collect_tracker_usage(debugger, &mut rows, &mut rows_truncated)
-        .unwrap_or_else(|error| error);
+    let tracker = collect_tracker_usage(debugger, &mut rows, &mut rows_truncated);
+    let big = match &tracker {
+        Ok(_) => BigPoolScanSummary {
+            status: "counted by the tracker".to_string(),
+        },
+        Err(_) => collect_big_pool_usage(debugger, &mut rows, &mut rows_truncated),
+    };
+    PoolUsageSummary {
+        rows: rows.into_values().collect(),
+        rows_truncated,
+        tracker_status: tracker.unwrap_or_else(|error| error),
+        big,
+    }
+}
 
-    let big = match pool_layout(debugger) {
+/// The big-page table's allocations, by tag, into `rows`.
+fn collect_big_pool_usage(
+    debugger: &Target,
+    rows: &mut BTreeMap<u32, PoolUsageRow>,
+    rows_truncated: &mut bool,
+) -> BigPoolScanSummary {
+    match pool_layout(debugger) {
         Ok(layout) => scan_big_pool_entries(
             debugger,
             layout.big_pool_type.as_deref(),
@@ -660,7 +696,7 @@ pub fn collect_pool_usage(debugger: &Target) -> PoolUsageSummary {
             layout.big_pool_has_pool_type,
             layout.big_pool_has_slush,
             |entry| {
-                aggregate_big_pool_entry(&mut rows, &mut rows_truncated, entry);
+                aggregate_big_pool_entry(rows, rows_truncated, entry);
                 false
             },
         ),
@@ -672,7 +708,7 @@ pub fn collect_pool_usage(debugger: &Target) -> PoolUsageSummary {
                 has_pool_type,
                 has_slush,
                 |entry| {
-                    aggregate_big_pool_entry(&mut rows, &mut rows_truncated, entry);
+                    aggregate_big_pool_entry(rows, rows_truncated, entry);
                     false
                 },
             ),
@@ -682,13 +718,6 @@ pub fn collect_pool_usage(debugger: &Target) -> PoolUsageSummary {
                 ),
             },
         },
-    };
-
-    PoolUsageSummary {
-        rows: rows.into_values().collect(),
-        rows_truncated,
-        tracker_status,
-        big,
     }
 }
 
@@ -728,7 +757,14 @@ fn pool_storage_from_buf<'a>(
     Some((f, le_uint(buf.get(offset..offset.checked_add(size)?)?)))
 }
 
+/// The bit Windows 7 sets in the tag of a protected allocation (an object's,
+/// for one): `PROTECTED_POOL`. The tag's characters are the rest.
+pub const PROTECTED_POOL: u32 = 0x8000_0000;
+
+/// A tag's four characters, `.` for one that does not print; the
+/// protected bit is not part of the last.
 pub fn tag_string(tag: u32) -> String {
+    let tag = tag & !PROTECTED_POOL;
     let mut s = String::with_capacity(4);
     for i in 0..4 {
         let c = ((tag >> (i * 8)) & 0xff) as u8;
@@ -742,6 +778,7 @@ pub fn tag_string(tag: u32) -> String {
 }
 
 pub fn tag_looks_printable(tag: u32) -> bool {
+    let tag = tag & !PROTECTED_POOL;
     (0..4).all(|i| (0x20..=0x7e).contains(&((tag >> (i * 8)) & 0xff)))
 }
 
@@ -1108,6 +1145,15 @@ pub struct PoolRange {
     /// The `nt!Mm*Start`/`nt!Mm*End` globals of builds before those regions.
     start_symbol: &'static str,
     end_symbol: &'static str,
+    /// Another global for the end, where a build names it so instead
+    /// (Windows 7's `MiNonPagedPoolEnd`).
+    other_end_symbol: Option<&'static str>,
+    /// Where AMD64 kernels with no start global put the pool, by release;
+    /// the start is the highest of these below the end.
+    amd64_fixed_starts: &'static [u64],
+    /// The pool's size, for an end where no global gives one (8.1's
+    /// nonpaged pool: its start plus `MmMaximumNonPagedPoolInBytes`).
+    size_symbol: Option<&'static str>,
 }
 
 pub const NONPAGED_POOL: PoolRange = PoolRange {
@@ -1115,6 +1161,10 @@ pub const NONPAGED_POOL: PoolRange = PoolRange {
     assigned_region: Some("AssignedRegionNonPagedPool"),
     start_symbol: "MmNonPagedPoolStart",
     end_symbol: "MmNonPagedPoolEnd",
+    other_end_symbol: Some("MiNonPagedPoolEnd"),
+    // Windows 8.1.
+    amd64_fixed_starts: &[0xffff_e000_0000_0000],
+    size_symbol: Some("MmMaximumNonPagedPoolInBytes"),
 };
 
 pub const PAGED_POOL: PoolRange = PoolRange {
@@ -1122,6 +1172,10 @@ pub const PAGED_POOL: PoolRange = PoolRange {
     assigned_region: Some("AssignedRegionPagedPool"),
     start_symbol: "MmPagedPoolStart",
     end_symbol: "MmPagedPoolEnd",
+    other_end_symbol: None,
+    // Windows 7 (128 GiB below 0xfffff8c000000000) and 8.1.
+    amd64_fixed_starts: &[0xffff_f8a0_0000_0000, 0xffff_c000_0000_0000],
+    size_symbol: None,
 };
 
 pub const SPECIAL_POOL: PoolRange = PoolRange {
@@ -1129,6 +1183,9 @@ pub const SPECIAL_POOL: PoolRange = PoolRange {
     assigned_region: None,
     start_symbol: "MmSpecialPoolStart",
     end_symbol: "MmSpecialPoolEnd",
+    other_end_symbol: None,
+    amd64_fixed_starts: &[],
+    size_symbol: None,
 };
 
 /// The virtual range `[start, end)` of `pool`. Windows 10 1803 and later
@@ -1169,9 +1226,6 @@ fn assigned_system_va_region(debugger: &Target, region: &str) -> Result<(VirtAdd
         .and_then(|values| values.into_iter().find(|(name, _)| name == region))
         .map(|(_, value)| value as u64)
         .ok_or_else(|| missing("no _MI_ASSIGNED_REGION_TYPES value".into()))?;
-    let info = types
-        .layout("_MI_SYSTEM_INFORMATION")
-        .map_err(|error| missing(error.to_string()))?;
     let visible = types
         .layout("_MI_VISIBLE_STATE")
         .map_err(|error| missing(error.to_string()))?;
@@ -1186,10 +1240,7 @@ fn assigned_system_va_region(debugger: &Target, region: &str) -> Result<(VirtAdd
         return Err(missing(format!("index {index} past {count} regions")));
     }
     let entry_size = regions.size / count;
-    let entry = ntos.symbol("MiState")?.address()
-        + info.field_offset("Vs")?
-        + regions.offset as u64
-        + index * entry_size;
+    let entry = debugger.visible_state()? + regions.offset as u64 + index * entry_size;
     let assignment = types.struct_at("_MI_SYSTEM_VA_ASSIGNMENT", entry)?;
     let base = assignment.read_pointer("BaseAddress")?;
     let size = assignment.read_uint("NumberOfBytes")?;
@@ -1204,10 +1255,30 @@ fn assigned_system_va_region(debugger: &Target, region: &str) -> Result<(VirtAdd
 /// `pool`'s range from its `nt!Mm*Start`/`nt!Mm*End` globals, else from the
 /// `MiState` fields named like them.
 fn legacy_pool_range(debugger: &Target, pool: &PoolRange) -> Option<(VirtAddr, VirtAddr)> {
-    let globals = read_kernel_global_u64(debugger, pool.start_symbol)
-        .and_then(|start| Ok((start, read_kernel_global_u64(debugger, pool.end_symbol)?)))
+    let end = read_kernel_global_u64(debugger, pool.end_symbol)
+        .or_else(|error| {
+            pool.other_end_symbol.map_or(Err(error), |symbol| {
+                read_kernel_global_u64(debugger, symbol)
+            })
+        })
+        .ok();
+    let start = read_kernel_global_u64(debugger, pool.start_symbol)
         .ok()
-        .filter(|(start, end)| start < end);
+        .or_else(|| {
+            if debugger.arch() != crate::arch::Arch::Amd64 {
+                return None;
+            }
+            let fixed = pool.amd64_fixed_starts.iter().copied();
+            match end {
+                Some(end) => fixed.filter(|start| *start < end).max(),
+                None => fixed.max(),
+            }
+        });
+    let end = end.or_else(|| {
+        let size = read_kernel_global_u64(debugger, pool.size_symbol?).ok()?;
+        start?.checked_add(size)
+    });
+    let globals = start.zip(end).filter(|(start, end)| start < end);
     let (start, end) = globals.or_else(|| {
         let fields = find_mi_state_fields(debugger, &["pool", "start", "end"]);
         // `MmPagedPoolStart` names `pagedpoolstart`, which a
@@ -1350,4 +1421,18 @@ pub fn annotate_near_symbol(debugger: &Target, addr: VirtAddr) -> Option<String>
         .symbols
         .find_closest_symbol_for_address(debugger.current_dtb(), addr)?;
     (offset <= 0x1000).then(|| format_symbol_with_offset(&module, &name, offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tag_looks_printable, tag_string};
+
+    /// Windows 7 sets the protected bit in an object's tag: 'Proc' is
+    /// stored 0xe36f7250, and still reads, and passes, as Proc.
+    #[test]
+    fn a_protected_tag_reads_as_its_characters() {
+        assert_eq!(tag_string(0xe36f_7250), "Proc");
+        assert!(tag_looks_printable(0xe36f_7250));
+        assert!(!tag_looks_printable(0x8000_0001));
+    }
 }

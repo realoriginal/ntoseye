@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use ntoseye_macros::record;
 
 use super::{DiagnosticMetric, DiagnosticValue, Target};
-use crate::base::memory::PAGE_SIZE;
+use crate::base::memory::{NonResident, PAGE_SIZE};
 use crate::base::types::{Dtb, PageTableLevel, PteAttributes, VirtAddr};
 use crate::nt::guest::ProcessInfo;
 use crate::nt::layout::{ParsedType, TypeInfo};
@@ -672,8 +672,10 @@ pub struct SystemPteTypeDetail {
     /// `TotalFreeSystemPtes`.
     pub free: u64,
     pub failures: u32,
-    /// The free PTEs, counted from the clear bits of the bitmap. It differs
-    /// from `free` only when the target allocated between the two reads.
+    /// The free PTEs, counted from the clear bits of the bitmap, which the
+    /// allocator hands out from. It differs from `free` when the target
+    /// allocated between the two reads, or where the counter does not hold:
+    /// Windows 11 22631 ARM64 keeps one below zero.
     pub bitmap_free: u64,
     /// The bitmap bytes that could not be read, which count as allocated.
     pub unreadable_bitmap_bytes: u64,
@@ -698,6 +700,18 @@ impl SystemPteTypeDetail {
     }
 }
 
+impl SystemPteTypeDetail {
+    /// The free PTEs: counted from the bitmap where it was read whole, else
+    /// `TotalFreeSystemPtes`.
+    pub fn counted_free(&self) -> u64 {
+        if self.unreadable_bitmap_bytes == 0 && self.unscanned_bitmap_bits == 0 {
+            self.bitmap_free
+        } else {
+            self.free
+        }
+    }
+}
+
 /// Every system-PTE bitmap allocator in `MiState` (`!sysptes`). Counts
 /// are in PTEs.
 #[record(impl)]
@@ -705,6 +719,8 @@ impl SystemPteTypeDetail {
 pub struct SystemPtesDetail {
     pub types: Vec<SystemPteTypeDetail>,
     pub total: u64,
+    /// The free PTEs of every allocator: counted from its bitmap where the
+    /// bitmap was read whole, else its `TotalFreeSystemPtes`.
     pub free: u64,
 }
 
@@ -1091,6 +1107,10 @@ pub struct PteWalk {
     pub ppe: Option<PteLevel>,
     pub pde: Option<PteLevel>,
     pub pte: Option<PteLevel>,
+    /// Where the page is when it is not in memory, and whether reads still
+    /// get it (from the memory-compression store); `None` when it is in
+    /// memory.
+    pub non_resident: Option<NonResident>,
 }
 
 impl PteWalk {

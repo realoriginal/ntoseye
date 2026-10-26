@@ -509,7 +509,7 @@ impl ReplState<'_> {
     pub fn display_symbol_range(&self, range: &AddressRange, item_size: usize) -> Result<()> {
         match symbol_values(self.ctx, range, item_size) {
             Ok(values) => values.show(self.ctx),
-            Err(error) => error!("{error}"),
+            Err(error) => crate::hosts::repl::report_error(self, &error),
         }
         Ok(())
     }
@@ -1098,6 +1098,7 @@ fn pagein(
     #[arg(parse = pagein_request)] request: PageInRequest,
 ) -> Result<()> {
     let PageInRequest { process, address } = request;
+    let dtb = process.as_ref().map(|process| process.dtb);
     outln!("resuming the target so its debugger worker can run");
     state.clear_selected_frame();
     let report = state
@@ -1113,8 +1114,14 @@ fn pagein(
     if !report.resident {
         // MmPrefetchVirtualMemory declines addresses that are not backed
         // at all, and the worker reports completion either way.
+        let target = &state.ctx.target;
+        let dtb = dtb.unwrap_or_else(|| target.current_dtb());
+        let why = target.non_resident(dtb, address).map_or_else(
+            || "it may be unmapped rather than paged out".to_string(),
+            |why| why.to_string(),
+        );
         return Err(Error::DebugInfo(format!(
-            "{} is still unreadable; it may be unmapped rather than paged out",
+            "{} is still unreadable: {why}",
             ui::addr(address.0)
         )));
     }

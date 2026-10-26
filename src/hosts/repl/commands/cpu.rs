@@ -16,7 +16,7 @@ use crate::hosts::ui;
 use crate::nt::expr::Expr;
 use crate::nt::target::cpu::{
     CpuInfo, CpuTriageFallback, DescriptorRegister, Gdt, GdtDescriptor, Idt, IdtGate, Irql, Pcr,
-    Prcb, Processor, SpecialRegistersArea, msr_name, parse_msr_name,
+    Prcb, Processor, SpecialRegistersArea, msr_kind, msr_name, parse_msr_name,
 };
 use crate::nt::target::{DiagnosticValue, ServedVp, Target};
 use crate::session::Session;
@@ -66,7 +66,7 @@ impl FromArg for Msr {
     const COMPLETION: CompletionStrategy = CompletionStrategy::Expression;
 
     fn from_arg(cx: &mut ArgCx<'_, '_>, text: &str) -> std::result::Result<Self, ArgError> {
-        if let Some(msr) = parse_msr_name(text) {
+        if let Some(msr) = parse_msr_name(cx.state.ctx.target.arch(), text) {
             return Ok(Msr(msr));
         }
         let value = cx.eval(text)?.0;
@@ -284,7 +284,7 @@ fn print_irql(detail: &Irql) {
 }
 
 /// One IDT gate's row of the `!idt` table, and a row under it for the
-/// KiIsrThunk chain it dispatches to.
+/// interrupt object connected to a KiIsrThunk vector.
 fn push_idt_entry(builder: &mut Builder, gaps: &mut Gaps, detail: &IdtGate) {
     let vector = format!("{:02x}", detail.vector);
     let field = |name: &str| format!("vector {vector} {name}");
@@ -319,7 +319,7 @@ fn push_idt_entry(builder: &mut Builder, gaps: &mut Gaps, detail: &IdtGate) {
     ]);
     if let DiagnosticValue::Available(Some(chain)) = &detail.ki_isr_thunk {
         let mut row = vec![String::new(); 6];
-        row.push(format!("chain: {chain}"));
+        row.push(format!("connected: {chain}"));
         builder.push_record(row);
     }
 }
@@ -660,7 +660,10 @@ pub struct MsrValue {
 ///
 /// Reads one model-specific register on the selected processor, or on
 /// another processor that you select with /p. The dump and memory backends
-/// show that MSR access is unavailable.
+/// show that MSR access is unavailable. On an ARM64 target the register is
+/// a system register: by name (MIDR_EL1, TTBR1_EL1, CNTVCT_EL0, ...), as
+/// S<op0>_<op1>_C<n>_C<m>_<op2>, or by the number KD reads it by,
+/// op0<<16 | op1<<12 | CRn<<8 | CRm<<4 | op2 (MIDR_EL1 is 0x30000).
 #[command(
     names = ["rdmsr"],
     category = "cpu",
@@ -691,10 +694,11 @@ fn rdmsr(
 
 impl Render for MsrValue {
     fn render(&self, repl: &mut ReplState<'_>, (): ()) {
+        let arch = repl.ctx.target.arch();
         outln!(
             "processor {}  {} ({:#x}) = {}",
             self.processor,
-            msr_name(self.msr).unwrap_or("MSR"),
+            msr_name(arch, self.msr).unwrap_or(msr_kind(arch)),
             self.msr,
             render_msr_value(&repl.ctx.target, self.value)
         );
@@ -707,7 +711,8 @@ pub struct MsrWrite(MsrValue);
 /// Write a model-specific register on the current processor.
 ///
 /// Writes one model-specific register on the current processor. You can use
-/// a common IA32_* name instead of the numeric MSR.
+/// a common IA32_* name instead of the numeric MSR. On an ARM64 target the
+/// register is a system register, named as rdmsr takes it.
 #[command(
     names = ["wrmsr"],
     category = "cpu",
@@ -734,7 +739,8 @@ fn wrmsr(session: &mut Session, msr: Msr, value: u64) -> Result<MsrWrite> {
 }
 
 impl Render for MsrWrite {
-    fn render(&self, _: &mut ReplState<'_>, (): ()) {
+    fn render(&self, repl: &mut ReplState<'_>, (): ()) {
+        let arch = repl.ctx.target.arch();
         let MsrValue {
             processor,
             msr,
@@ -743,7 +749,7 @@ impl Render for MsrWrite {
         outln!(
             "processor {}  {} ({:#x}) <- {}",
             processor,
-            msr_name(msr).unwrap_or("MSR"),
+            msr_name(arch, msr).unwrap_or(msr_kind(arch)),
             msr,
             ui::addr(value)
         );
@@ -842,8 +848,9 @@ fn idt_vector(
 /// Decode one IDT entry or the bounded 256-entry IDT.
 ///
 /// Shows one IDT vector or all 256 entries, with the handler, selector, gate
-/// type, DPL, presence, non-nt hooks, and KiIsrThunk chain hints of each
-/// entry.
+/// type, DPL, presence, and non-nt hooks of each entry. Under a vector that
+/// dispatches through KiIsrThunk, the KINTERRUPT the processor has
+/// connected to it and its service routine.
 #[command(
     names = ["!idt", "idt"],
     category = "cpu",
@@ -1339,7 +1346,8 @@ impl Render for Contexts {
             Self::Vcpus(vcpus) => {
                 repl.caches.refresh_vcpus(repl.ctx.backend.as_mut());
                 let current = repl.ctx.current_thread.as_str();
-                print_vcpus(vcpus, current);
+                let pc = repl.ctx.target.arch().pc_register().to_uppercase();
+                print_vcpus(vcpus, current, &pc);
             }
         }
     }
@@ -1387,8 +1395,9 @@ fn print_user_threads(threads: &[UserThreadSummary]) {
 
 /// The vCPU list: what each vCPU runs, with the lines below a vCPU in the
 /// hypervisor. `.` marks `current`, the selected vCPU, as WinDbg's `~` marks
-/// the current thread.
-fn print_vcpus(vcpus: &[VcpuInfo], current: &str) {
+/// the current thread. `pc` heads the program counter's column: `RIP`, or
+/// `PC` on ARM64.
+fn print_vcpus(vcpus: &[VcpuInfo], current: &str, pc: &str) {
     // The marker column, and the two spaces after it.
     let marker_column = 3;
     // Where the Symbol column starts: each column is as wide as its
@@ -1405,7 +1414,7 @@ fn print_vcpus(vcpus: &[VcpuInfo], current: &str) {
                 .map(|vcpu| thread_label(&vcpu.id).chars().count()),
         )
         + widest(
-            "RIP",
+            pc,
             &mut vcpus.iter().map(|vcpu| match vcpu.rip {
                 Some(0) => 1,
                 Some(_) => 16,
@@ -1418,7 +1427,7 @@ fn print_vcpus(vcpus: &[VcpuInfo], current: &str) {
         );
 
     let mut builder = Builder::default();
-    builder.push_record(["", "Processor", "RIP", "Context", "Symbol"]);
+    builder.push_record(["", "Processor", pc, "Context", "Symbol"]);
     // Processors whose registers could not be read, said under the table.
     let mut notes = Vec::new();
     for vcpu in vcpus {

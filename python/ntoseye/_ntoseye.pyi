@@ -2786,8 +2786,9 @@ class Cpu:
         Decode one IDT entry or the bounded 256-entry IDT.
         
         Shows one IDT vector or all 256 entries, with the handler, selector, gate
-        type, DPL, presence, non-nt hooks, and KiIsrThunk chain hints of each
-        entry.
+        type, DPL, presence, and non-nt hooks of each entry. Under a vector that
+        dispatches through KiIsrThunk, the KINTERRUPT the processor has
+        connected to it and its service routine.
         """
     @property
     def info(self, /) -> VcpuInfo:
@@ -3661,7 +3662,11 @@ class DevNodeDetail(BaseRecord):
         The problem code's name, when it is a known one.
         """
     @property
-    def problem_status(self, /) -> int: ...
+    def problem_status(self, /) -> int |None:
+        """
+        The status the problem came with; `None` on kernels whose device
+        node keeps none (Windows 7).
+        """
     @property
     def service_name(self, /) -> str: ...
     @property
@@ -3762,7 +3767,11 @@ class DevNodeSummary(BaseRecord):
         The problem code's name, when it is a known one.
         """
     @property
-    def problem_status(self, /) -> int: ...
+    def problem_status(self, /) -> int |None:
+        """
+        The status the problem came with; `None` on kernels whose device
+        node keeps none (Windows 7).
+        """
     @property
     def service_name(self, /) -> str: ...
     @property
@@ -4318,6 +4327,9 @@ class Driver:
     def inspect(self, /) -> DriverObjectDetail:
         """
         Show a DRIVER_OBJECT with its device chain and dispatch table.
+        
+        The flags follow WinDbg: 1 shows the device objects, 2 the dispatch
+        routines; without flags, both.
         """
     @property
     def name(self, /) -> str:
@@ -6954,9 +6966,6 @@ class Heaps:
 
 @final
 class Hive(BaseRecord):
-    """
-    A loaded hive (`_CMHIVE`).
-    """
     __match_args__: Final[tuple[Literal["address"], Literal["master"], Literal["mount"], Literal["file"], Literal["base_block"], Literal["base_block_name"], Literal["root_cell"], Literal["version"], Literal["flags"], Literal["flat"]]]
     @property
     def address(self, /) -> int: ...
@@ -6989,10 +6998,11 @@ class Hive(BaseRecord):
         The master hive (`nt!CmpMasterHive`), whose root is `\\REGISTRY`.
         """
     @property
-    def mount(self, /) -> str |None:
+    def mount(self, /) -> Diagnostic[str |None]:
         """
         Where it is mounted (`HiveRootPath`), `\\REGISTRY` for the master
-        hive.
+        hive; `None` for one not mounted. Unavailable before Vista, whose
+        hives do not record it.
         """
     @property
     def root_cell(self, /) -> Diagnostic[int]:
@@ -7677,10 +7687,11 @@ class IdtGate(BaseRecord):
     @property
     def ki_isr_thunk(self, /) -> Diagnostic[str |None]:
         """
-        For a handler in `KiIsrThunk` (a chained interrupt), the offset of
-        the handler in `KiIsrThunk` and the location of
-        `_KINTERRUPT.DispatchCode`. The diagnostic value is None for other
-        handlers.
+        The `_KINTERRUPT` connected to the vector and its service routine:
+        through the processor's `_KPRCB.InterruptObject` table for a
+        handler in `KiIsrThunk` (or `KiIsrThunkShadow`), or, before those
+        (Windows 8.1), the object whose `DispatchCode` the gate points into.
+        None for other handlers and for a vector nothing is connected to.
         """
     @property
     def non_nt_hook(self, /) -> Diagnostic[bool]:
@@ -8728,7 +8739,9 @@ class Inspect:
         """
         Show pool tracker usage by tag.
         
-        The command adds up the usage from the tag table of each processor. The
+        The command adds up the usage from the tag table of each processor, which
+        counts big allocations too; the big-page table is read only when those
+        tables cannot be. Tags with no allocation outstanding are left out. The
         flags follow WinDbg: bit 1 (2) sorts by nonpaged bytes, bit 2 (4) sorts by
         paged bytes, and bit 0 (1) shows the alloc/free columns. The tag match is
         case-sensitive and supports * and ?.
@@ -11642,7 +11655,8 @@ class MsrRange(BaseRecord):
 @final
 class Msrs:
     """
-    Model-specific registers on one processor (`rdmsr`/`wrmsr`, KD only).
+    Model-specific registers on one processor, or an ARM64 target's system
+    registers (`rdmsr`/`wrmsr`, KD only).
     """
     def __getitem__(self, key: int |str, /) -> int: ...
     def __repr__(self, /) -> str: ...
@@ -12458,6 +12472,22 @@ class NdisUnreadable(BaseRecord):
     def address(self, /) -> int: ...
     @property
     def error(self, /) -> str: ...
+
+@final
+class NonResident(BaseRecord):
+    """
+    Why a page is not in memory, as its page tables say
+    (`non_resident`).
+    """
+    __match_args__: Final[tuple[Literal["table"], Literal["place"]]]
+    @property
+    def place(self, /) -> Place: ...
+    @property
+    def table(self, /) -> Literal["pxe", "ppe", "pde", "pte"] |None:
+        """
+        The level whose entry names the page table that is not in memory;
+        `None` when the page itself is not.
+        """
 
 @final
 class Notice(BaseRecord):
@@ -13844,6 +13874,93 @@ class PfnSelector(BaseRecord):
         def value(self, /) -> int:
             """
             The page-frame number or physical address given.
+            """
+
+class Place(BaseRecord):
+    """
+    Where a page, or a page table, that is not in memory is.
+    """
+    @property
+    def kind(self, /) -> Literal["unmapped", "demand_zero", "prototype", "page_file", "store", "unreadable"]:
+        """
+        The variant: `unmapped`, `demand_zero`, `prototype`, `page_file`, `store`, `unreadable`.
+        """
+    @final
+    class DemandZero(Place):
+        """
+        Committed but never touched; it reads as zeros once touched.
+        """
+        __match_args__: Final[tuple[()]]
+        @property
+        def kind(self, /) -> Literal["demand_zero"]:
+            """
+            `demand_zero`.
+            """
+    @final
+    class PageFile(Place):
+        """
+        In paging file `file`, at page `offset`.
+        """
+        __match_args__: Final[tuple[Literal["file"], Literal["offset"]]]
+        @property
+        def file(self, /) -> int: ...
+        @property
+        def kind(self, /) -> Literal["page_file"]:
+            """
+            `page_file`.
+            """
+        @property
+        def offset(self, /) -> int: ...
+    @final
+    class Prototype(Place):
+        """
+        A view's page this process has not touched, and the section's own
+        PTE leaves it out of memory.
+        """
+        __match_args__: Final[tuple[()]]
+        @property
+        def kind(self, /) -> Literal["prototype"]:
+            """
+            `prototype`.
+            """
+    @final
+    class Store(Place):
+        """
+        In the memory-compression store, at page `offset` of its page file:
+        read from there, or, with `problem`, not.
+        """
+        __match_args__: Final[tuple[Literal["offset"], Literal["problem"]]]
+        @property
+        def kind(self, /) -> Literal["store"]:
+            """
+            `store`.
+            """
+        @property
+        def offset(self, /) -> int: ...
+        @property
+        def problem(self, /) -> str |None: ...
+    @final
+    class Unmapped(Place):
+        """
+        Nothing maps it: no page table, or a zero entry.
+        """
+        __match_args__: Final[tuple[()]]
+        @property
+        def kind(self, /) -> Literal["unmapped"]:
+            """
+            `unmapped`.
+            """
+    @final
+    class Unreadable(Place):
+        """
+        Its entry is present, but its frame does not read (a dump without
+        it).
+        """
+        __match_args__: Final[tuple[()]]
+        @property
+        def kind(self, /) -> Literal["unreadable"]:
+            """
+            `unreadable`.
             """
 
 @final
@@ -15369,7 +15486,7 @@ class PteWalk(BaseRecord):
     The page-table entries that map an address, read through NT's self-map
     (`!pte`).
     """
-    __match_args__: Final[tuple[Literal["address"], Literal["dtb"], Literal["pxe"], Literal["ppe"], Literal["pde"], Literal["pte"]]]
+    __match_args__: Final[tuple[Literal["address"], Literal["dtb"], Literal["pxe"], Literal["ppe"], Literal["pde"], Literal["pte"], Literal["non_resident"]]]
     @property
     def address(self, /) -> int: ...
     @property
@@ -15377,6 +15494,13 @@ class PteWalk(BaseRecord):
         """
         The address space the walk was performed in (the attached process DTB
         when attached, else the kernel), so callers know what was walked.
+        """
+    @property
+    def non_resident(self, /) -> NonResident |None:
+        """
+        Where the page is when it is not in memory, and whether reads still
+        get it (from the memory-compression store); `None` when it is in
+        memory.
         """
     @property
     def pde(self, /) -> PteLevel |None: ...
@@ -16716,7 +16840,10 @@ class SegmentHeap(BaseRecord):
     @property
     def reserved_pages(self, /) -> int: ...
     @property
-    def vs_free_committed_pages(self, /) -> int: ...
+    def vs_free_committed_pages(self, /) -> int |None:
+        """
+        `None` before Windows 11 24H2, which counts no VS share apart.
+        """
 
 @final
 class SegmentHeapDetail(BaseRecord):
@@ -18405,8 +18532,10 @@ class SystemPteTypeDetail(BaseRecord):
     @property
     def bitmap_free(self, /) -> int:
         """
-        The free PTEs, counted from the clear bits of the bitmap. It differs
-        from `free` only when the target allocated between the two reads.
+        The free PTEs, counted from the clear bits of the bitmap, which the
+        allocator hands out from. It differs from `free` when the target
+        allocated between the two reads, or where the counter does not hold:
+        Windows 11 22631 ARM64 keeps one below zero.
         """
     @property
     def failures(self, /) -> int: ...
@@ -18479,7 +18608,11 @@ class SystemPtesDetail(BaseRecord):
     """
     __match_args__: Final[tuple[Literal["types"], Literal["total"], Literal["free"]]]
     @property
-    def free(self, /) -> int: ...
+    def free(self, /) -> int:
+        """
+        The free PTEs of every allocator: counted from its bitmap where the
+        bitmap was read whole, else its `TotalFreeSystemPtes`.
+        """
     @property
     def total(self, /) -> int: ...
     @property
@@ -18587,7 +18720,7 @@ class TargetKernel(BaseRecord):
     """
     The identity of the kernel image.
     """
-    __match_args__: Final[tuple[Literal["name"], Literal["short_name"], Literal["base"], Literal["size"], Literal["file_version"], Literal["product_version"], Literal["pdb_guid"], Literal["pdb_age"]]]
+    __match_args__: Final[tuple[Literal["name"], Literal["short_name"], Literal["base"], Literal["size"], Literal["file_version"], Literal["product_version"], Literal["pdb_name"], Literal["pdb_guid"], Literal["pdb_age"]]]
     @property
     def base(self, /) -> int: ...
     @property
@@ -18606,6 +18739,11 @@ class TargetKernel(BaseRecord):
     def pdb_guid(self, /) -> str |None:
         """
         The GUID of the PDB, which identifies the symbols.
+        """
+    @property
+    def pdb_name(self, /) -> str |None:
+        """
+        The file name of the loaded PDB (`ntkrnlmp.pdb`).
         """
     @property
     def product_version(self, /) -> str |None: ...
@@ -19292,7 +19430,7 @@ class TimerBucketEnd(BaseRecord):
     @property
     def bucket(self, /) -> int: ...
     @property
-    def processor(self, /) -> int: ...
+    def processor(self, /) -> int |None: ...
     @property
     def termination(self, /) -> ListTermination: ...
 
@@ -19340,7 +19478,10 @@ class TimerTableEntry(BaseRecord):
         The index of the timer-table bucket.
         """
     @property
-    def processor(self, /) -> int: ...
+    def processor(self, /) -> int |None:
+        """
+        `None` in the one table all processors share before Windows 7.
+        """
     @property
     def timer(self, /) -> KernelTimer: ...
 

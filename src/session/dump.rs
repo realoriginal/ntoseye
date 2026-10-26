@@ -40,13 +40,13 @@ const USER_FRAME_SEARCH: usize = 256;
 /// A region at most this large is captured page by page, which also takes
 /// its pages in transition and the shared pages of a view this process has
 /// not touched; a larger one (a reservation such as the CFG bitmap) only
-/// where its pages are present.
+/// where its pages are present or in the memory-compression store.
 const PAGE_BY_PAGE_REGION: u64 = 64 << 20;
 /// FILETIME (100 ns units since 1601) at the Unix epoch.
 const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 const FILETIME_SECOND: u64 = 10_000_000;
-/// `NT_TIB64.StackBase`.
-const NT_TIB_STACK_BASE: u64 = 8;
+/// `NT_TIB.StackBase`, in pointers from the TEB's start.
+const NT_TIB_STACK_BASE_SLOT: u64 = 1;
 /// The most handles a minidump lists: far more than any process holds.
 const MAX_HANDLES: usize = 1 << 20;
 /// `RTL_UNLOAD_EVENT_TRACE` on a 64-bit process: `BaseAddress`,
@@ -272,12 +272,57 @@ fn minidump_module(memory: &AddressSpace<'_, PhysMem>, module: &ModuleInfo) -> M
     }
 }
 
-/// A VAD too large to scan page by page (a reservation such as the CFG
-/// bitmap) as regions: the runs of its pages that are present, committed
-/// with its protection, and the rest reserved. A committed page that is
-/// paged out shows as reserved.
-fn present_runs(memory: &AddressSpace<'_, PhysMem>, vad: &MemoryRegionInfo) -> Vec<MinidumpRegion> {
+/// The runs of pages in `[start, end)` that are present or in the
+/// memory-compression store, in address order and merged; one walk finds
+/// both.
+fn readable_runs(
+    memory: &AddressSpace<'_, PhysMem>,
+    start: VirtAddr,
+    end: VirtAddr,
+) -> Vec<Range<u64>> {
     let page = PAGE_SIZE as u64;
+    let mut runs = Vec::new();
+    let mut stored = Vec::new();
+    let _ = memory.for_each_page(
+        start,
+        end,
+        |va, _, length| {
+            runs.push(va.0 & !(page - 1)..(va.0 + length).next_multiple_of(page));
+            ControlFlow::Continue(())
+        },
+        |va, pte| stored.push((va, pte)),
+    );
+    runs.extend(
+        stored
+            .into_iter()
+            .filter(|&(_, pte)| memory.pte_is_compressed(pte))
+            .map(|(va, _)| va.0..va.0 + page),
+    );
+    runs.sort_unstable_by_key(|run| run.start);
+    let mut merged = Vec::new();
+    for run in runs {
+        push_merged(&mut merged, run);
+    }
+    merged
+}
+
+/// Append `run` to `ranges`, or extend the last range when `run` starts
+/// where it ends.
+fn push_merged(ranges: &mut Vec<Range<u64>>, run: Range<u64>) {
+    match ranges.last_mut() {
+        Some(last) if last.end == run.start => last.end = run.end,
+        _ => ranges.push(run),
+    }
+}
+
+/// A VAD too large to scan page by page (a reservation such as the CFG
+/// bitmap) as regions: the runs of its pages that are present or in the
+/// memory-compression store, committed with its protection, and the rest
+/// reserved. A committed page that is paged out to disk shows as reserved.
+fn readable_regions(
+    memory: &AddressSpace<'_, PhysMem>,
+    vad: &MemoryRegionInfo,
+) -> Vec<MinidumpRegion> {
     let protect = vad.protection_value().map_or(0, page_protection);
     let kind = if vad.vad_type == Some(VadType::ImageMap) {
         MEM_IMAGE
@@ -295,19 +340,9 @@ fn present_runs(memory: &AddressSpace<'_, PhysMem>, vad: &MemoryRegionInfo) -> V
         protect: if committed { protect } else { 0 },
         kind,
     };
-    let mut present: Vec<Range<u64>> = Vec::new();
-    let _ = memory.for_each_present_page(vad.start, vad.end, |va, _, length| {
-        let start = va.0 & !(page - 1);
-        let end = (va.0 + length).next_multiple_of(page);
-        match present.last_mut() {
-            Some(last) if last.end == start => last.end = end,
-            _ => present.push(start..end),
-        }
-        ControlFlow::Continue(())
-    });
     let mut regions = Vec::new();
     let mut at = vad.start.0;
-    for run in present {
+    for run in readable_runs(memory, vad.start, vad.end) {
         if run.start > at {
             regions.push(region(at, run.start, false));
         }
@@ -368,9 +403,12 @@ fn stop_exception(
 fn kernel_unicode_string(target: &Target, address: VirtAddr) -> Option<String> {
     let kernel = target.kernel_address_space();
     let length: u16 = kernel.read(address).ok()?;
-    let buffer: u64 = kernel.read(address + 8u64).ok()?;
+    // `Buffer` follows the lengths, a pointer in.
+    let buffer = kernel
+        .read_pointer(address + kernel.arch().pointer_size())
+        .ok()?;
     let mut bytes = vec![0u8; usize::from(length)];
-    kernel.read_bytes(VirtAddr(buffer), &mut bytes).ok()?;
+    kernel.read_bytes(buffer, &mut bytes).ok()?;
     Some(utf16le_lossy(&bytes))
 }
 
@@ -458,7 +496,9 @@ fn unloaded_modules(target: &Target, process: &ProcessInfo) -> Vec<MinidumpUnloa
             .flatten()
     };
     let (Some(array), Some(size), Some(number)) = (
-        symbol("ntdll!RtlpUnloadEventTraceEx").and_then(|at| memory.read::<u64>(at).ok()),
+        symbol("ntdll!RtlpUnloadEventTraceEx")
+            .and_then(|at| memory.read_pointer(at).ok())
+            .map(|array| array.0),
         symbol("ntdll!RtlpUnloadEventTraceExSize").and_then(|at| memory.read::<u32>(at).ok()),
         symbol("ntdll!RtlpUnloadEventTraceExNumber").and_then(|at| memory.read::<u32>(at).ok()),
     ) else {
@@ -502,7 +542,12 @@ fn unloaded_modules(target: &Target, process: &ProcessInfo) -> Vec<MinidumpUnloa
 /// Where a thread's user stack is in use: from `sp` to its TEB's
 /// `StackBase`, when that is above `sp`.
 fn used_stack(memory: &AddressSpace<'_, PhysMem>, teb: u64, sp: u64) -> Option<Range<u64>> {
-    let base = memory.read::<u64>(VirtAddr(teb + NT_TIB_STACK_BASE)).ok()?;
+    let base = memory
+        .read_pointer(VirtAddr(
+            teb + NT_TIB_STACK_BASE_SLOT * memory.arch().pointer_size(),
+        ))
+        .ok()?
+        .0;
     (sp < base && base - sp <= 1 << 30).then_some(sp..base)
 }
 
@@ -510,41 +555,33 @@ fn used_stack(memory: &AddressSpace<'_, PhysMem>, teb: u64, sp: u64) -> Option<R
 /// part of it that is demand-zero: each committed region of at most
 /// [`PAGE_BY_PAGE_REGION`] wherever its pages translate, which takes pages
 /// in transition and shared pages not yet touched too, or are demand-zero
-/// (committed, never touched: zeros); each larger one where its pages are
-/// present.
+/// (committed, never touched: zeros), or are in the memory-compression
+/// store; each larger one whole, as [`readable_regions`] made it of pages that
+/// read.
 fn captured_memory(
     memory: &AddressSpace<'_, PhysMem>,
     regions: &[MinidumpRegion],
 ) -> (Vec<Range<u64>>, Vec<Range<u64>>) {
     let page = PAGE_SIZE as u64;
-    let add = |ranges: &mut Vec<Range<u64>>, start: u64, end: u64| match ranges.last_mut() {
-        Some(last) if last.end == start => last.end = end,
-        _ => ranges.push(start..end),
-    };
     let mut ranges = Vec::new();
     let mut zero = Vec::new();
     for region in regions.iter().filter(|region| region.state == MEM_COMMIT) {
         let end = region.base + region.size;
-        if region.size <= PAGE_BY_PAGE_REGION {
-            let private = region.kind == MEM_PRIVATE;
-            for address in (region.base..end).step_by(PAGE_SIZE) {
-                if matches!(memory.virt_to_phys(VirtAddr(address)), Ok(Some(_))) {
-                    add(&mut ranges, address, address + page);
-                } else if memory.page_is_demand_zero(VirtAddr(address), private) {
-                    add(&mut ranges, address, address + page);
-                    add(&mut zero, address, address + page);
-                }
+        if region.size > PAGE_BY_PAGE_REGION {
+            push_merged(&mut ranges, region.base..end);
+            continue;
+        }
+        let private = region.kind == MEM_PRIVATE;
+        for address in (region.base..end).step_by(PAGE_SIZE) {
+            let run = address..address + page;
+            if matches!(memory.virt_to_phys(VirtAddr(address)), Ok(Some(_))) {
+                push_merged(&mut ranges, run);
+            } else if memory.page_is_demand_zero(VirtAddr(address), private) {
+                push_merged(&mut ranges, run.clone());
+                push_merged(&mut zero, run);
+            } else if memory.page_is_compressed(VirtAddr(address)) {
+                push_merged(&mut ranges, run);
             }
-        } else {
-            let _ = memory.for_each_present_page(
-                VirtAddr(region.base),
-                VirtAddr(end),
-                |va, _, length| {
-                    let start = va.0 & !(page - 1);
-                    add(&mut ranges, start, (va.0 + length).next_multiple_of(page));
-                    ControlFlow::Continue(())
-                },
-            );
         }
     }
     (ranges, zero)
@@ -714,9 +751,9 @@ pub fn collect_process_minidump(
                 .or(thread.start_address)
                 .map_or(0, |address| address.0),
             name: thread_name_offset
-                .and_then(|offset| kernel.read::<u64>(thread.ethread + offset).ok())
-                .filter(|&pointer| pointer != 0)
-                .and_then(|pointer| kernel_unicode_string(&session.target, VirtAddr(pointer)))
+                .and_then(|offset| kernel.read_pointer(thread.ethread + offset).ok())
+                .filter(|pointer| !pointer.is_zero())
+                .and_then(|pointer| kernel_unicode_string(&session.target, pointer))
                 .filter(|name| !name.is_empty()),
         });
     }
@@ -749,7 +786,7 @@ pub fn collect_process_minidump(
                     }),
             );
         } else {
-            regions.extend(present_runs(&user, vad));
+            regions.extend(readable_regions(&user, vad));
         }
     }
     let (memory, zero) = captured_memory(&user, &regions);

@@ -823,6 +823,47 @@ pub fn version_strings(info: &[u32; 13]) -> (String, String) {
     (version(info[2], info[3]), version(info[4], info[5]))
 }
 
+/// The `[start, end)` RVAs of the executable sections `view`'s headers
+/// list, clipped to the image's `SizeOfImage`; a section with nothing in the
+/// image is left out.
+pub fn executable_ranges<'a>(view: &impl pelite::pe64::Pe<'a>) -> Vec<(u32, u32)> {
+    let size = view.optional_header().SizeOfImage;
+    view.section_headers()
+        .iter()
+        .filter(|section| section.Characteristics & pelite::image::IMAGE_SCN_MEM_EXECUTE != 0)
+        .map(|section| {
+            let start = section.VirtualAddress;
+            let end = start.saturating_add(section.VirtualSize.max(section.SizeOfRawData));
+            (start, end.min(size))
+        })
+        .filter(|(start, end)| start < end)
+        .collect()
+}
+
+/// Whether `disk` is the file `mapped` was loaded from: the headers agree
+/// except in `OptionalHeader.ImageBase`, which the loader rewrites to the
+/// address it relocated the image to.
+pub fn headers_match_relocated(disk: &[u8], mapped: &[u8]) -> bool {
+    if disk.len() != mapped.len() || disk.len() < 0x40 {
+        return false;
+    }
+    let e_lfanew = u32::from_le_bytes(disk[0x3c..0x40].try_into().unwrap()) as usize;
+    let optional = e_lfanew + 24;
+    let Some(magic) = disk.get(optional..optional + 2) else {
+        return false;
+    };
+    let image_base = match u16::from_le_bytes([magic[0], magic[1]]) {
+        0x20b => optional + 24..optional + 32,
+        0x10b => optional + 28..optional + 32,
+        _ => return false,
+    };
+    if image_base.end > disk.len() {
+        return false;
+    }
+    disk[..image_base.start] == mapped[..image_base.start]
+        && disk[image_base.end..] == mapped[image_base.end..]
+}
+
 /// Build a complete (hole-free) `PeImage` from an on-disk PE file by mapping its
 /// raw sections to their RVAs: the same layout `read_pe_image` produces from
 /// guest memory, but sourced from the full file. Used to recover read-only data

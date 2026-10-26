@@ -329,11 +329,14 @@ impl<'a> HeapReader<'a> {
     }
 
     pub fn classify(&self, heap: VirtAddr) -> Result<HeapKind> {
-        let segment = self.layout("_SEGMENT_HEAP")?;
-        let signature_offset = segment.offset("Signature")?;
-        let signature: u32 = self.memory.read(heap + signature_offset as u64)?;
-        if signature == SEGMENT_HEAP_SIGNATURE {
-            return Ok(HeapKind::Segment);
+        // ntdll has no segment heap before Windows 10 (Windows 7's PDB has
+        // no `_SEGMENT_HEAP`), so every heap there is an NT heap.
+        if let Ok(segment) = self.layout("_SEGMENT_HEAP") {
+            let signature_offset = segment.offset("Signature")?;
+            let signature: u32 = self.memory.read(heap + signature_offset as u64)?;
+            if signature == SEGMENT_HEAP_SIGNATURE {
+                return Ok(HeapKind::Segment);
+            }
         }
         let nt = self.layout("_HEAP")?;
         let nt_signature: u32 = self.memory.read(heap + nt.offset("Signature")? as u64)?;
@@ -546,6 +549,12 @@ impl HeapReader<'_> {
                 "{} is not an NT heap (no _HEAP signature)",
                 address
             )));
+        }
+        if heap.offset("SegmentList").is_err() && heap.offset("Segments").is_ok() {
+            return Err(Error::DebugInfo(
+                "the heap layout before Vista (a Segments array, unencoded entries) is not decoded"
+                    .into(),
+            ));
         }
         let encode_mask = heap.read(&image, 0, "EncodeFlagMask")? as u32;
         let granule = self.layout("_HEAP_ENTRY")?.size() as u64;
@@ -796,7 +805,8 @@ pub struct SegmentHeap {
     pub committed_pages: u64,
     pub free_committed_pages: u64,
     pub lfh_free_committed_pages: u64,
-    pub vs_free_committed_pages: u64,
+    /// `None` before Windows 11 24H2, which counts no VS share apart.
+    pub vs_free_committed_pages: Option<u64>,
     pub large_reserved_pages: u64,
     pub large_committed_pages: u64,
     /// The segment contexts, as decoded; `SegmentHeapDetail.contexts` has
@@ -1072,7 +1082,7 @@ impl HeapReader<'_> {
             committed_pages: stats.read(&image, stats_at, "TotalCommittedPages")?,
             free_committed_pages: stats.read(&image, stats_at, "FreeCommittedPages")?,
             lfh_free_committed_pages: stats.read(&image, stats_at, "LfhFreeCommittedPages")?,
-            vs_free_committed_pages: stats.read(&image, stats_at, "VsFreeCommittedPages")?,
+            vs_free_committed_pages: stats.read(&image, stats_at, "VsFreeCommittedPages").ok(),
             large_reserved_pages: heap.read(&image, 0, "LargeReservedPages")?,
             large_committed_pages: heap.read(&image, 0, "LargeCommittedPages")?,
             contexts,
